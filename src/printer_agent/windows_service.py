@@ -49,6 +49,11 @@ if _IMPORT_ERROR is None:
             # A service has no console, so the rotating file handler is the only
             # place these records land — and it is what the app's Logs page reads.
             configure_logging()
+            # The SCM gives a service 30 seconds to report RUNNING and kills it
+            # with error 1053 otherwise. Everything below — reading the config,
+            # querying the update feed, dialling the hub — can exceed that on its
+            # own, so the handshake has to come first.
+            self.ReportServiceStatus(win32service.SERVICE_RUNNING)
             servicemanager.LogInfoMsg("printer-agent service starting")
             try:
                 asyncio.run(self._run())

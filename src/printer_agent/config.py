@@ -71,10 +71,26 @@ def parse_config(
     runnable yet. Only a malformed YAML document still raises.
     """
     env = env or os.environ
-    data = _read_yaml(Path(path)) if Path(path).exists() else {}
+    config_path = Path(path)
+    data = _read_yaml(config_path) if config_path.exists() else {}
     merged = _apply_env_overrides(data, env)
     config = config_from_dict(merged)
+    config.outbox.database_path = _resolve_outbox_path(config.outbox.database_path, config_path)
     return config, validate_config(config)
+
+
+def _resolve_outbox_path(database_path: Path, config_path: Path) -> Path:
+    """Anchor a relative outbox path to the config file, not the process CWD.
+
+    The service starts with its working directory somewhere in System32, so a
+    relative `data/outbox.sqlite3` meant "create a folder wherever Windows
+    happened to launch us" — which fails with access denied and takes the whole
+    service down before it can report a reason.
+    """
+    if database_path.is_absolute():
+        return database_path
+    base = config_path.parent if config_path.parent != Path("") else Path.cwd()
+    return (base / database_path).resolve()
 
 
 def load_config(path: str | Path = "agent.yaml", env: os._Environ[str] | None = None) -> AgentConfig:
