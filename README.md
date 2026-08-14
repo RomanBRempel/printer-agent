@@ -30,6 +30,19 @@ It has one job: translate vendor-specific printer protocols into a single normal
 - Состояние хранится на диске, поэтому перезапуск сохраняет неотправленные события и результаты команд.
 - Настройка на Windows выполняется через локальный GUI и службу; входящих портов при этом не появляется.
 
+**Исключение дублей (multi-agent)**
+
+- Один физический принтер должен иметь один канонический идентификатор `printer_identity` на уровне локации.
+- Рекомендуемая стратегия: `printer_identity = sha256(location_key + brand + stable_device_id)`, где `stable_device_id` это Bambu serial или устойчивый идентификатор для Moonraker.
+- `msg_id` и `command_id` обеспечивают идемпотентность сообщений, но не решают дубль одного и того же принтера при двух сервисах.
+- При одновременной видимости одного принтера несколькими агентами должен действовать один активный owner (lease/claim), остальные инстансы не публикуют дублирующие snapshots/events.
+- На стороне БД дедуп должен опираться на `(location_key, printer_identity)` и сигнатуру состояния, а не на транспортные `msg_id`.
+
+**Встраивание в учётную систему**
+
+- У агента нет входящего API — это жёсткая граница. Учётная система (ERP/1C/MES) интегрируется с хабом RD Control, а не с агентом.
+- Спецификация: [docs/integration-api-v1.md](docs/integration-api-v1.md) — чтение состояния принтеров, команды печати, вебхуки событий, идемпотентность по `command_id` из документа учётной системы.
+
 Подробности по установке, запуску, обновлению и деплою — в английских разделах ниже.
 
 ## What this project is
@@ -147,6 +160,8 @@ The installer writes the shared service configuration to `ProgramData\printer-ag
 ## Contract source of truth
 
 - [Agent-Hub contract](docs/contracts/agent-hub-v1.md)
+- [Data storage and duplicate prevention](docs/data-storage-and-dedup.md)
+- [Integration API v1 for accounting systems](docs/integration-api-v1.md) (hub-side specification; the agent itself exposes no inbound API)
 
 ## Operational notes
 
@@ -154,3 +169,4 @@ The installer writes the shared service configuration to `ProgramData\printer-ag
 - Runtime state is disk-backed so restarts preserve pending events and command idempotency.
 - Only adapter modules may contain vendor protocol logic.
 - The GUI is a local configuration surface only; it does not expose inbound ports.
+- In multi-agent deployments, deduplicate by stable printer identity per location. Do not rely on `msg_id` as the only duplicate prevention key.

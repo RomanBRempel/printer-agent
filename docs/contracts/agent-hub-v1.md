@@ -18,6 +18,13 @@ Rules:
 - `ts` is UTC ISO-8601.
 - `payload` is message-specific.
 
+Identity and duplicate-prevention notes:
+
+- `msg_id` uniqueness is transport-level and only guarantees message idempotency.
+- Printer-level deduplication must use a stable physical identity key scoped by `location_key`.
+- Recommended identity input is `location_key + brand + stable_device_id` (for example Bambu serial), hashed if needed for compact transport.
+- In multi-agent overlap scenarios, only one active owner should publish state for a given printer identity at a time.
+
 ## Agent -> Hub
 
 ### `hello`
@@ -38,6 +45,8 @@ Sent on connect.
   ]
 }
 ```
+
+`printer_key` must be stable for the same physical printer inside one location. If a config-local alias is used, map it to a canonical identity before publishing.
 
 ### `telemetry`
 

@@ -48,8 +48,8 @@ if (-not (Test-Administrator)) {
     throw "Run this installer from an elevated PowerShell session."
 }
 
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$exampleConfig = Join-Path $repoRoot "agent.example.yaml"
+Write-Host "[STEP] bootstrap"
+
 $installRootPath = New-Item -ItemType Directory -Force -Path $InstallRoot
 $venvPath = Join-Path $installRootPath.FullName ".venv"
 $configDir = Join-Path $env:ProgramData "printer-agent"
@@ -64,18 +64,50 @@ $pythonwExe = Join-Path $venvPath "Scripts\pythonw.exe"
 
 & $pythonExe -m pip install --upgrade pip
 
+Write-Host "[STEP] package"
+
 if ([string]::IsNullOrWhiteSpace($PackageSpec)) {
-    $installTarget = "$($repoRoot)[windows]"
+    $localWheel = Get-ChildItem -Path $PSScriptRoot -Filter "printer_agent-*.whl" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+    if ($null -eq $localWheel) {
+        throw "PackageSpec is required when no local wheel is present next to install.ps1. Provide -PackageSpec or place printer_agent-*.whl in $PSScriptRoot."
+    }
+    $installTarget = $localWheel.FullName
 }
 else {
     $installTarget = $PackageSpec
 }
 
 & $pythonExe -m pip install "$installTarget"
+# Service integration requires pywin32 on Windows even when wheel extras are not requested.
+& $pythonExe -m pip install "pywin32>=306"
 
+Write-Host "[STEP] config"
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 if ((-not (Test-Path $configPath)) -or $Force) {
-    Copy-Item $exampleConfig $configPath -Force
+    if (Test-Path (Join-Path (Split-Path $PSScriptRoot -Parent | Split-Path -Parent) "agent.example.yaml")) {
+        $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+        $exampleConfig = Join-Path $repoRoot "agent.example.yaml"
+        Copy-Item $exampleConfig $configPath -Force
+    }
+    else {
+        @"
+hub_url: wss://rd-control.example.com/ws/agent
+agent_token: change-me
+location_key: location-1
+telemetry_interval_s: 5
+heartbeat_interval_s: 15
+outbox:
+    database_path: data/outbox.sqlite3
+    max_events: 5000
+updates:
+    feed_url: ""
+    auto_update: false
+    check_on_startup: true
+printers: []
+"@ | Set-Content -Path $configPath -Encoding UTF8
+    }
 }
 
 & $pythonExe -c @"
@@ -109,8 +141,11 @@ with config_path.open('w', encoding='utf-8') as handle:
     yaml.safe_dump(data, handle, sort_keys=False, allow_unicode=True)
 "@
 
+Write-Host "[STEP] service"
 & $pythonExe -m printer_agent install-service --config $configPath
+& $pythonExe -m printer_agent.windows_service start
 
+Write-Host "[STEP] shortcuts"
 New-Item -ItemType Directory -Force -Path $startMenuDir | Out-Null
 New-Shortcut -ShortcutPath (Join-Path $startMenuDir "printer-agent GUI.lnk") -TargetPath $pythonwExe -Arguments "-m printer_agent gui --config `"$configPath`"" -WorkingDirectory $installRootPath.FullName -Description "Open printer-agent configuration GUI"
 New-Shortcut -ShortcutPath (Join-Path $startMenuDir "printer-agent Status.lnk") -TargetPath $pythonExe -Arguments "-m printer_agent --config `"$configPath`" status" -WorkingDirectory $installRootPath.FullName -Description "Show printer-agent status"
@@ -120,6 +155,8 @@ Write-Host "printer-agent was installed to $installRootPath"
 Write-Host "Configuration file: $configPath"
 Write-Host "Service: printer-agent"
 Write-Host "Use the Start Menu shortcut or desktop shortcut to open the GUI."
+Write-Host "[STEP] finalize"
+& sc.exe query "printer-agent"
 
 if ($LaunchGui) {
     Start-Process -FilePath $pythonwExe -ArgumentList @("-m", "printer_agent", "gui", "--config", $configPath) -WorkingDirectory $installRootPath.FullName
