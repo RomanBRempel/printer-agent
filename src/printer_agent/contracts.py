@@ -9,6 +9,88 @@ from uuid import uuid4
 PROTOCOL_VERSION = 1
 
 
+class MessageType(StrEnum):
+    hello = "hello"
+    telemetry = "telemetry"
+    event = "event"
+    command_result = "command_result"
+    heartbeat = "heartbeat"
+    hello_ack = "hello_ack"
+    hello_reject = "hello_reject"
+    command = "command"
+    file_offer = "file_offer"
+    camera_request = "camera_request"
+    camera_stop = "camera_stop"
+    ack = "ack"
+    error = "error"
+
+
+AGENT_TO_HUB_TYPES = frozenset(
+    {
+        MessageType.hello.value,
+        MessageType.telemetry.value,
+        MessageType.event.value,
+        MessageType.command_result.value,
+        MessageType.heartbeat.value,
+    }
+)
+
+HUB_TO_AGENT_TYPES = frozenset(
+    {
+        MessageType.hello_ack.value,
+        MessageType.hello_reject.value,
+        MessageType.command.value,
+        MessageType.file_offer.value,
+        MessageType.camera_request.value,
+        MessageType.camera_stop.value,
+        MessageType.ack.value,
+        MessageType.error.value,
+    }
+)
+
+# Hub messages that carry a command_id and are answered with a command_result.
+COMMAND_BEARING_TYPES = frozenset(
+    {
+        MessageType.command.value,
+        MessageType.file_offer.value,
+        MessageType.camera_request.value,
+        MessageType.camera_stop.value,
+    }
+)
+
+
+class EventKind(StrEnum):
+    snapshot = "snapshot"
+    status_changed = "status_changed"
+    job_changed = "job_changed"
+    error_changed = "error_changed"
+
+
+class CommandAction(StrEnum):
+    start_print = "start_print"
+    pause = "pause"
+    resume = "resume"
+    cancel = "cancel"
+    upload_file = "upload_file"
+
+
+class HelloRejectCode(StrEnum):
+    protocol_unsupported = "protocol_unsupported"
+    auth_rejected = "auth_rejected"
+    location_unknown = "location_unknown"
+    temporarily_unavailable = "temporarily_unavailable"
+
+
+# Only a hub that says it is busy is worth reconnecting to. Every other code, an
+# unknown code and a missing code are terminal: retrying cannot change the answer,
+# and treating them as network failures is what produces an endless reconnect loop.
+RETRYABLE_HELLO_REJECT_CODES = frozenset({HelloRejectCode.temporarily_unavailable.value})
+
+
+def is_retryable_hello_reject(code: str) -> bool:
+    return code in RETRYABLE_HELLO_REJECT_CODES
+
+
 class PrinterStatus(StrEnum):
     offline = "offline"
     idle = "idle"
@@ -34,6 +116,24 @@ class CommandStatus(StrEnum):
     failed = "failed"
     unsupported = "unsupported"
     timeout = "timeout"
+
+
+_JOB_STATUS_BY_PRINTER_STATUS = {
+    PrinterStatus.printing: JobStatus.printing,
+    PrinterStatus.paused: JobStatus.paused,
+    PrinterStatus.finished: JobStatus.finished,
+    PrinterStatus.error: JobStatus.failed,
+}
+
+
+def job_status_for(printer_status: PrinterStatus) -> JobStatus | None:
+    """Job status implied by a printer status, or None when no job is on the bed.
+
+    `PrinterStatus` and `JobStatus` are separate vocabularies on the wire: idle,
+    offline and maintenance describe a machine, not a job, so they map to no job
+    status at all rather than leaking a printer value into `job.status`.
+    """
+    return _JOB_STATUS_BY_PRINTER_STATUS.get(printer_status)
 
 
 @dataclass(slots=True)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "printer-agent"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Edge agent for a distributed 3D printer fleet"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,13 +22,25 @@ dev = [
 windows = [
   "pywin32>=306; platform_system == 'Windows'",
 ]
+# Desktop app only. The service never imports Qt, so its runtime footprint is
+# unchanged by installing this extra.
+gui = [
+  "PySide6-Essentials>=6.7,<7",
+]
 
 [project.scripts]
 printer-agent = "printer_agent.cli:main"
-printer-agent-gui = "printer_agent.gui:main"
+
+# gui-scripts, not scripts: setuptools builds these against pythonw.exe, so
+# launching the app never opens a console window.
+[project.gui-scripts]
+printer-agent-gui = "printer_agent.desktop:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+"printer_agent.desktop" = ["resources/*.ico"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

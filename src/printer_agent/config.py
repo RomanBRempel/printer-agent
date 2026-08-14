@@ -61,12 +61,24 @@ class AgentConfig:
 _REQUIRED_KEYS = ("hub_url", "agent_token", "location_key")
 
 
-def load_config(path: str | Path = "agent.yaml", env: os._Environ[str] | None = None) -> AgentConfig:
+def parse_config(
+    path: str | Path = "agent.yaml", env: os._Environ[str] | None = None
+) -> tuple[AgentConfig, list[str]]:
+    """Load and validate without raising: returns the config and its errors.
+
+    Callers that can act on a partially valid config — the service installer,
+    the desktop editor — need the parsed values *and* the reasons it is not
+    runnable yet. Only a malformed YAML document still raises.
+    """
     env = env or os.environ
     data = _read_yaml(Path(path)) if Path(path).exists() else {}
     merged = _apply_env_overrides(data, env)
     config = config_from_dict(merged)
-    errors = validate_config(config)
+    return config, validate_config(config)
+
+
+def load_config(path: str | Path = "agent.yaml", env: os._Environ[str] | None = None) -> AgentConfig:
+    config, errors = parse_config(path, env)
     if errors:
         raise ConfigError(errors)
     return config

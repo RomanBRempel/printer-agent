@@ -27,7 +27,12 @@ $venvPath = Join-Path $installRootPath ".venv"
 $configDir = Join-Path $env:ProgramData "printer-agent"
 $configPath = Join-Path $configDir "agent.yaml"
 $startMenuDir = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\printer-agent"
-$desktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "printer-agent GUI.lnk"
+$desktopDir = [Environment]::GetFolderPath("Desktop")
+$desktopShortcuts = @(
+    (Join-Path $desktopDir "Printer Agent.lnk"),
+    (Join-Path $desktopDir "Printer Agent - Configure.lnk"),
+    (Join-Path $desktopDir "printer-agent GUI.lnk")
+)
 
 if (Test-Path $venvPath) {
     $pythonExe = Join-Path $venvPath "Scripts\python.exe"
@@ -43,7 +48,9 @@ if (Test-Path $venvPath) {
 if (Test-Path $startMenuDir) {
     Remove-Item $startMenuDir -Recurse -Force
 }
-Try-RemoveShortcut -ShortcutPath $desktopShortcut
+foreach ($shortcut in $desktopShortcuts) {
+    Try-RemoveShortcut -ShortcutPath $shortcut
+}
 
 if (Test-Path $installRootPath) {
     Remove-Item $installRootPath -Recurse -Force

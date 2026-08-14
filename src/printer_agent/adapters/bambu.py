@@ -10,7 +10,7 @@ from typing import Any
 from aiomqtt import Client
 
 from ..config import PrinterConfig
-from ..contracts import ErrorSnapshot, JobSnapshot, PrinterCapabilities, PrinterSnapshot, PrinterStatus, TemperatureSnapshot, utc_now_iso
+from ..contracts import ErrorSnapshot, JobSnapshot, JobStatus, PrinterCapabilities, PrinterSnapshot, PrinterStatus, TemperatureSnapshot, job_status_for, utc_now_iso
 from .base import PrinterAdapter, UnsupportedCommandError
 
 
@@ -36,6 +36,92 @@ def normalize_bambu_status(raw_status: str) -> PrinterStatus:
 
 BAMBU_USER_CANCELLED = 50348044
 
+BAMBU_SSDP_PORT = 2021
+BAMBU_SSDP_GROUP = "239.255.255.250"
+BAMBU_MQTT_PORT = 8883
+
+
+def parse_bambu_ssdp(datagram: bytes, sender_ip: str) -> dict[str, Any] | None:
+    """Parse one Bambu SSDP NOTIFY into a discovery record.
+
+    Bambu printers announce themselves on UDP 2021 with an SSDP-shaped message
+    whose vendor headers carry the serial, model and user-assigned name — which
+    is everything needed to fill in a printer entry except the access code.
+    """
+    try:
+        text = datagram.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    lines = text.splitlines()
+    if not lines or not lines[0].upper().startswith(("NOTIFY", "HTTP/1.1 200")):
+        return None
+
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        name, separator, value = line.partition(":")
+        if separator:
+            headers[name.strip().upper()] = value.strip()
+
+    location = headers.get("LOCATION", "").strip()
+    host = location or sender_ip
+    serial = headers.get("USN", "").strip()
+    if not serial and not host:
+        return None
+    return {
+        "brand": "bambu",
+        "host": host,
+        "port": BAMBU_MQTT_PORT,
+        "name": headers.get("DEVNAME.BAMBU.COM", "").strip() or serial or host,
+        "model": headers.get("DEVMODEL.BAMBU.COM", "").strip(),
+        "serial": serial,
+        "source": "ssdp",
+    }
+
+
+async def discover_bambu(timeout_s: float = 6.0) -> list[dict[str, Any]]:
+    """Listen on the Bambu SSDP port for printer announcements.
+
+    Printers broadcast on their own schedule, so this listens for the whole
+    window rather than expecting a reply to a probe; an M-SEARCH is sent first
+    because some firmware answers it immediately.
+    """
+    loop = asyncio.get_running_loop()
+    found: dict[str, dict[str, Any]] = {}
+
+    class _Protocol(asyncio.DatagramProtocol):
+        def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+            record = parse_bambu_ssdp(data, addr[0])
+            if record is not None:
+                found[record.get("serial") or record["host"]] = record
+
+    transport = None
+    try:
+        transport, _ = await loop.create_datagram_endpoint(
+            _Protocol,
+            local_addr=("0.0.0.0", BAMBU_SSDP_PORT),
+            reuse_port=None,
+            allow_broadcast=True,
+        )
+    except OSError:
+        # Port already bound (often by Bambu Studio) — nothing to listen with.
+        return []
+
+    try:
+        search = (
+            "M-SEARCH * HTTP/1.1\r\n"
+            f"HOST: {BAMBU_SSDP_GROUP}:{BAMBU_SSDP_PORT}\r\n"
+            'MAN: "ssdp:discover"\r\n'
+            "MX: 1\r\n"
+            "ST: urn:bambulab-com:device:3dprinter:1\r\n\r\n"
+        ).encode()
+        with suppress(OSError):
+            transport.sendto(search, (BAMBU_SSDP_GROUP, BAMBU_SSDP_PORT))
+        await asyncio.sleep(timeout_s)
+    finally:
+        transport.close()
+
+    return list(found.values())
+
 
 class BambuAdapter(PrinterAdapter):
     def __init__(self, printer: PrinterConfig):
@@ -49,6 +135,9 @@ class BambuAdapter(PrinterAdapter):
         self._latest_snapshot: PrinterSnapshot | None = None
         self._connected = False
         self._message_count = 0
+        #: MQTT client id. Defaults to the serial; a second consumer (the desktop
+        #: app) overrides it so the broker does not evict the service's session.
+        self.client_identifier: str | None = None
 
     async def connect(self) -> None:
         if self._connection_task is not None and not self._connection_task.done():
@@ -127,7 +216,7 @@ class BambuAdapter(PrinterAdapter):
                     port=self.printer.port or 8883,
                     username="bblp",
                     password=self._access_code,
-                    identifier=serial,
+                    identifier=self.client_identifier or serial,
                     keepalive=30,
                     tls_context=self._tls_context(),
                     tls_insecure=True,
@@ -240,7 +329,8 @@ class BambuAdapter(PrinterAdapter):
             current_file = None
         layers_total = self._safe_int(print_state.get("total_layer_num"))
         current_layer = self._safe_int(print_state.get("layer_num"))
-        job_status = self._job_status_from_printer(status)
+        error_code = self._safe_int(print_state.get("print_error"))
+        job_status = self._job_status_from_printer(status, error_code)
         job = JobSnapshot(
             name=current_file,
             progress_pct=progress,
@@ -257,7 +347,6 @@ class BambuAdapter(PrinterAdapter):
             bed_target=self._safe_float(print_state.get("bed_target_temper")),
             chamber=self._safe_float(print_state.get("chamber_temper")),
         )
-        error_code = self._safe_int(print_state.get("print_error"))
         error_message = None
         if error_state and error_state.get("message"):
             error_message = str(error_state.get("message"))
@@ -287,8 +376,10 @@ class BambuAdapter(PrinterAdapter):
         return status
 
     @staticmethod
-    def _job_status_from_printer(printer_status: PrinterStatus) -> PrinterStatus:
-        return printer_status
+    def _job_status_from_printer(printer_status: PrinterStatus, print_error: int | None) -> JobStatus | None:
+        if printer_status is PrinterStatus.finished and print_error == BAMBU_USER_CANCELLED:
+            return JobStatus.cancelled
+        return job_status_for(printer_status)
 
     @staticmethod
     def _safe_float(value: Any) -> float | None:

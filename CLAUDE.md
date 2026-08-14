@@ -14,12 +14,13 @@ The repo uses a local venv at `.venv` (see [.vscode/settings.json](.vscode/setti
 
 ```bash
 python -m pip install -r requirements-dev.txt   # runtime + test deps
+python -m pip install -r requirements-gui.txt   # + PySide6, needed only for the desktop app
 python -m pytest                                 # full suite (live tests auto-skip)
 python -m pytest tests/test_config.py            # one file
 python -m pytest tests/test_config.py::test_load_config_with_env_override  # one test
 python -m printer_agent --config agent.yaml run
 python -m printer_agent --config agent.yaml status
-python -m printer_agent gui --config agent.yaml
+python -m printer_agent --config agent.yaml gui  # desktop app
 ```
 
 `pytest` picks up `pythonpath = ["src"]` from [pyproject.toml](pyproject.toml), so no install is needed to run tests. There is no configured linter or formatter.
@@ -44,29 +45,46 @@ Data flows in one direction on each side: adapters normalize *up* into contract 
 
 **Registry** — [src/printer_agent/core/registry.py](src/printer_agent/core/registry.py) maps brand string → adapter class. A new brand needs an entry here *and* in the `printer.brand not in {...}` check in `validate_config` ([config.py](src/printer_agent/config.py)) — the two lists must agree or valid configs get rejected.
 
-**State diffing** — [src/printer_agent/core/state.py](src/printer_agent/core/state.py) keeps last-known snapshots and returns a `StateChange` only when status, job signature, or error signature differ. Temperature drift deliberately does not raise an event; temps ride along in lossy telemetry instead.
+**State diffing** — [src/printer_agent/core/state.py](src/printer_agent/core/state.py) keeps last-known snapshots and returns a `StateChange` only when status, job signature, or error signature differ. The job signature is `(name, status)` only: temperature drift, progress, layer and timing counters deliberately do not raise events — including them would write a durable outbox row on every poll of a running print. All of it rides along in lossy telemetry instead.
 
 **Durable outbox** — [src/printer_agent/core/outbox.py](src/printer_agent/core/outbox.py) is a SQLite store (WAL, `synchronous=FULL`) with two tables: `events` (pending until the hub acks by `msg_id`) and `command_results` (idempotency by `command_id`). This is the crash-safety boundary — events survive restarts and a replayed command returns its stored result.
 
-**Uplink** — [uplink/connection.py](src/printer_agent/uplink/connection.py) owns the WSS session: derives `wss://` from `hub_url`, sends `hello` with per-printer capabilities, handles `hello_ack`/`hello_reject`/`ack`/`command`, and reconnects with exponential backoff between `command_reconnect_backoff_s.min`/`.max`. [uplink/commands.py](src/printer_agent/uplink/commands.py) dispatches actions to adapters and maps exceptions onto `CommandStatus` — it checks the outbox for an existing result *before* executing, which is where idempotency is enforced.
+**Uplink** — [uplink/connection.py](src/printer_agent/uplink/connection.py) owns the WSS session: derives `wss://` from `hub_url`, sends `hello` with per-printer capabilities, handles `hello_ack`/`hello_reject`/`ack`/`command`/`error`, and reconnects with exponential backoff between `command_reconnect_backoff_s.min`/`.max`. It runs a second task, `_poll_loop`, for the whole life of `run()`: every `telemetry_interval_s` it polls all adapters concurrently, batches the snapshots into one `telemetry` message, feeds them through `PrinterStateStore` to queue `event`s in the outbox, and flushes unacked events (with a resend delay so a slow ack does not cause a send storm). The poll loop keeps running while the hub is unreachable — telemetry is dropped, events accumulate durably. Only a *retryable* `hello_reject` reconnects; every other code raises `HubRejected` out of `run()` and stops the agent, since retrying an unknown token cannot change the answer. [uplink/commands.py](src/printer_agent/uplink/commands.py) dispatches actions to adapters and maps exceptions onto `CommandStatus` — it checks the outbox for an existing result *before* executing, which is where idempotency is enforced.
 
-**Config** — [config.py](src/printer_agent/config.py) loads YAML, applies uppercase env overrides (`HUB_URL`, `AGENT_TOKEN`, `LOCATION_KEY`, `TELEMETRY_INTERVAL_S`, `HEARTBEAT_INTERVAL_S`, `OUTBOX_DATABASE_PATH`, `UPDATE_FEED_URL`, `AUTO_UPDATE`, `UPDATE_CHECK_ON_STARTUP`), then validates. Validation collects *all* errors into `ConfigError.errors` rather than failing on the first. A missing config file is not an error — env-only configuration is supported.
+**Config** — [config.py](src/printer_agent/config.py) loads YAML, applies uppercase env overrides (`HUB_URL`, `AGENT_TOKEN`, `LOCATION_KEY`, `TELEMETRY_INTERVAL_S`, `HEARTBEAT_INTERVAL_S`, `OUTBOX_DATABASE_PATH`, `UPDATE_FEED_URL`, `AUTO_UPDATE`, `UPDATE_CHECK_ON_STARTUP`), then validates. Validation collects *all* errors into `ConfigError.errors` rather than failing on the first. A missing config file is not an error — env-only configuration is supported. `hub_url` carries the full endpoint URL including the path (`https://host/api/printers/agent`); a bare host reaches the site root and gets HTML instead of a WebSocket handshake, so `_hub_wss_url()` falls back to `DEFAULT_AGENT_PATH` and logs a warning.
 
-**Entry points** — [cli.py](src/printer_agent/cli.py) (`run`, `status`, `gui`, `install-service`, `uninstall-service`, `update`, `publish-update`), [windows_service.py](src/printer_agent/windows_service.py) (pywin32 service; guards its imports so the module is importable on non-Windows), [gui.py](src/printer_agent/gui.py) (Tkinter config editor), [updates.py](src/printer_agent/updates.py) (manifest feed + `pip install --upgrade`).
+**Entry points** — [cli.py](src/printer_agent/cli.py) (`run`, `status`, `gui`, `install-service`, `uninstall-service`, `update`, `publish-update`), [windows_service.py](src/printer_agent/windows_service.py) (pywin32 service; guards its imports so the module is importable on non-Windows), [desktop/](src/printer_agent/desktop/) (the PySide6 app; [gui.py](src/printer_agent/gui.py) is a shim kept for pre-existing shortcuts), [updates.py](src/printer_agent/updates.py) (manifest feed + `pip install --upgrade`).
 
-### Known scaffold gap
+**Desktop app** — [src/printer_agent/desktop/](src/printer_agent/desktop/) is the operator UI and the only place Qt is imported; the service and CLI never touch it, and PySide6 lives in the `gui` extra rather than in runtime deps. [theme.py](src/printer_agent/desktop/theme.py) is pure data and string building — palettes, accent presets, and the QSS — so the colour system is testable without a display; only `apply_window_backdrop` touches Win32. [prefs.py](src/printer_agent/desktop/prefs.py) keeps theme/accent in `%APPDATA%\printer-agent\ui.json`, deliberately outside `agent.yaml`. [state.py](src/printer_agent/desktop/state.py) holds `AppState` plus a *tolerant* config reader: the editor must open on a config the service rejects, which is the whole point of the page. [probe.py](src/printer_agent/desktop/probe.py) runs adapter polling, service queries and blocking one-shots off the UI thread.
 
-The CLI `run` command currently logs a startup line and blocks on an empty `asyncio.Event` — it does **not** start `HubConnection` or any printer polling loop. Only `PrinterAgentService._run` in [windows_service.py](src/printer_agent/windows_service.py) wires the outbox and hub connection together. Wiring the CLI path is pending work, not an oversight to route around.
+**Diagnostics and discovery** — [uplink/diagnostics.py](src/printer_agent/uplink/diagnostics.py) holds `check_hub` and `check_printer`; both return a staged `CheckResult` rather than a boolean, and both reuse the real handshake helpers (`hub_wss_url`, `hello_payload`) so a passing check means the service will connect too. [core/discovery.py](src/printer_agent/core/discovery.py) enumerates subnets and merges results; the actual probing is per-brand and lives in the adapters (`discover_moonraker`, `discover_bambu`/`parse_bambu_ssdp`), because a Moonraker HTTP probe and a Bambu SSDP datagram are vendor protocol details.
+
+Two invariants worth keeping:
+
+- `cli.py` dispatches `gui` **before** `load_config`. Validating first is what made the old shortcut die silently under `pythonw.exe`, where `parser.exit()` writes to a `sys.stderr` that does not exist.
+- `printer-agent-gui` belongs in `[project.gui-scripts]`, not `[project.scripts]` — that is what makes the launcher a GUI-subsystem exe and stops Windows opening a console.
+- The Windows installer must ship the wheel it was built from. [build-gui-installer-exe.ps1](installer/windows/build-gui-installer-exe.ps1) builds one and bundles it; without that, `Resolve-InstallTarget` falls through to the update feed and installs the *previous* release, which is how an install once ended up running the old Tkinter editor behind a console window. [install.ps1](installer/windows/install.ps1) now force-reinstalls the package (a local build carries the same version string, so pip would otherwise keep the old code) and refuses to create shortcuts unless `printer_agent.desktop` imports and the launcher is PE subsystem 2.
+
+Both entry points now run the same thing: `cli.run_agent` and `PrinterAgentService._run` in [windows_service.py](src/printer_agent/windows_service.py) each build an `EventOutbox`, hand it to `HubConnection`, and await `run()`.
 
 ## Rules for changes here
 
 - Protocol-specific code stays inside `src/printer_agent/adapters/`. Nothing outside that package should know Moonraker JSON-RPC shapes or Bambu MQTT topics.
-- Preserve the outbound-only model — no inbound HTTP or listening ports in the agent service. The GUI is a local config surface only.
+- Preserve the outbound-only model — no inbound HTTP or listening ports in the agent service. The desktop app is a local surface only; its printer polling is outbound and stops with the window.
 - No scheduling, queueing, or RD Control business logic; no persistence beyond the outbox and idempotency store.
 - Update [docs/contracts/agent-hub-v1.md](docs/contracts/agent-hub-v1.md) alongside any message-shape change, and follow its evolution rules: add fields, never rename or remove them; breaking changes bump `PROTOCOL_VERSION`.
-- Keep runtime dependencies minimal (currently `aiohttp`, `aiomqtt`, `PyYAML`); mirror any change across [requirements.txt](requirements.txt) and `pyproject.toml`.
+- This repo is the *owner* of that contract and RD Control is the follower — cross-repository coordination rules (document before code, hub deployed before agents, handoff written as a file rather than agreed in chat) live in [docs/agent-collaboration.md](docs/agent-collaboration.md). Never edit the RD Control repository directly; write a handoff file under `docs/handoff/` instead.
+- Keep runtime dependencies minimal (currently `aiohttp`, `aiomqtt`, `PyYAML`); mirror any change across [requirements.txt](requirements.txt) and `pyproject.toml`. PySide6 is a desktop-only dependency and belongs in the `gui` extra and [requirements-gui.txt](requirements-gui.txt), never in the runtime set.
 - Never log `agent_token`, Bambu `access_code`, or Moonraker API keys.
 
 ## Repository skill conventions
 
-[.github/skills/README.md](.github/skills/README.md) asks that these skills be preferred over ad-hoc reasoning: `managing-python-dependencies` for dependency/environment changes, `project-setup-info-local` for scaffolding, `python-fact-grounded-coding` for debugging grounded in runtime output, `pylance-refactoring` for refactors and import cleanup.
+[.github/skills/README.md](.github/skills/README.md) asks that skills be preferred over ad-hoc reasoning, and routes by which agent is running.
+
+Available to Copilot / VS Code chat via the Pylance extension, **not** to the Claude Code CLI: `python-fact-grounded-coding` for debugging grounded in runtime output, `pylance-refactoring` for refactors and import cleanup, plus `pylance-python-profiling` and `pylance-docs`.
+
+Earlier revisions also named `managing-python-dependencies` and `project-setup-info-local`; neither is installed anywhere in this workspace, so those references are stale.
+
+The one skill vendored into `.github/skills/` — `premium-frontend-ui` — is out of scope here and should not be applied; see [.github/skills/CHANGELOG.md](.github/skills/CHANGELOG.md). That changelog is append-only and records every skill admission, rejection, and repair.
+
+The `<!-- agent-ninja-START/END -->` markers in [AGENTS.md](AGENTS.md) and [.github/skills/README.md](.github/skills/README.md) fence a *generated* span. Never move hand-written rules inside them — a regeneration on 2026-08-14 deleted the entire AGENTS.md working-rules section that way.

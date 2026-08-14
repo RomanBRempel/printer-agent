@@ -5,7 +5,7 @@ from typing import Any
 
 from ..adapters.base import PrinterAdapter, UnsupportedCommandError
 from ..core.outbox import EventOutbox
-from ..contracts import CommandStatus
+from ..contracts import CommandAction, CommandStatus
 
 
 class CommandProcessor:
@@ -26,15 +26,15 @@ class CommandProcessor:
         response: dict[str, Any] = {}
 
         try:
-            if action == "start_print":
+            if action == CommandAction.start_print.value:
                 response = await adapter.start_print(str(args["file_ref"]))
-            elif action == "pause":
+            elif action == CommandAction.pause.value:
                 response = await adapter.pause()
-            elif action == "resume":
+            elif action == CommandAction.resume.value:
                 response = await adapter.resume()
-            elif action == "cancel":
+            elif action == CommandAction.cancel.value:
                 response = await adapter.cancel()
-            elif action == "upload_file":
+            elif action == CommandAction.upload_file.value:
                 response = await adapter.upload_file(Path(args["local_path"]), str(args["remote_name"]))
             else:
                 raise UnsupportedCommandError(f"unknown action {action}")

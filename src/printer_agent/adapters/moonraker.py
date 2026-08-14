@@ -7,7 +7,7 @@ from typing import Any
 import aiohttp
 
 from ..config import PrinterConfig
-from ..contracts import ErrorSnapshot, JobSnapshot, PrinterCapabilities, PrinterSnapshot, PrinterStatus, TemperatureSnapshot, utc_now_iso
+from ..contracts import ErrorSnapshot, JobSnapshot, PrinterCapabilities, PrinterSnapshot, PrinterStatus, TemperatureSnapshot, job_status_for, utc_now_iso
 from .base import PrinterAdapter, UnsupportedCommandError
 
 
@@ -30,6 +30,63 @@ _MOONRAKER_STATUS_MAP = {
 
 def normalize_moonraker_status(raw_status: str) -> PrinterStatus:
     return _MOONRAKER_STATUS_MAP.get(raw_status.lower(), PrinterStatus.maintenance)
+
+
+MOONRAKER_DISCOVERY_PORTS: tuple[int, ...] = (7125, 80)
+
+
+async def discover_moonraker(
+    hosts: list[str], *, ports: tuple[int, ...] = MOONRAKER_DISCOVERY_PORTS, timeout_s: float = 1.5
+) -> list[dict[str, Any]]:
+    """Probe hosts for a Moonraker HTTP API.
+
+    Klipper has no service announcement to listen for, so the only reliable
+    local discovery is asking each address whether it answers `/printer/info`.
+    A bare TCP connect comes first because it fails fast on the ~99% of
+    addresses that are not printers.
+    """
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+        results = await asyncio.gather(
+            *(_probe_moonraker_host(session, host, ports, timeout_s) for host in hosts)
+        )
+    return [item for item in results if item is not None]
+
+
+async def _probe_moonraker_host(
+    session: aiohttp.ClientSession, host: str, ports: tuple[int, ...], timeout_s: float
+) -> dict[str, Any] | None:
+    for port in ports:
+        try:
+            _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout_s)
+        except (OSError, asyncio.TimeoutError, TimeoutError):
+            continue
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (OSError, asyncio.TimeoutError):
+            pass
+
+        try:
+            async with session.get(f"http://{host}:{port}/printer/info") as response:
+                if response.status != 200:
+                    continue
+                body = await response.json(content_type=None)
+        except Exception:
+            continue
+
+        result = body.get("result") if isinstance(body, dict) else None
+        if not isinstance(result, dict) or "state" not in result:
+            continue  # something else is listening on this port
+        return {
+            "brand": "moonraker",
+            "host": host,
+            "port": port,
+            "name": str(result.get("hostname") or "") or host,
+            "model": str(result.get("software_version") or ""),
+            "serial": "",
+            "source": "http",
+        }
+    return None
 
 
 class MoonrakerAdapter(PrinterAdapter):
@@ -170,7 +227,7 @@ class MoonrakerAdapter(PrinterAdapter):
             layers_total=total_layer,
             time_elapsed_s=self._safe_int(print_duration),
             time_remaining_s=time_remaining,
-            status=PrinterStatus.printing if is_active else printer_status,
+            status=job_status_for(PrinterStatus.printing if is_active else printer_status),
         )
         temps = TemperatureSnapshot(
             nozzle=self._safe_float(extruder.get("temperature")),

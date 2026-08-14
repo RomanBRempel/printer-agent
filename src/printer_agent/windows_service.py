@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .config import ConfigError, load_config
 from .core.outbox import EventOutbox
+from .logging import configure_logging
 from .uplink.connection import HubConnection
 from .updates import apply_update, check_for_update
 
@@ -45,6 +46,9 @@ if _IMPORT_ERROR is None:
             win32event.SetEvent(self.stop_event)
 
         def SvcDoRun(self):
+            # A service has no console, so the rotating file handler is the only
+            # place these records land — and it is what the app's Logs page reads.
+            configure_logging()
             servicemanager.LogInfoMsg("printer-agent service starting")
             try:
                 asyncio.run(self._run())

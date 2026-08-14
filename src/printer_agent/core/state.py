@@ -3,7 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ..contracts import ErrorSnapshot, JobSnapshot, PrinterSnapshot, PrinterStatus, TemperatureSnapshot
+from ..contracts import (
+    ErrorSnapshot,
+    EventKind,
+    JobSnapshot,
+    PrinterSnapshot,
+    PrinterStatus,
+    TemperatureSnapshot,
+)
 
 
 @dataclass(slots=True)
@@ -35,27 +42,25 @@ class PrinterStateStore:
 
     def _diff(self, previous: PrinterSnapshot | None, current: PrinterSnapshot) -> list[str]:
         if previous is None:
-            return ["snapshot"]
+            return [EventKind.snapshot.value]
         kinds: list[str] = []
         if previous.status != current.status:
-            kinds.append("status_changed")
+            kinds.append(EventKind.status_changed.value)
         if self._job_signature(previous.job) != self._job_signature(current.job):
-            kinds.append("job_changed")
+            kinds.append(EventKind.job_changed.value)
         if self._error_signature(previous.error) != self._error_signature(current.error):
-            kinds.append("error_changed")
+            kinds.append(EventKind.error_changed.value)
         return kinds
 
     @staticmethod
     def _job_signature(job: JobSnapshot) -> tuple[Any, ...]:
-        return (
-            job.name,
-            job.progress_pct,
-            job.layer,
-            job.layers_total,
-            job.time_elapsed_s,
-            job.time_remaining_s,
-            job.status,
-        )
+        """Identity and phase of the job, deliberately without moving values.
+
+        Progress, layer and timing counters change on every poll; including them
+        would put a durable event in the outbox each cycle of a print. They ride
+        along in lossy telemetry instead, same as temperature drift.
+        """
+        return (job.name, job.status)
 
     @staticmethod
     def _error_signature(error: ErrorSnapshot) -> tuple[Any, ...]:

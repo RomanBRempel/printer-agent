@@ -1,4 +1,6 @@
-hub_url: https://rd-control.example.com
+# Full endpoint URL, including the agent path. A bare host reaches the site
+# root and gets HTML instead of a WebSocket handshake.
+hub_url: https://rd-control.example.com/api/printers/agent
 agent_token: replace-me
 location_key: loc-001
 telemetry_interval_s: 5

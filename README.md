@@ -28,7 +28,7 @@ It has one job: translate vendor-specific printer protocols into a single normal
 
 - Секреты (`agent_token`, `access_code`, ключи API) не должны попадать в логи.
 - Состояние хранится на диске, поэтому перезапуск сохраняет неотправленные события и результаты команд.
-- Настройка на Windows выполняется через локальный GUI и службу; входящих портов при этом не появляется.
+- Настройка на Windows выполняется через локальное приложение Printer Agent и службу; входящих портов при этом не появляется.
 
 **Исключение дублей (multi-agent)**
 
@@ -61,7 +61,7 @@ The agent discovers and polls printers in its location, normalizes their state, 
 
 - `src/printer_agent/adapters/` protocol integrations for Moonraker and Bambu.
 - `src/printer_agent/core/` normalized state, diffing, and durable local storage.
-- `src/printer_agent/uplink/` outbound WSS connection, hello/heartbeat, and command routing.
+- `src/printer_agent/uplink/` outbound WSS connection, hello/heartbeat, printer polling, telemetry and event delivery, and command routing.
 - `docs/contracts/agent-hub-v1.md` versioned contract between the agent and RD Control.
 
 ## What is already scaffolded
@@ -71,9 +71,12 @@ The agent discovers and polls printers in its location, normalizes their state, 
 - config loading from file plus environment overrides.
 - crash-safe local outbox and command idempotency storage in SQLite.
 - adapter registry for Moonraker and Bambu.
-- WSS uplink and command dispatch skeletons.
+- WSS uplink that polls printers on `telemetry_interval_s`, batches snapshots into
+  one `telemetry` message, queues state changes as durable `event`s, and clears
+  them from the outbox on hub `ack`.
+- command dispatch with idempotency by `command_id`.
 - Dockerfile and systemd unit template.
-- Windows configuration GUI backed by Tkinter.
+- Native Windows desktop app (PySide6, Fluent styling) with light/dark/system themes and accent colours.
 - Windows installer scripts that create a service, configuration file, and launch shortcuts.
 
 ## Local setup
@@ -152,10 +155,75 @@ The live test suite connects to the configured printers, waits for a live snapsh
 - systemd: use `systemd/printer-agent.service` as the template unit.
 - Windows: run `installer/windows/install.cmd` from an elevated prompt.
 
-## Windows configuration
+## Windows desktop app
 
-The GUI opens with `python -m printer_agent gui --config agent.yaml` or through the Start Menu shortcut created by the installer.
-The installer writes the shared service configuration to `ProgramData\printer-agent\agent.yaml` and registers the `printer-agent` Windows service.
+The desktop app is the operator surface: service state, live printer status, configuration, updates and logs.
+
+```bash
+python -m pip install -r requirements-gui.txt   # or: pip install "printer-agent[gui]"
+printer-agent-gui --config agent.yaml           # installed launcher, no console window
+python -m printer_agent --config agent.yaml gui # equivalent, from a source checkout
+```
+
+`printer-agent-gui` is declared under `[project.gui-scripts]`, so setuptools builds it against
+`pythonw.exe` and Windows starts it without a terminal. The installer points both shortcuts at it.
+
+Pages:
+
+| Page | What it does |
+|------|--------------|
+| Обзор | Windows service state with start/stop/restart, outbox counters, hub wiring, config validation |
+| Хаб | Hub URL, agent token, location key, intervals, backoff, outbox — **and the agent → hub check** |
+| Принтеры | Printer inventory, network discovery, add/edit/remove, live status, **agent → printer check** |
+| Обновления | Update feed URL, check and apply a release, auto-update toggles |
+| Логи | Tail of the rotating log files under `ProgramData\printer-agent\logs` |
+| Оформление | Light / dark / follow-system theme, eight accent colours, poll interval |
+
+The hub link and the printer setup are separate pages on purpose: nothing on **Хаб** knows what a
+printer is, and nothing on **Принтеры** knows the hub exists.
+
+### Connectivity checks
+
+[uplink/diagnostics.py](src/printer_agent/uplink/diagnostics.py) reports *stages*, not a boolean —
+"could not connect" is useless to an operator, while "TLS established, hello rejected: invalid_token"
+names the field to fix.
+
+- **Агент → хаб** (Хаб page): validates the fields, resolves the host, opens WSS, completes the
+  `hello` handshake and reports what the hub answered. It checks the values *in the form*, so a URL
+  can be tried before it is saved, and it opens its own short-lived session — the running service is
+  untouched.
+- **Агент → принтер** (Принтеры page): validates the entry, opens a TCP connection, connects the
+  adapter, then reads a snapshot and reports the printer's status.
+
+### Network discovery
+
+**Найти в сети** on the Принтеры page sweeps the locally attached subnets:
+
+- **Moonraker** has nothing to announce itself with, so discovery asks each address whether it
+  answers `/printer/info`, TCP-preflighted so non-printers fail fast.
+- **Bambu Lab** announces itself over SSDP on UDP 2021; the app listens for those datagrams and
+  reads the serial, model and user-assigned name straight out of the vendor headers.
+
+The sweep is capped at 1024 addresses — a `/16` is 65k probes and, on a corporate network, is
+indistinguishable from a port scan. Already-configured hosts are hidden from the results, and Bambu
+entries still require the access code from the printer's own screen; nothing on the network hands
+that over. Protocol-specific probing lives in the adapters
+([moonraker](src/printer_agent/adapters/moonraker.py), [bambu](src/printer_agent/adapters/bambu.py));
+[core/discovery.py](src/printer_agent/core/discovery.py) only enumerates subnets and merges results.
+
+Theme and accent live in `%APPDATA%\printer-agent\ui.json` — per user, deliberately not in `agent.yaml`,
+which is the service's contract and is admin-owned.
+
+The app opens even when `agent.yaml` is missing, unparseable, or rejected by `validate_config` — it is the
+tool you use to fix exactly that, and it reports the errors on the Обзор page. When the config lives under
+`ProgramData` and the app runs unelevated, saving falls back to a UAC-elevated copy.
+
+Live status is polled by the app itself, independently of the service, only while the window is open, and can
+be turned off in Оформление. For Bambu Lab printers the app uses its own MQTT client id so it does not evict
+the service's broker session.
+
+The installer writes the shared service configuration to `ProgramData\printer-agent\agent.yaml` and registers
+the `printer-agent` Windows service.
 
 ## Contract source of truth
 
@@ -168,5 +236,5 @@ The installer writes the shared service configuration to `ProgramData\printer-ag
 - Secrets must stay out of logs.
 - Runtime state is disk-backed so restarts preserve pending events and command idempotency.
 - Only adapter modules may contain vendor protocol logic.
-- The GUI is a local configuration surface only; it does not expose inbound ports.
+- The desktop app is a local surface only; it does not expose inbound ports.
 - In multi-agent deployments, deduplicate by stable printer identity per location. Do not rely on `msg_id` as the only duplicate prevention key.
