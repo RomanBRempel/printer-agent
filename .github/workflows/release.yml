@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Generate update manifest
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL_PATH=$(ls dist/*.whl | head -n 1)
+          WHEEL_NAME=$(basename "$WHEEL_PATH")
+          VERSION=$(python - <<'PY'
+          import tomllib
+
+          with open("pyproject.toml", "rb") as fh:
+              data = tomllib.load(fh)
+          print(data["project"]["version"])
+          PY
+          )
+          SHA256=$(python - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          wheel = sorted(Path("dist").glob("*.whl"))[0]
+          print(hashlib.sha256(wheel.read_bytes()).hexdigest())
+          PY
+          )
+          PACKAGE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${WHEEL_NAME}"
+          export VERSION SHA256 PACKAGE_URL
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          sha256 = os.environ["SHA256"]
+          package_url = os.environ["PACKAGE_URL"]
+          manifest = {
+              "version": version,
+              "package_url": package_url,
+              "sha256": sha256,
+              "notes": f"Release {version}",
+              "published_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          destination = Path("dist") / "printer-agent-update.json"
+          destination.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+        
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.whl
+            dist/printer-agent-update.json
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}

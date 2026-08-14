@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -m pytest)",
+      "PowerShell(Test-Path \"c:\\\\#Data\\\\printer-agent\\\\graphify-out\\\\graph.json\"; Get-Command uv -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source; Get-Command pipx -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source; \\(Get-Command python -ErrorAction SilentlyContinue\\).Source)"
+    ]
+  }
+}

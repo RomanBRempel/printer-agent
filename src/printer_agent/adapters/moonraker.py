@@ -1,0 +1,270 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+
+from ..config import PrinterConfig
+from ..contracts import ErrorSnapshot, JobSnapshot, PrinterCapabilities, PrinterSnapshot, PrinterStatus, TemperatureSnapshot, utc_now_iso
+from .base import PrinterAdapter, UnsupportedCommandError
+
+
+_MOONRAKER_STATUS_MAP = {
+    "standby": PrinterStatus.idle,
+    "idle": PrinterStatus.idle,
+    "ready": PrinterStatus.idle,
+    "printing": PrinterStatus.printing,
+    "paused": PrinterStatus.paused,
+    "complete": PrinterStatus.finished,
+    "done": PrinterStatus.finished,
+    "error": PrinterStatus.error,
+    "cancelled": PrinterStatus.finished,
+    "offline": PrinterStatus.offline,
+    "shutdown": PrinterStatus.maintenance,
+    "startup": PrinterStatus.offline,
+    "disconnected": PrinterStatus.offline,
+}
+
+
+def normalize_moonraker_status(raw_status: str) -> PrinterStatus:
+    return _MOONRAKER_STATUS_MAP.get(raw_status.lower(), PrinterStatus.maintenance)
+
+
+class MoonrakerAdapter(PrinterAdapter):
+    def __init__(self, printer: PrinterConfig):
+        super().__init__(printer)
+        self._session: aiohttp.ClientSession | None = None
+        self._base_url = self._build_base_url()
+        self._last_snapshot: PrinterSnapshot | None = None
+
+    async def connect(self) -> None:
+        self._ensure_session()
+        await self._jsonrpc("server.info")
+
+    async def disconnect(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    async def get_state(self) -> PrinterSnapshot:
+        try:
+            response = await self._jsonrpc(
+                "printer.objects.query",
+                {
+                    "objects": {
+                        "webhooks": None,
+                        "print_stats": None,
+                        "virtual_sdcard": None,
+                        "extruder": None,
+                        "heater_bed": None,
+                        "temperature_sensor": None,
+                        "temperature_fan": None,
+                    }
+                },
+            )
+            status = self._build_snapshot_from_response(response)
+        except Exception:
+            status = PrinterSnapshot(
+                printer_key=self.printer.key,
+                status=PrinterStatus.offline,
+                status_raw="offline",
+                job=JobSnapshot(),
+                temps=TemperatureSnapshot(),
+                error=ErrorSnapshot(code="offline", message="Moonraker request failed"),
+                capabilities=self.capabilities(),
+                ts=utc_now_iso(),
+            )
+        self._last_snapshot = status
+        return status
+
+    def capabilities(self) -> PrinterCapabilities:
+        return PrinterCapabilities(pause=True, resume=True, cancel=True, upload=True, camera=False)
+
+    async def start_print(self, file_ref: str) -> dict[str, Any]:
+        raise UnsupportedCommandError("Moonraker print start is not implemented yet")
+
+    async def pause(self) -> dict[str, Any]:
+        await self._jsonrpc("printer.print.pause")
+        return {"ok": True}
+
+    async def resume(self) -> dict[str, Any]:
+        await self._jsonrpc("printer.print.resume")
+        return {"ok": True}
+
+    async def cancel(self) -> dict[str, Any]:
+        await self._jsonrpc("printer.print.cancel")
+        return {"ok": True}
+
+    async def upload_file(self, local_path: str | Path, remote_name: str) -> dict[str, Any]:
+        raise UnsupportedCommandError("Moonraker upload is not implemented yet")
+
+    async def get_camera_frame(self) -> bytes:
+        raise UnsupportedCommandError("Moonraker camera capture is not implemented yet")
+
+    def _build_base_url(self) -> str:
+        scheme = "http"
+        host = self.printer.host
+        port = self.printer.port or 7125
+        return f"{scheme}://{host}:{port}"
+
+    def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            headers: dict[str, str] = {}
+            api_key = self.printer.credentials.get("api_key") if isinstance(self.printer.credentials, dict) else None
+            bearer_token = self.printer.credentials.get("bearer_token") if isinstance(self.printer.credentials, dict) else None
+            if api_key:
+                headers["X-Api-Key"] = str(api_key)
+            if bearer_token:
+                headers["Authorization"] = f"Bearer {bearer_token}"
+            self._session = aiohttp.ClientSession(headers=headers)
+        return self._session
+
+    async def _jsonrpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        session = self._ensure_session()
+        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method, "id": 1}
+        if params:
+            payload["params"] = params
+        async with session.post(f"{self._base_url}/server/jsonrpc", json=payload) as response:
+            response.raise_for_status()
+            body = await response.json()
+        if "error" in body:
+            raise RuntimeError(str(body["error"]))
+        result = body.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Moonraker RPC {method} returned unexpected payload")
+        return result
+
+    def _build_snapshot_from_response(self, response: dict[str, Any]) -> PrinterSnapshot:
+        status_map = response.get("status") or {}
+        webhooks = status_map.get("webhooks") or {}
+        print_stats = status_map.get("print_stats") or {}
+        virtual_sdcard = status_map.get("virtual_sdcard") or {}
+        extruder = status_map.get("extruder") or {}
+        heater_bed = status_map.get("heater_bed") or {}
+        temp_sensor = self._pick_temperature_sensor(status_map)
+        temp_fan = self._pick_temperature_fan(status_map)
+
+        hooks_state = str(webhooks.get("state", "offline")).lower()
+        job_state = str(print_stats.get("state", "standby")).lower()
+        printer_status = self._map_status(hooks_state, job_state)
+        is_active = printer_status in {PrinterStatus.printing, PrinterStatus.paused}
+
+        progress = self._progress_value(virtual_sdcard, print_stats)
+        total_duration = print_stats.get("total_duration")
+        print_duration = print_stats.get("print_duration")
+        time_remaining = self._estimate_remaining(print_duration, progress, total_duration)
+        current_layer = self._safe_int(print_stats.get("info", {}).get("current_layer"))
+        total_layer = self._safe_int(print_stats.get("info", {}).get("total_layer"))
+        current_file = print_stats.get("filename") or virtual_sdcard.get("file_path")
+        if isinstance(current_file, str) and current_file:
+            current_file = Path(current_file).name
+        else:
+            current_file = None
+
+        job = JobSnapshot(
+            name=current_file,
+            progress_pct=progress,
+            layer=current_layer,
+            layers_total=total_layer,
+            time_elapsed_s=self._safe_int(print_duration),
+            time_remaining_s=time_remaining,
+            status=PrinterStatus.printing if is_active else printer_status,
+        )
+        temps = TemperatureSnapshot(
+            nozzle=self._safe_float(extruder.get("temperature")),
+            nozzle_target=self._safe_float(extruder.get("target")),
+            bed=self._safe_float(heater_bed.get("temperature")),
+            bed_target=self._safe_float(heater_bed.get("target")),
+            chamber=self._safe_float(temp_sensor.get("temperature") if temp_sensor else None)
+            if temp_sensor
+            else self._safe_float(temp_fan.get("temperature") if temp_fan else None),
+        )
+        error_message = webhooks.get("message") or print_stats.get("message") or None
+        error = ErrorSnapshot(
+            code=None if printer_status != PrinterStatus.error else hooks_state or job_state,
+            message=str(error_message) if error_message else None,
+        )
+        return PrinterSnapshot(
+            printer_key=self.printer.key,
+            status=printer_status,
+            status_raw=f"webhooks={hooks_state};print_stats={job_state}",
+            job=job,
+            temps=temps,
+            error=error,
+            capabilities=self.capabilities(),
+        )
+
+    @staticmethod
+    def _map_status(webhooks_state: str, job_state: str) -> PrinterStatus:
+        if webhooks_state in {"startup", "disconnected", "offline"}:
+            return PrinterStatus.offline
+        if webhooks_state == "shutdown":
+            return PrinterStatus.maintenance
+        if webhooks_state == "error":
+            return PrinterStatus.error
+        return normalize_moonraker_status(job_state)
+
+    @staticmethod
+    def _progress_value(virtual_sdcard: dict[str, Any], print_stats: dict[str, Any]) -> float | None:
+        progress = virtual_sdcard.get("progress")
+        if progress is None:
+            progress = print_stats.get("info", {}).get("current_layer")
+        if progress is None:
+            return None
+        try:
+            progress_value = float(progress)
+        except (TypeError, ValueError):
+            return None
+        if progress_value <= 1.0:
+            progress_value *= 100.0
+        return max(0.0, min(100.0, progress_value))
+
+    @staticmethod
+    def _estimate_remaining(print_duration: Any, progress_pct: float | None, total_duration: Any) -> int | None:
+        elapsed = MoonrakerAdapter._safe_float(print_duration)
+        if elapsed is None:
+            return None
+        if total_duration is not None:
+            total = MoonrakerAdapter._safe_float(total_duration)
+            if total is not None:
+                return max(0, int(round(total - elapsed)))
+        if progress_pct is None or progress_pct <= 0:
+            return None
+        total_estimate = elapsed / (progress_pct / 100.0)
+        return max(0, int(round(total_estimate - elapsed)))
+
+    @staticmethod
+    def _pick_temperature_sensor(status_map: dict[str, Any]) -> dict[str, Any] | None:
+        sensors = status_map.get("temperature_sensor") or {}
+        if isinstance(sensors, dict) and sensors:
+            first_key = next(iter(sensors))
+            value = sensors.get(first_key)
+            if isinstance(value, dict):
+                return value
+        return None
+
+    @staticmethod
+    def _pick_temperature_fan(status_map: dict[str, Any]) -> dict[str, Any] | None:
+        fans = status_map.get("temperature_fan") or {}
+        if isinstance(fans, dict) and fans:
+            first_key = next(iter(fans))
+            value = fans.get(first_key)
+            if isinstance(value, dict):
+                return value
+        return None
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        try:
+            return None if value is None else float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _safe_int(value: Any) -> int | None:
+        try:
+            return None if value is None else int(float(value))
+        except (TypeError, ValueError):
+            return None

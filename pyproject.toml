@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "printer-agent"
+version = "0.1.0a1"
+description = "Edge agent for a distributed 3D printer fleet"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "aiohttp>=3.10,<4",
+  "aiomqtt>=2.3,<3",
+  "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.24,<1",
+]
+windows = [
+  "pywin32>=306; platform_system == 'Windows'",
+]
+
+[project.scripts]
+printer-agent = "printer_agent.cli:main"
+printer-agent-gui = "printer_agent.gui:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
+markers = [
+  "live: tests that connect to real printers on the network",
+]

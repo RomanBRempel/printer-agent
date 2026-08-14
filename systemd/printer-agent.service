@@ -1,0 +1,21 @@
+[Unit]
+Description=printer-agent edge service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/printer-agent
+EnvironmentFile=-/etc/printer-agent/printer-agent.env
+ExecStart=/opt/printer-agent/.venv/bin/python -m printer_agent --config /etc/printer-agent/agent.yaml run
+Restart=always
+RestartSec=5
+User=printeragent
+Group=printeragent
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

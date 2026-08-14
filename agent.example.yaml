@@ -1,0 +1,28 @@
+hub_url: https://rd-control.example.com
+agent_token: replace-me
+location_key: loc-001
+telemetry_interval_s: 5
+heartbeat_interval_s: 15
+command_reconnect_backoff_s:
+  min: 1
+  max: 60
+outbox:
+  max_events: 5000
+  database_path: data/outbox.sqlite3
+updates:
+  feed_url: https://downloads.example.com/printer-agent/update.json
+  auto_update: false
+  check_on_startup: true
+printers:
+  - key: printer-1
+    brand: moonraker
+    host: 192.168.10.21
+    port: 7125
+    credentials: {}
+  - key: printer-2
+    brand: bambu
+    host: 192.168.10.22
+    port: 8883
+    credentials:
+      access_code: replace-me
+      serial: replace-me
