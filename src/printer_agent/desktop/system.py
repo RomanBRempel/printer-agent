@@ -63,6 +63,58 @@ def _no_window_kwargs() -> dict[str, object]:
     return {}
 
 
+def _powershell(command: str) -> list[str]:
+    """Build a PowerShell invocation whose output is decodable as UTF-8.
+
+    PowerShell writes to the console in the OEM code page (866 on a Russian
+    Windows), while Python decodes with the ANSI one — which turns every error
+    message into mojibake. Setting OutputEncoding first fixes both streams.
+    """
+    return [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + command,
+    ]
+
+
+def _run_powershell(command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        _powershell(command),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **_no_window_kwargs(),
+    )
+
+
+def condense_powershell_error(text: str) -> str:
+    """Reduce a PowerShell error record to the sentence that means something.
+
+    The raw record repeats the command, underlines it with `~~~~`, then adds
+    CategoryInfo and FullyQualifiedErrorId lines. None of that helps an
+    operator, and all of it drowns the one line that does.
+    """
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith(("+ CategoryInfo", "+ FullyQualifiedErrorId", "+ ~", "~")):
+            continue
+        if line.startswith("+ "):  # the echoed command
+            continue
+        lines.append(line)
+    if not lines:
+        return text.strip()
+    message = lines[0]
+    # Strip the "Start-Service : " cmdlet prefix PowerShell puts on the first line.
+    _, separator, remainder = message.partition(" : ")
+    return (remainder if separator else message).strip()
+
+
 # --------------------------------------------------------------------------- #
 # paths (canonical definitions live in printer_agent.paths)
 # --------------------------------------------------------------------------- #
@@ -159,20 +211,9 @@ def query_service(name: str = SERVICE_NAME) -> ServiceInfo:
 
     # Fallback: Get-Service returns an English .NET enum name, so it survives
     # localized Windows installs the way parsing sc.exe output would not.
-    completed = subprocess.run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            f"(Get-Service -Name '{name}' -ErrorAction Stop).Status.ToString()",
-        ],
-        capture_output=True,
-        text=True,
-        **_no_window_kwargs(),
-    )
+    completed = _run_powershell(f"(Get-Service -Name '{name}' -ErrorAction Stop).Status.ToString()")
     if completed.returncode != 0:
-        return ServiceInfo(state="not_installed", detail=completed.stderr.strip())
+        return ServiceInfo(state="not_installed", detail=condense_powershell_error(completed.stderr))
     value = completed.stdout.strip().lower()
     mapping = {
         "running": "running",
@@ -200,15 +241,11 @@ def control_service(action: str, name: str = SERVICE_NAME) -> tuple[bool, str]:
     }[action]
 
     if is_admin():
-        completed = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-            capture_output=True,
-            text=True,
-            **_no_window_kwargs(),
-        )
+        completed = _run_powershell(command)
         if completed.returncode == 0:
             return True, ""
-        return False, completed.stderr.strip() or completed.stdout.strip() or "Команда завершилась с ошибкой."
+        detail = condense_powershell_error(completed.stderr or completed.stdout)
+        return False, detail or "Команда завершилась с ошибкой."
 
     return _elevate(command)
 

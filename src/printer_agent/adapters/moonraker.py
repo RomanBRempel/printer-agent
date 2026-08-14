@@ -34,6 +34,30 @@ def normalize_moonraker_status(raw_status: str) -> PrinterStatus:
 
 MOONRAKER_DISCOVERY_PORTS: tuple[int, ...] = (7125, 80)
 
+#: Printer objects a snapshot needs. Keys only — Moonraker returns every field
+#: when no field list is given.
+QUERY_OBJECTS: dict[str, None] = {
+    "webhooks": None,
+    "print_stats": None,
+    "virtual_sdcard": None,
+    "extruder": None,
+    "heater_bed": None,
+    "temperature_sensor": None,
+    "temperature_fan": None,
+}
+
+#: REST equivalents of the JSON-RPC methods this adapter uses. Every Moonraker
+#: build has these; `/server/jsonrpc` is a later addition that Creality's fork
+#: never picked up.
+REST_ROUTES: dict[str, tuple[str, str]] = {
+    "server.info": ("GET", "/server/info"),
+    "printer.info": ("GET", "/printer/info"),
+    "printer.objects.query": ("GET", "/printer/objects/query"),
+    "printer.print.pause": ("POST", "/printer/print/pause"),
+    "printer.print.resume": ("POST", "/printer/print/resume"),
+    "printer.print.cancel": ("POST", "/printer/print/cancel"),
+}
+
 
 async def discover_moonraker(
     hosts: list[str], *, ports: tuple[int, ...] = MOONRAKER_DISCOVERY_PORTS, timeout_s: float = 1.5
@@ -95,10 +119,14 @@ class MoonrakerAdapter(PrinterAdapter):
         self._session: aiohttp.ClientSession | None = None
         self._base_url = self._build_base_url()
         self._last_snapshot: PrinterSnapshot | None = None
+        #: Set once a 404 proves this printer has no JSON-RPC endpoint.
+        self._prefers_rest = False
 
     async def connect(self) -> None:
         self._ensure_session()
-        await self._jsonrpc("server.info")
+        # printer.info rather than server.info: discovery already proves every
+        # Moonraker build answers it, including Creality's fork.
+        await self._call("printer.info")
 
     async def disconnect(self) -> None:
         if self._session is not None:
@@ -107,29 +135,18 @@ class MoonrakerAdapter(PrinterAdapter):
 
     async def get_state(self) -> PrinterSnapshot:
         try:
-            response = await self._jsonrpc(
-                "printer.objects.query",
-                {
-                    "objects": {
-                        "webhooks": None,
-                        "print_stats": None,
-                        "virtual_sdcard": None,
-                        "extruder": None,
-                        "heater_bed": None,
-                        "temperature_sensor": None,
-                        "temperature_fan": None,
-                    }
-                },
-            )
+            response = await self._call("printer.objects.query", {"objects": QUERY_OBJECTS})
             status = self._build_snapshot_from_response(response)
-        except Exception:
+        except Exception as exc:
             status = PrinterSnapshot(
                 printer_key=self.printer.key,
                 status=PrinterStatus.offline,
                 status_raw="offline",
                 job=JobSnapshot(),
                 temps=TemperatureSnapshot(),
-                error=ErrorSnapshot(code="offline", message="Moonraker request failed"),
+                # Carry the real reason: "request failed" tells an operator
+                # nothing they can act on.
+                error=ErrorSnapshot(code="offline", message=str(exc) or exc.__class__.__name__),
                 capabilities=self.capabilities(),
                 ts=utc_now_iso(),
             )
@@ -143,15 +160,15 @@ class MoonrakerAdapter(PrinterAdapter):
         raise UnsupportedCommandError("Moonraker print start is not implemented yet")
 
     async def pause(self) -> dict[str, Any]:
-        await self._jsonrpc("printer.print.pause")
+        await self._call("printer.print.pause")
         return {"ok": True}
 
     async def resume(self) -> dict[str, Any]:
-        await self._jsonrpc("printer.print.resume")
+        await self._call("printer.print.resume")
         return {"ok": True}
 
     async def cancel(self) -> dict[str, Any]:
-        await self._jsonrpc("printer.print.cancel")
+        await self._call("printer.print.cancel")
         return {"ok": True}
 
     async def upload_file(self, local_path: str | Path, remote_name: str) -> dict[str, Any]:
@@ -177,6 +194,49 @@ class MoonrakerAdapter(PrinterAdapter):
                 headers["Authorization"] = f"Bearer {bearer_token}"
             self._session = aiohttp.ClientSession(headers=headers)
         return self._session
+
+    async def _call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Invoke a Moonraker method over whichever transport this printer has.
+
+        Creality's K-series firmware ships an older Moonraker fork with no
+        JSON-RPC-over-HTTP endpoint: `/server/jsonrpc` answers 404 there. The
+        REST API exists in every build, so a 404 switches this adapter over for
+        the rest of its life rather than re-probing on every poll.
+        """
+        if self._prefers_rest:
+            return await self._rest(method, params)
+        try:
+            return await self._jsonrpc(method, params)
+        except aiohttp.ClientResponseError as exc:
+            if exc.status != 404:
+                raise
+            self._prefers_rest = True
+            return await self._rest(method, params)
+
+    async def _rest(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        try:
+            verb, path = REST_ROUTES[method]
+        except KeyError as exc:
+            raise RuntimeError(f"Moonraker method {method} has no REST equivalent") from exc
+
+        url = f"{self._base_url}{path}"
+        if method == "printer.objects.query":
+            objects = (params or {}).get("objects") or {}
+            # Moonraker takes bare names in the query string; a value after `=`
+            # restricts the fields, and we want them all.
+            url = f"{url}?{'&'.join(objects)}"
+
+        session = self._ensure_session()
+        async with session.request(verb, url) as response:
+            response.raise_for_status()
+            body = await response.json(content_type=None)
+        result = body.get("result") if isinstance(body, dict) else None
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, str):
+            # `ok` from the print-control endpoints.
+            return {"result": result}
+        raise RuntimeError(f"Moonraker {path} returned unexpected payload")
 
     async def _jsonrpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         session = self._ensure_session()

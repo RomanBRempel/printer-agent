@@ -180,6 +180,20 @@ class DashboardPage(Page):
     # -- actions ------------------------------------------------------------ #
 
     def _service_action(self, action: str) -> None:
+        if action in {"start", "restart"}:
+            # The service validates the config on startup and exits. Letting it
+            # try anyway answers a question the operator did not ask, with an
+            # SCM error that names nothing actionable.
+            blockers = self.state.validation_errors
+            if blockers:
+                self.notify(
+                    "Служба не запустится с текущей конфигурацией: "
+                    + "; ".join(blockers)
+                    + ". Заполните страницы «Хаб» и «Принтеры», затем повторите.",
+                    "warning",
+                )
+                return
+
         for button in (self._start_button, self._stop_button, self._restart_button):
             button.setEnabled(False)
         self.notify({"start": "Запуск службы…", "stop": "Остановка службы…", "restart": "Перезапуск службы…"}[action])
@@ -196,5 +210,5 @@ class DashboardPage(Page):
             if ok:
                 self.notify("Команда отправлена службе.", "success")
             else:
-                self.notify(message, "error")
+                self.notify(f"{message} Подробности — на странице «Логи».", "error")
         self.apply_health(self._health)
