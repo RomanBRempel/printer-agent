@@ -20,9 +20,10 @@ from ..widgets import Caption, form_row
 BRANDS: tuple[tuple[str, str], ...] = (
     ("moonraker", "Moonraker (Klipper)"),
     ("bambu", "Bambu Lab"),
+    ("creality", "Creality (порт 9999)"),
 )
 
-DEFAULT_PORTS = {"moonraker": 7125, "bambu": 8883}
+DEFAULT_PORTS = {"moonraker": 7125, "bambu": 8883, "creality": 9999}
 
 
 class PrinterDialog(QDialog):
@@ -68,7 +69,7 @@ class PrinterDialog(QDialog):
         layout.addWidget(form_row("Бренд", self.brand_combo))
         layout.addWidget(form_row("Хост", self.host_edit))
         layout.addWidget(
-            form_row("Порт", self.port_edit, hint="Пусто — значение по умолчанию для бренда (7125 / 8883).")
+            form_row("Порт", self.port_edit, hint="Пусто — значение по умолчанию для бренда (7125 / 8883 / 9999).")
         )
 
         self._bambu_fields = QWidget()

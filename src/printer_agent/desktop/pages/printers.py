@@ -32,7 +32,7 @@ STATUS_LABELS = {
     "maintenance": "Обслуживание",
 }
 
-BRAND_LABELS = {"moonraker": "Moonraker", "bambu": "Bambu Lab"}
+BRAND_LABELS = {"moonraker": "Moonraker", "bambu": "Bambu Lab", "creality": "Creality"}
 
 
 def format_duration(seconds: int | None) -> str:
@@ -176,7 +176,8 @@ class PrintersPage(Page):
         self._empty.add(
             Caption(
                 "Добавьте первый принтер — служба не запустится, пока список пуст. "
-                "Для Moonraker нужен хост и порт, для Bambu Lab — ещё access code и серийный номер."
+                "Для Moonraker и Creality нужен хост и порт, для Bambu Lab — ещё access code "
+                "и серийный номер."
             )
         )
         self.content.addWidget(self._empty)

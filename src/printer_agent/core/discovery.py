@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..adapters.bambu import discover_bambu
+from ..adapters.creality import discover_creality
 from ..adapters.moonraker import discover_moonraker
 
 #: Refuse to sweep anything larger than a /22 — a /16 is 65k probes and, on a
@@ -123,7 +124,12 @@ def parse_networks(values: list[str]) -> list[ipaddress.IPv4Network]:
 
 
 def merge(records: list[dict[str, Any]], known_hosts: set[str] | None = None) -> list[DiscoveredPrinter]:
-    """Normalize brand records, drop duplicates, and sort for a stable list."""
+    """Normalize brand records, drop duplicates, and sort for a stable list.
+
+    A Creality machine with Moonraker enabled answers both probes and would be
+    offered twice. Moonraker wins that tie: it is the richer protocol, and the
+    Creality socket is the fallback for firmware that keeps 7125 closed.
+    """
     known = known_hosts or set()
     merged: dict[tuple[str, str], DiscoveredPrinter] = {}
     for record in records:
@@ -143,7 +149,14 @@ def merge(records: list[dict[str, Any]], known_hosts: set[str] | None = None) ->
         existing = merged.get(printer.identity)
         if existing is None or (not existing.serial and printer.serial):
             merged[printer.identity] = printer
-    return sorted(merged.values(), key=lambda item: (item.brand, item.host))
+
+    moonraker_hosts = {item.host for item in merged.values() if item.brand == "moonraker"}
+    kept = [
+        item
+        for item in merged.values()
+        if not (item.brand == "creality" and item.host in moonraker_hosts)
+    ]
+    return sorted(kept, key=lambda item: (item.brand, item.host))
 
 
 async def discover(
@@ -159,6 +172,7 @@ async def discover(
 
     results = await asyncio.gather(
         discover_moonraker(hosts, timeout_s=scan_timeout_s),
+        discover_creality(hosts, timeout_s=scan_timeout_s),
         discover_bambu(timeout_s=listen_timeout_s),
         return_exceptions=True,
     )

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from ..adapters.base import PrinterAdapter
 from ..adapters.bambu import BambuAdapter
+from ..adapters.creality import CrealityAdapter
 from ..adapters.moonraker import MoonrakerAdapter
 from ..config import PrinterConfig
 
 ADAPTERS: dict[str, type[PrinterAdapter]] = {
     "moonraker": MoonrakerAdapter,
     "bambu": BambuAdapter,
+    "creality": CrealityAdapter,
 }
 
 

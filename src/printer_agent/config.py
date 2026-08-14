@@ -233,7 +233,7 @@ def validate_config(config: AgentConfig) -> list[str]:
     for printer in config.printers:
         if not printer.key:
             errors.append("each printer needs a key")
-        if printer.brand not in {"moonraker", "bambu"}:
+        if printer.brand not in {"moonraker", "bambu", "creality"}:
             errors.append(f"printer {printer.key}: unsupported brand {printer.brand}")
         if not printer.host:
             errors.append(f"printer {printer.key}: host is required")

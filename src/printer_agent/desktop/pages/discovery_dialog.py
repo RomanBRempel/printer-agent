@@ -21,7 +21,7 @@ from ..checks import AsyncRunner
 from ..theme import Palette
 from ..widgets import Caption, Card, SectionTitle, form_row, inline_row
 
-BRAND_LABELS = {"moonraker": "Moonraker", "bambu": "Bambu Lab"}
+BRAND_LABELS = {"moonraker": "Moonraker", "bambu": "Bambu Lab", "creality": "Creality"}
 
 
 class DiscoveryRow(QWidget):
@@ -116,8 +116,8 @@ class DiscoveryDialog(QDialog):
             form_row(
                 "Подсети",
                 self.networks_edit,
-                hint="Moonraker ищется опросом адресов, Bambu Lab — прослушиванием его "
-                     "объявлений в сети. Уже добавленные принтеры в списке не показываются.",
+                hint="Moonraker и Creality ищутся опросом адресов, Bambu Lab — прослушиванием "
+                     "его объявлений в сети. Уже добавленные принтеры в списке не показываются.",
             )
         )
         self.search_button = QPushButton("Искать")

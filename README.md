@@ -19,7 +19,7 @@ It has one job: translate vendor-specific printer protocols into a single normal
 
 **Как устроен**
 
-- `adapters/` — интеграции с протоколами Moonraker (JSON-RPC поверх HTTP) и Bambu (MQTT).
+- `adapters/` — интеграции с протоколами Moonraker (JSON-RPC поверх HTTP), Bambu (MQTT) и Creality (WebSocket на порту 9999 — для прошивок K-серии, где Moonraker закрыт).
 - `core/` — нормализованное состояние, вычисление изменений (diff) и надёжное локальное хранилище на SQLite: очередь событий (outbox) и идемпотентность команд.
 - `uplink/` — исходящее WSS-соединение, `hello`/`heartbeat` и маршрутизация команд.
 - `docs/contracts/agent-hub-v1.md` — версионированный контракт между агентом и RD Control, источник истины для формата сообщений.
@@ -59,7 +59,7 @@ The agent discovers and polls printers in its location, normalizes their state, 
 
 ## Current architecture
 
-- `src/printer_agent/adapters/` protocol integrations for Moonraker and Bambu.
+- `src/printer_agent/adapters/` protocol integrations for Moonraker, Bambu and Creality.
 - `src/printer_agent/core/` normalized state, diffing, and durable local storage.
 - `src/printer_agent/uplink/` outbound WSS connection, hello/heartbeat, printer polling, telemetry and event delivery, and command routing.
 - `docs/contracts/agent-hub-v1.md` versioned contract between the agent and RD Control.
@@ -70,7 +70,7 @@ The agent discovers and polls printers in its location, normalizes their state, 
 - normalized contract models and message envelope helpers.
 - config loading from file plus environment overrides.
 - crash-safe local outbox and command idempotency storage in SQLite.
-- adapter registry for Moonraker and Bambu.
+- adapter registry for Moonraker, Bambu and Creality.
 - WSS uplink that polls printers on `telemetry_interval_s`, batches snapshots into
   one `telemetry` message, queues state changes as durable `event`s, and clears
   them from the outbox on hub `ack`.
@@ -203,12 +203,17 @@ names the field to fix.
   answers `/printer/info`, TCP-preflighted so non-printers fail fast.
 - **Bambu Lab** announces itself over SSDP on UDP 2021; the app listens for those datagrams and
   reads the serial, model and user-assigned name straight out of the vendor headers.
+- **Creality** is probed the same way as Moonraker but on the vendor WebSocket (port 9999), which
+  answers with the hostname and model. A machine that answers both probes is offered once, as
+  Moonraker: that adapter is the richer one, and the Creality socket is the fallback for firmware
+  that keeps 7125 closed.
 
 The sweep is capped at 1024 addresses — a `/16` is 65k probes and, on a corporate network, is
 indistinguishable from a port scan. Already-configured hosts are hidden from the results, and Bambu
 entries still require the access code from the printer's own screen; nothing on the network hands
 that over. Protocol-specific probing lives in the adapters
-([moonraker](src/printer_agent/adapters/moonraker.py), [bambu](src/printer_agent/adapters/bambu.py));
+([moonraker](src/printer_agent/adapters/moonraker.py), [bambu](src/printer_agent/adapters/bambu.py),
+[creality](src/printer_agent/adapters/creality.py));
 [core/discovery.py](src/printer_agent/core/discovery.py) only enumerates subnets and merges results.
 
 Theme and accent live in `%APPDATA%\printer-agent\ui.json` — per user, deliberately not in `agent.yaml`,

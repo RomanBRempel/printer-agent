@@ -64,6 +64,14 @@ Sent on connect.
 
 `printer_key` must be stable for the same physical printer inside one location. If a config-local alias is used, map it to a canonical identity before publishing.
 
+`brand` names the protocol the agent speaks to that printer, not the manufacturer:
+`moonraker`, `bambu`, `creality`. It is an **open set** — a new adapter adds a value
+without bumping `PROTOCOL_VERSION`, so receivers must store and pass through an
+unknown `brand` rather than reject the printer. Note that one physical machine can be
+reachable under more than one of them (Creality K-series firmware exposes Moonraker on
+some builds and only the vendor socket on others), which is why `brand` is an input to
+the identity hash and never an identity on its own.
+
 ### `telemetry`
 
 Batch snapshots, lossy delivery.

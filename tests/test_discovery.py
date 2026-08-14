@@ -77,6 +77,22 @@ def test_merge_drops_duplicates_by_serial():
     assert len(merge(records)) == 1
 
 
+def test_merge_prefers_moonraker_over_creality_on_the_same_host():
+    """K-series firmware can answer both probes; offering it twice is a bug."""
+    records = [
+        {"brand": "creality", "host": "192.168.1.9", "port": 9999, "name": "K1-0942"},
+        {"brand": "moonraker", "host": "192.168.1.9", "port": 7125, "name": "K1-0942"},
+        {"brand": "creality", "host": "192.168.1.10", "port": 9999, "name": "K1C-B24E"},
+    ]
+
+    merged = merge(records)
+
+    assert [(item.brand, item.host) for item in merged] == [
+        ("creality", "192.168.1.10"),
+        ("moonraker", "192.168.1.9"),
+    ]
+
+
 def test_merge_hides_already_configured_hosts():
     records = [{"brand": "moonraker", "host": "192.168.1.9", "port": 7125}]
 

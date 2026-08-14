@@ -25,7 +25,7 @@ from ..core.registry import build_adapter
 from .connection import hello_payload, hub_auth_headers, hub_wss_url
 
 DEFAULT_TIMEOUT_S = 15.0
-DEFAULT_PORTS = {"moonraker": 7125, "bambu": 8883}
+DEFAULT_PORTS = {"moonraker": 7125, "bambu": 8883, "creality": 9999}
 
 
 @dataclass(slots=True)

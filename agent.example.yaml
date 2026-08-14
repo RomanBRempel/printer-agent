@@ -28,3 +28,10 @@ printers:
     credentials:
       access_code: replace-me
       serial: replace-me
+  # Creality K-series firmware that keeps Moonraker's 7125 closed: the vendor
+  # WebSocket on 9999 is the only way in, and it needs no credentials.
+  - key: printer-3
+    brand: creality
+    host: 192.168.10.23
+    port: 9999
+    credentials: {}
