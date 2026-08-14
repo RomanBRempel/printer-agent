@@ -15,6 +15,10 @@ from urllib.request import urlopen
 from . import __version__
 
 
+#: Filename endings pip can install from a local path.
+PACKAGE_SUFFIXES = (".whl", ".tar.gz", ".zip")
+
+
 @dataclass(slots=True)
 class UpdateManifest:
     version: str
@@ -164,15 +168,24 @@ def _version_key(value: str) -> tuple[int, ...]:
 
 def _download_package(package_url: str, expected_sha256: str) -> str:
     parsed = urlparse(package_url)
-    if parsed.scheme in {"http", "https"}:
-        with urlopen(package_url) as response:  # nosec: B310 - update packages are operator-controlled
-            payload = response.read()
-        if expected_sha256:
-            digest = hashlib.sha256(payload).hexdigest()
-            if digest.lower() != expected_sha256.lower():
-                raise ValueError("downloaded package sha256 does not match manifest")
-        suffix = Path(parsed.path).suffix or ".whl"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-            temp_file.write(payload)
-            return temp_file.name
-    return package_url
+    if parsed.scheme not in {"http", "https"}:
+        return package_url
+
+    with urlopen(package_url) as response:  # nosec: B310 - update packages are operator-controlled
+        payload = response.read()
+    if expected_sha256:
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest.lower() != expected_sha256.lower():
+            raise ValueError("downloaded package sha256 does not match manifest")
+
+    # pip reads the distribution name and version out of the *filename*, so the
+    # download has to keep the one from the URL. Writing to a NamedTemporaryFile
+    # gives it a random stem and pip refuses the install with
+    # "Invalid wheel filename (wrong number of parts)".
+    name = Path(parsed.path).name
+    if not name.endswith(PACKAGE_SUFFIXES):
+        name = "printer_agent-0-py3-none-any.whl"
+    directory = Path(tempfile.mkdtemp(prefix="printer-agent-update-"))
+    target = directory / Path(name).name  # drop any path components from the URL
+    target.write_bytes(payload)
+    return str(target)

@@ -68,10 +68,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         # to register it would leave the operator with no service to configure.
         return _service_command(parser, args)
 
+    if args.command == "publish-update":
+        # A release-authoring command; it never reads the agent config.
+        manifest = publish_manifest(
+            version=args.version,
+            package_url=args.package_url,
+            destination=args.output,
+            sha256=args.sha256,
+            notes=args.notes,
+            published_at=args.published_at,
+        )
+        print(f"wrote update manifest for {manifest.version} to {args.output}")
+        return 0
+
+    if args.command == "run":
+        # The only command that genuinely needs a runnable config.
+        try:
+            config = load_config(args.config)
+        except ConfigError as exc:
+            parser.exit(status=2, message=f"configuration error: {exc}\n")
+        return run_agent(config)
+
     try:
-        config = load_config(args.config)
+        config, config_errors = parse_config(args.config)
     except ConfigError as exc:
         parser.exit(status=2, message=f"configuration error: {exc}\n")
+    if config_errors:
+        # Reporting status or checking for an update does not depend on the
+        # config being runnable. Say what is wrong, then answer the question
+        # that was actually asked.
+        print(f"warning: configuration is not runnable yet: {'; '.join(config_errors)}")
 
     if args.command == "status":
         outbox = EventOutbox(config.outbox.database_path)
@@ -82,9 +108,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"outbox_pending={summary['pending_events']}")
         print(f"command_results={summary['command_results']}")
         return 0
-
-    if args.command == "run":
-        return run_agent(config)
 
     if args.command == "update":
         feed_url = args.feed_url or config.updates.feed_url
@@ -99,18 +122,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"install_message={applied.message}")
             return 0 if applied.installed else 1
         return 0 if not status.update_available else 1
-
-    if args.command == "publish-update":
-        manifest = publish_manifest(
-            version=args.version,
-            package_url=args.package_url,
-            destination=args.output,
-            sha256=args.sha256,
-            notes=args.notes,
-            published_at=args.published_at,
-        )
-        print(f"wrote update manifest for {manifest.version} to {args.output}")
-        return 0
 
     parser.exit(status=1, message="unknown command\n")
 
