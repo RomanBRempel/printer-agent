@@ -79,3 +79,83 @@ def test_the_service_reports_running_before_doing_any_work():
 
     assert "SERVICE_RUNNING" in body
     assert body.index("ReportServiceStatus") < body.index("asyncio.run")
+
+
+def test_service_environment_covers_the_dll_search_path():
+    """pythonservice.exe links against python3XX.dll, which a venv does not copy.
+
+    Missing it, the process dies with 0xC0000135 before reaching any of our
+    code, and the SCM reports only "did not respond in a timely fashion".
+    """
+    import sys
+    import sysconfig
+
+    paths = [str(item) for item in windows_service.service_environment_paths()]
+
+    assert sys.base_prefix in paths
+    assert str(Path(sysconfig.get_paths()["purelib"]) / "pywin32_system32") in paths
+
+
+def test_service_environment_block_keeps_the_existing_path(monkeypatch):
+    monkeypatch.setenv("PATH", r"C:\Windows\System32")
+
+    block = windows_service.build_service_environment()
+    path_entry = next(item for item in block if item.startswith("PATH="))
+
+    # Replacing PATH outright would strip System32 from the service process.
+    assert path_entry.endswith(r"C:\Windows\System32")
+    assert any(item.startswith("PYTHONPATH=") for item in block)
+
+
+def test_service_environment_sets_pythonpath_to_site_packages():
+    import sysconfig
+
+    block = windows_service.build_service_environment()
+    entry = next(item for item in block if item.startswith("PYTHONPATH="))
+
+    assert entry == f"PYTHONPATH={sysconfig.get_paths()['purelib']}"
+
+
+def test_the_service_runs_the_venv_python_not_pythonservice_exe():
+    """pythonservice.exe cannot find python3XX.dll from inside a venv.
+
+    It sits in the venv root and links against the base interpreter's DLL,
+    which a venv does not copy, so it exited 0xC0000135 before running any of
+    our code. A venv's own python.exe resolves that through pyvenv.cfg.
+    """
+    source = Path(inspect.getfile(windows_service)).read_text(encoding="utf-8")
+
+    assert "_exe_name_ = sys.executable" in source
+    assert "-u -m " in source
+
+
+def test_the_module_hosts_the_dispatcher_when_launched_bare():
+    """With _exe_args_ the SCM starts `python.exe -u windows_service.py`.
+
+    Without the dispatcher branch that process would parse no arguments, do
+    nothing, and the SCM would time it out.
+    """
+    source = Path(inspect.getfile(windows_service)).read_text(encoding="utf-8")
+    body = source[source.index("def main()") :]
+
+    assert "StartServiceCtrlDispatcher" in body
+    assert "PrepareToHostSingle" in body
+    assert body.index("len(sys.argv) == 1") < body.index("HandleCommandLine")
+
+
+def test_the_package_never_shadows_a_stdlib_module():
+    """Running the service as a file put the package dir first on sys.path.
+
+    `printer_agent/logging.py` then answered `import logging` for the whole
+    interpreter, and asyncio failed to import before any of our code ran.
+    """
+    import sys
+
+    package = Path(inspect.getfile(windows_service)).parent
+    shadowed = {
+        path.stem
+        for path in package.glob("*.py")
+        if path.stem in sys.stdlib_module_names
+    }
+
+    assert shadowed == set()

@@ -16,7 +16,7 @@ import pytest
 from printer_agent import cli
 from printer_agent.config import load_config, ConfigError
 from printer_agent.desktop.state import read_config
-from printer_agent.logging import configure_logging
+from printer_agent.logsetup import configure_logging
 
 INSTALLER_DEFAULT_CONFIG = """
 hub_url: wss://rd-control.example.com/ws/agent
@@ -108,11 +108,18 @@ def test_install_service_registers_despite_an_unrunnable_config(installer_config
     commands: list[str] = []
     monkeypatch.setattr(cli, "_run_windows_service_command", commands.append)
     monkeypatch.setattr("printer_agent.windows_service.CONFIG_PATH", installer_config)
+    configured: list[bool] = []
+    monkeypatch.setattr(
+        "printer_agent.windows_service.configure_service_environment",
+        lambda: configured.append(True),
+    )
 
     exit_code = cli.main(["install-service", "--config", str(installer_config)])
 
     assert exit_code == 0
     assert commands == ["install"]
+    # Registration without the environment leaves a service that cannot start.
+    assert configured == [True]
     output = capsys.readouterr().out
     assert "printers must not be empty" in output
     assert "not runnable yet" in output

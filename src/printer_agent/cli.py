@@ -9,7 +9,7 @@ from typing import Sequence
 
 from .config import AgentConfig, ConfigError, load_config, parse_config, save_config
 from .core.outbox import EventOutbox
-from .logging import configure_logging
+from .logsetup import configure_logging
 from .updates import apply_update, check_for_update, publish_manifest
 
 
@@ -180,6 +180,12 @@ def _service_command(parser: argparse.ArgumentParser, args) -> int:
     if Path(args.config).resolve() != CONFIG_PATH.resolve():
         save_config(config, CONFIG_PATH)
     _run_windows_service_command("install")
+
+    # Without this the service host cannot find python3XX.dll and dies before
+    # running a line of our code, which the SCM reports only as a timeout.
+    from .windows_service import configure_service_environment
+
+    configure_service_environment()
     print(f"installed Windows service with config {CONFIG_PATH}")
     if errors:
         # Registered but not yet runnable. Say so plainly: the service will fail

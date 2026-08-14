@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import threading
 from contextlib import suppress
 from pathlib import Path
 
 from .config import ConfigError, load_config
 from .core.outbox import EventOutbox
-from .logging import configure_logging
+from .logsetup import configure_logging
 from .uplink.connection import HubConnection
 from .updates import apply_update, check_for_update
 
@@ -28,12 +29,72 @@ SERVICE_DESCRIPTION = "Edge agent for a distributed 3D printer fleet"
 CONFIG_DIR = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "printer-agent"
 CONFIG_PATH = CONFIG_DIR / "agent.yaml"
 
+SERVICE_KEY = rf"SYSTEM\CurrentControlSet\Services\{SERVICE_NAME}"
+
+
+def service_environment_paths() -> list[Path]:
+    """Directories pythonservice.exe must have on PATH to start at all.
+
+    It lives in the venv root and links against python3XX.dll, which is in the
+    *base* interpreter — a venv does not copy it. Without these the process dies
+    with 0xC0000135 (DLL not found) before reaching any of our code, and the SCM
+    reports only "did not respond in a timely fashion".
+    """
+    import sysconfig
+
+    site_packages = Path(sysconfig.get_paths()["purelib"])
+    return [
+        Path(sys.base_prefix),  # python3XX.dll
+        Path(sys.base_prefix) / "DLLs",
+        site_packages / "pywin32_system32",  # pywintypes/pythoncom
+        Path(sys.prefix) / "Scripts",
+    ]
+
+
+def build_service_environment() -> list[str]:
+    """The REG_MULTI_SZ block Windows hands the service process."""
+    import sysconfig
+
+    existing = os.environ.get("PATH", "")
+    prefix = os.pathsep.join(str(path) for path in service_environment_paths())
+    return [
+        f"PATH={prefix}{os.pathsep}{existing}" if existing else f"PATH={prefix}",
+        # pythonservice.exe puts the service module's own directory on sys.path,
+        # not site-packages, so `import printer_agent` would fail without this.
+        f"PYTHONPATH={sysconfig.get_paths()['purelib']}",
+    ]
+
+
+def configure_service_environment() -> None:
+    """Write the environment onto the service key. Requires administrator."""
+    if os.name != "nt":
+        return
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, SERVICE_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, build_service_environment())
+
+
+SERVICE_MODULE = "printer_agent.windows_service"
+
 
 if _IMPORT_ERROR is None:
     class PrinterAgentService(win32serviceutil.ServiceFramework):
         _svc_name_ = SERVICE_NAME
         _svc_display_name_ = SERVICE_DISPLAY_NAME
         _svc_description_ = SERVICE_DESCRIPTION
+
+        # Run the venv's own python.exe instead of pywin32's pythonservice.exe.
+        # pythonservice.exe sits in the venv root and links against python3XX.dll,
+        # which lives in the *base* interpreter — a venv does not copy it — so it
+        # died with 0xC0000135 before reaching any of this code, and the SCM
+        # reported it only as "did not respond in a timely fashion". A venv's
+        # python.exe resolves its own DLLs and site-packages through pyvenv.cfg.
+        # `-m`, never a file path: running the module as a script puts the
+        # package directory first on sys.path, where printer_agent's own modules
+        # shadow same-named stdlib ones and the import of asyncio fails.
+        _exe_name_ = sys.executable
+        _exe_args_ = f"-u -m {SERVICE_MODULE}"
 
         def __init__(self, args):
             super().__init__(args)
@@ -102,6 +163,16 @@ def main() -> int:
         raise SystemExit(
             "Windows service support requires pywin32. Install the project with the windows extra."
         ) from _IMPORT_ERROR
+
+    if len(sys.argv) == 1:
+        # No arguments means the SCM launched us as the service process itself
+        # (see _exe_args_). Hand over to the control dispatcher; anything else is
+        # a person running install/remove/start from a prompt.
+        servicemanager.Initialize()
+        servicemanager.PrepareToHostSingle(PrinterAgentService)
+        servicemanager.StartServiceCtrlDispatcher()
+        return 0
+
     win32serviceutil.HandleCommandLine(PrinterAgentService)
     return 0
 
