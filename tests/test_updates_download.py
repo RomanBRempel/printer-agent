@@ -76,3 +76,31 @@ def test_local_paths_are_passed_through_untouched():
     assert updates._download_package(r"C:\builds\printer_agent-1-py3-none-any.whl", "") == (
         r"C:\builds\printer_agent-1-py3-none-any.whl"
     )
+
+
+def test_pip_runs_under_the_console_interpreter(monkeypatch, tmp_path):
+    """pip appends "w" to the running interpreter to name a gui launcher.
+
+    Run it from pythonw.exe and it writes a shebang for `pythonww.exe`, which
+    does not exist — every regenerated launcher then dies with
+    "Unable to create process".
+    """
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    (scripts / "python.exe").write_bytes(b"")
+    monkeypatch.setattr(updates.sys, "executable", str(scripts / "pythonw.exe"))
+
+    assert updates.pip_executable() == str(scripts / "python.exe")
+
+
+def test_a_console_interpreter_is_used_as_is(monkeypatch, tmp_path):
+    monkeypatch.setattr(updates.sys, "executable", str(tmp_path / "python.exe"))
+
+    assert updates.pip_executable() == str(tmp_path / "python.exe")
+
+
+def test_a_missing_console_interpreter_falls_back(monkeypatch, tmp_path):
+    """Nothing to switch to is better than pointing at a file that is not there."""
+    monkeypatch.setattr(updates.sys, "executable", str(tmp_path / "pythonw.exe"))
+
+    assert updates.pip_executable() == str(tmp_path / "pythonw.exe")

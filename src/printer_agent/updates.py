@@ -113,10 +113,27 @@ def check_for_update(feed_url: str | Path | None) -> UpdateStatus:
     )
 
 
+def pip_executable() -> str:
+    """The interpreter pip should run under.
+
+    pip derives a gui-script's launcher from the running interpreter by
+    appending "w" to its name. Run it from pythonw.exe — which is what the
+    desktop app is — and it writes a shebang pointing at `pythonww.exe`, a file
+    that does not exist, leaving every regenerated launcher dead with
+    "Unable to create process".
+    """
+    executable = Path(sys.executable)
+    if executable.name.lower() == "pythonw.exe":
+        console = executable.with_name("python.exe")
+        if console.exists():
+            return str(console)
+    return sys.executable
+
+
 def apply_update(manifest: UpdateManifest) -> UpdateStatus:
     package_reference = _download_package(manifest.package_url, manifest.sha256)
     completed = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade", package_reference],
+        [pip_executable(), "-m", "pip", "install", "--upgrade", package_reference],
         check=False,
         capture_output=True,
         text=True,

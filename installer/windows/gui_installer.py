@@ -514,13 +514,18 @@ class InstallerWindow(QWidget):
 
     def _launch_app(self) -> None:
         install_root = Path(self.install_root.text().strip() or DEFAULT_INSTALL_ROOT)
-        app_exe = install_root / ".venv" / "Scripts" / "printer-agent-gui.exe"
+        # pythonw.exe rather than the pip-generated launcher: it is GUI-subsystem
+        # so no console appears, and updates never rewrite it.
+        pythonw = install_root / ".venv" / "Scripts" / "pythonw.exe"
         config = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "printer-agent" / "agent.yaml"
-        if not app_exe.exists():
-            self.info_bar.show_message(f"Не найден launcher приложения: {app_exe}", "warning")
+        if not pythonw.exists():
+            self.info_bar.show_message(f"Не найден интерпретатор: {pythonw}", "warning")
             return
         try:
-            subprocess.Popen([str(app_exe), "--config", str(config)], cwd=str(install_root))
+            subprocess.Popen(
+                [str(pythonw), "-m", "printer_agent", "gui", "--config", str(config)],
+                cwd=str(install_root),
+            )
             self.close()
         except Exception as exc:
             self.info_bar.show_message(f"Не удалось запустить приложение: {exc}", "error")

@@ -147,7 +147,10 @@ $pyArgs = $pythonLauncher.Args
 $autoUpdateEnabled = Convert-ToBoolean -Value $AutoUpdate
 Invoke-Checked -What "Virtual environment creation" -Command { & $pyCmd @pyArgs -m venv $venvPath }
 $pythonExe = Join-Path $venvPath "Scripts\python.exe"
+$pythonwExe = Join-Path $venvPath "Scripts\pythonw.exe"
 $guiExe = Join-Path $venvPath "Scripts\printer-agent-gui.exe"
+# e.g. "311" — pywin32 names its runtime DLLs after the interpreter version.
+$pythonVersionTag = (& $pythonExe -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')").Trim()
 
 & $pythonExe -m pip install --upgrade pip
 
@@ -167,6 +170,16 @@ Invoke-Checked -What "Package reinstall" -Command {
 }
 # Service integration requires pywin32 on Windows even when wheel extras are not requested.
 Invoke-Checked -What "pywin32 install" -Command { & $pythonExe -m pip install "pywin32>=306" }
+# pip alone is not enough: pythonservice.exe loads pywintypes/pythoncom as plain
+# DLLs and cannot see the copies inside site-packages. Without this step the
+# service registers fine and then refuses to start, which reads as a mystery.
+$postInstall = Join-Path $venvPath "Scripts\pywin32_postinstall.py"
+if (Test-Path $postInstall) {
+    Invoke-Checked -What "pywin32 post-install" -Command { & $pythonExe $postInstall -install -silent }
+}
+else {
+    throw "pywin32_postinstall.py was not found in $venvPath; the service would register but never start."
+}
 # Desktop app dependencies. Installed separately from the package spec so a
 # plain wheel path, a URL or a PyPI name all work the same way here.
 Invoke-Checked -What "PySide6 install" -Command {
@@ -244,6 +257,17 @@ with config_path.open('w', encoding='utf-8') as handle:
 "@
 
 Write-Host "[STEP] service"
+
+# The service host needs these next to the system DLLs; pywin32_postinstall put
+# them there. Checking here turns a silent non-starting service into a clear
+# install failure.
+$serviceRuntime = @("pywintypes$($pythonVersionTag).dll", "pythoncom$($pythonVersionTag).dll")
+foreach ($dll in $serviceRuntime) {
+    if (-not (Test-Path (Join-Path $env:SystemRoot "System32\$dll"))) {
+        throw "$dll is not registered in System32, so pythonservice.exe cannot start. The pywin32 post-install step did not take effect."
+    }
+}
+
 Invoke-Checked -What "Service registration" -Command {
     & $pythonExe -m printer_agent --config $configPath install-service
 }
@@ -300,9 +324,13 @@ foreach ($legacy in $legacyShortcuts) {
     }
 }
 
-# printer-agent-gui.exe is a gui-script: Windows launches it without a console.
-New-Shortcut -ShortcutPath $startMenuGuiShortcut -TargetPath $guiExe -Arguments "--config `"$configPath`"" -WorkingDirectory $installRootPath.FullName -IconLocation $iconTarget -Description "Printer Agent"
-New-Shortcut -ShortcutPath $desktopGuiShortcut -TargetPath $guiExe -Arguments "--config `"$configPath`"" -WorkingDirectory $installRootPath.FullName -IconLocation $iconTarget -Description "Printer Agent"
+# Target pythonw.exe rather than the pip-generated printer-agent-gui.exe.
+# pythonw.exe is GUI-subsystem, so no console appears, and unlike the entry
+# point launcher it is never rewritten by an update — a self-update that
+# regenerates a bad launcher must not be able to break the shortcut.
+$guiArguments = "-m printer_agent gui --config `"$configPath`""
+New-Shortcut -ShortcutPath $startMenuGuiShortcut -TargetPath $pythonwExe -Arguments $guiArguments -WorkingDirectory $installRootPath.FullName -IconLocation $iconTarget -Description "Printer Agent"
+New-Shortcut -ShortcutPath $desktopGuiShortcut -TargetPath $pythonwExe -Arguments $guiArguments -WorkingDirectory $installRootPath.FullName -IconLocation $iconTarget -Description "Printer Agent"
 
 Write-Host "printer-agent was installed to $installRootPath"
 Write-Host "Configuration file: $configPath"
@@ -312,5 +340,5 @@ Write-Host "[STEP] finalize"
 & sc.exe query "printer-agent"
 
 if ($LaunchGui) {
-    Start-Process -FilePath $guiExe -ArgumentList @("--config", $configPath) -WorkingDirectory $installRootPath.FullName
+    Start-Process -FilePath $pythonwExe -ArgumentList @("-m", "printer_agent", "gui", "--config", $configPath) -WorkingDirectory $installRootPath.FullName
 }
