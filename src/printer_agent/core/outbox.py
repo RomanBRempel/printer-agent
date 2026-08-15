@@ -53,6 +53,17 @@ class EventOutbox:
         )
         self._connection.commit()
 
+    def discard_event(self, msg_id: str) -> None:
+        """Stop resending an event the hub refused.
+
+        Same row transition as an ack, for the opposite reason: the hub will
+        never take this message, and a pending row that can never be delivered
+        is what makes the outbox grow without bound. The refusal reason belongs
+        in the log, not here — this table is a delivery queue, not an audit
+        trail.
+        """
+        self.ack_event(msg_id)
+
     def record_command_result(
         self,
         command_id: str,

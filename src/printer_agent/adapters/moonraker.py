@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 
@@ -32,6 +33,13 @@ def normalize_moonraker_status(raw_status: str) -> PrinterStatus:
     return _MOONRAKER_STATUS_MAP.get(raw_status.lower(), PrinterStatus.maintenance)
 
 
+def _looks_like_image(payload: bytes) -> bool:
+    """Judge a probe answer by its bytes: a captive portal also returns 200."""
+    return payload.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n")) or (
+        payload.startswith(b"RIFF") and payload[8:12] == b"WEBP"
+    )
+
+
 MOONRAKER_DISCOVERY_PORTS: tuple[int, ...] = (7125, 80)
 
 #: Printer objects a snapshot needs. Keys only — Moonraker returns every field
@@ -53,10 +61,27 @@ REST_ROUTES: dict[str, tuple[str, str]] = {
     "server.info": ("GET", "/server/info"),
     "printer.info": ("GET", "/printer/info"),
     "printer.objects.query": ("GET", "/printer/objects/query"),
+    "printer.print.start": ("POST", "/printer/print/start"),
     "printer.print.pause": ("POST", "/printer/print/pause"),
     "printer.print.resume": ("POST", "/printer/print/resume"),
     "printer.print.cancel": ("POST", "/printer/print/cancel"),
 }
+
+#: Where the file lands on the printer. Moonraker only prints from `gcodes`.
+UPLOAD_ROOT = "gcodes"
+
+#: Snapshot URLs tried when the printer entry names none. crowsnest answers the
+#: first on nearly every Mainsail/Fluidd image; the second is the older layout
+#: where the stream service has its own port. Anything else has to be configured
+#: explicitly — guessing further would raise `capabilities.camera` on printers
+#: that have no camera at all.
+CAMERA_SNAPSHOT_CANDIDATES: tuple[str, ...] = (
+    "http://{host}/webcam/?action=snapshot",
+    "http://{host}:8080/?action=snapshot",
+)
+
+#: A snapshot request has to fail fast: it runs inside the frame interval.
+CAMERA_TIMEOUT_S = 10.0
 
 
 async def discover_moonraker(
@@ -121,12 +146,17 @@ class MoonrakerAdapter(PrinterAdapter):
         self._last_snapshot: PrinterSnapshot | None = None
         #: Set once a 404 proves this printer has no JSON-RPC endpoint.
         self._prefers_rest = False
+        #: Snapshot URL, configured or found by probing. Empty means no camera,
+        #: and `capabilities.camera` says so.
+        self._camera_url = printer.camera_snapshot_url.strip()
+        self._camera_probed = bool(self._camera_url)
 
     async def connect(self) -> None:
         self._ensure_session()
         # printer.info rather than server.info: discovery already proves every
         # Moonraker build answers it, including Creality's fork.
         await self._call("printer.info")
+        await self._probe_camera()
 
     async def disconnect(self) -> None:
         if self._session is not None:
@@ -154,10 +184,22 @@ class MoonrakerAdapter(PrinterAdapter):
         return status
 
     def capabilities(self) -> PrinterCapabilities:
-        return PrinterCapabilities(pause=True, resume=True, cancel=True, upload=True, camera=False)
+        # `camera` follows the probe, not the intention: the hub turns the flag
+        # into a button, and a button that leads to a refusal is worse than an
+        # absent one.
+        return PrinterCapabilities(
+            pause=True, resume=True, cancel=True, upload=True, camera=bool(self._camera_url)
+        )
 
-    async def start_print(self, file_ref: str) -> dict[str, Any]:
-        raise UnsupportedCommandError("Moonraker print start is not implemented yet")
+    async def start_print(self, file_ref: str, remote_name: str | None = None) -> dict[str, Any]:
+        # Moonraker addresses a print by the name the file has on the printer,
+        # which is what the upload put there — the cache's file_ref never
+        # reaches the machine.
+        filename = (remote_name or file_ref or "").strip()
+        if not filename:
+            raise RuntimeError("start_print needs a file name")
+        await self._call("printer.print.start", {"filename": filename})
+        return {"ok": True, "filename": filename}
 
     async def pause(self) -> dict[str, Any]:
         await self._call("printer.print.pause")
@@ -172,10 +214,75 @@ class MoonrakerAdapter(PrinterAdapter):
         return {"ok": True}
 
     async def upload_file(self, local_path: str | Path, remote_name: str) -> dict[str, Any]:
-        raise UnsupportedCommandError("Moonraker upload is not implemented yet")
+        """Push a file into Moonraker's gcode store.
+
+        `/server/files/upload` is a plain multipart POST that every Moonraker
+        build has, including Creality's fork — unlike `/server/jsonrpc`, which
+        is why this one does not go through :meth:`_call`. The file is streamed
+        from disk: the caller's copy is the only one that exists.
+        """
+        source = Path(local_path)
+        if not source.is_file():
+            raise RuntimeError(f"{source} is not a file")
+        name = (remote_name or source.name).strip() or source.name
+
+        session = self._ensure_session()
+        with source.open("rb") as handle:
+            form = aiohttp.FormData()
+            form.add_field("root", UPLOAD_ROOT)
+            # The print is started by its own command, with its own command_id
+            # and its own result; starting it here would leave that print with
+            # no command to attribute its outcome to.
+            form.add_field("print", "false")
+            form.add_field("file", handle, filename=name, content_type="application/octet-stream")
+            async with session.post(
+                f"{self._base_url}/server/files/upload",
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300),
+            ) as response:
+                response.raise_for_status()
+                body = await response.json(content_type=None)
+
+        item = body.get("item") if isinstance(body, dict) else None
+        stored = item.get("path") if isinstance(item, dict) else None
+        return {"ok": True, "remote_name": name, "path": str(stored or name), "root": UPLOAD_ROOT}
 
     async def get_camera_frame(self) -> bytes:
-        raise UnsupportedCommandError("Moonraker camera capture is not implemented yet")
+        if not self._camera_url:
+            raise UnsupportedCommandError(
+                f"no camera snapshot URL for {self.printer.key}; set camera_snapshot_url"
+            )
+        session = self._ensure_session()
+        async with session.get(
+            self._camera_url, timeout=aiohttp.ClientTimeout(total=CAMERA_TIMEOUT_S)
+        ) as response:
+            response.raise_for_status()
+            frame = await response.read()
+        if not frame:
+            raise RuntimeError(f"camera at {self._camera_url} returned an empty frame")
+        return frame
+
+    async def _probe_camera(self) -> None:
+        """Find a snapshot endpoint once, or leave the capability switched off."""
+        if self._camera_probed:
+            return
+        self._camera_probed = True
+        session = self._ensure_session()
+        for template in CAMERA_SNAPSHOT_CANDIDATES:
+            url = template.format(host=self.printer.host)
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=CAMERA_TIMEOUT_S)
+                ) as response:
+                    if response.status != 200:
+                        continue
+                    content_type = response.headers.get("Content-Type", "")
+                    frame = await response.read()
+            except Exception:
+                continue
+            if frame and (content_type.startswith("image/") or _looks_like_image(frame)):
+                self._camera_url = url
+                return
 
     def _build_base_url(self) -> str:
         scheme = "http"
@@ -225,6 +332,9 @@ class MoonrakerAdapter(PrinterAdapter):
             # Moonraker takes bare names in the query string; a value after `=`
             # restricts the fields, and we want them all.
             url = f"{url}?{'&'.join(objects)}"
+        elif method == "printer.print.start":
+            filename = str((params or {}).get("filename", ""))
+            url = f"{url}?filename={quote(filename, safe='/')}"
 
         session = self._ensure_session()
         async with session.request(verb, url) as response:
@@ -249,9 +359,13 @@ class MoonrakerAdapter(PrinterAdapter):
         if "error" in body:
             raise RuntimeError(str(body["error"]))
         result = body.get("result")
-        if not isinstance(result, dict):
-            raise RuntimeError(f"Moonraker RPC {method} returned unexpected payload")
-        return result
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, str):
+            # The print-control methods answer with a bare "ok", exactly as their
+            # REST equivalents do.
+            return {"result": result}
+        raise RuntimeError(f"Moonraker RPC {method} returned unexpected payload")
 
     def _build_snapshot_from_response(self, response: dict[str, Any]) -> PrinterSnapshot:
         status_map = response.get("status") or {}

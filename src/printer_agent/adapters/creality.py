@@ -208,7 +208,7 @@ class CrealityAdapter(PrinterAdapter):
             camera=False,
         )
 
-    async def start_print(self, file_ref: str) -> dict[str, Any]:
+    async def start_print(self, file_ref: str, remote_name: str | None = None) -> dict[str, Any]:
         raise UnsupportedCommandError("Creality print start is not implemented yet")
 
     async def pause(self) -> dict[str, Any]:

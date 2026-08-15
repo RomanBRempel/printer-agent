@@ -8,7 +8,7 @@ import aiohttp
 import pytest
 
 from printer_agent.adapters.base import PrinterAdapter
-from printer_agent.config import AgentConfig, OutboxConfig, PrinterConfig
+from printer_agent.config import AgentConfig, OutboxConfig, PrinterConfig, load_config
 from printer_agent.contracts import (
     ErrorSnapshot,
     JobSnapshot,
@@ -221,6 +221,48 @@ async def test_events_are_queued_flushed_and_cleared_on_ack(connection) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_refused_event_stops_being_resent(connection) -> None:
+    """The hub refuses telemetry for a printer not attached to this agent, and
+    it will keep refusing: resending it forever is how the outbox grows without
+    bound on a location with one unattached printer."""
+    hub, _adapter, outbox = connection
+    ws = FakeWebSocket()
+    hub._ws = ws
+    hub._touch_heartbeat_deadline()
+
+    hub._record_events(await hub._collect_snapshots())
+    await hub._flush_outbox()
+    refused = ws.sent_of_type("event")[0]
+
+    await hub._handle_message(
+        ws,
+        build_envelope(
+            "error",
+            {"code": "printer_not_found", "message": "printer is not attached", "msg_id": refused["msg_id"]},
+        ),
+    )
+    await hub._flush_outbox()
+
+    assert outbox.list_pending_events() == []
+    assert len(ws.sent_of_type("event")) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_error_about_an_unknown_message_leaves_the_outbox_alone(connection) -> None:
+    hub, _adapter, outbox = connection
+    ws = FakeWebSocket()
+    hub._ws = ws
+    hub._touch_heartbeat_deadline()
+    hub._record_events(await hub._collect_snapshots())
+
+    await hub._handle_message(
+        ws, build_envelope("error", {"code": "command_id_required", "message": "no command_id", "msg_id": ""})
+    )
+
+    assert len(outbox.list_pending_events()) == 1
+
+
+@pytest.mark.asyncio
 async def test_progress_drift_does_not_queue_events(connection) -> None:
     hub, adapter, outbox = connection
     adapter.snapshot = PrinterSnapshot(
@@ -288,6 +330,148 @@ async def test_command_is_dispatched_and_answered(connection) -> None:
     assert adapter.paused is True
     assert result["command_id"] == "cmd-1"
     assert result["status"] == "done"
+
+
+def write_config_file(
+    tmp_path, printer_keys: list[str], agent_token: str = "secret-token", brand: str = "moonraker"
+) -> Any:
+    """A config file on disk, which is what the reload path actually watches."""
+    printers = "\n".join(
+        f"  - key: {key}\n    brand: {brand}\n    host: 127.0.0.1\n    port: 7125" for key in printer_keys
+    )
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        "hub_url: https://hub.example.com/api/printers/agent\n"
+        f"agent_token: {agent_token}\n"
+        "location_key: loc-001\n"
+        "telemetry_interval_s: 1\n"
+        "outbox:\n"
+        f"  database_path: {(tmp_path / 'outbox.sqlite3').as_posix()}\n"
+        "printers:\n" + printers + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.fixture
+def file_backed_connection(tmp_path):
+    path = write_config_file(tmp_path, ["printer-1"])
+    config = load_config(path)
+    outbox = EventOutbox(config.outbox.database_path)
+    hub = HubConnection(config, outbox)
+    ws = FakeWebSocket()
+    hub._ws = ws
+    try:
+        yield hub, ws, path
+    finally:
+        outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_config_reload_picks_up_a_new_printer_and_tells_the_hub(file_backed_connection, tmp_path) -> None:
+    """A printer added at the location used to reach the hub only after a
+    service restart, which is indistinguishable from a printer that is simply
+    unreachable."""
+    hub, ws, path = file_backed_connection
+    write_config_file(tmp_path, ["printer-1", "printer-2"])
+
+    await hub._reload_config_if_changed()
+
+    assert sorted(hub._adapters) == ["printer-1", "printer-2"]
+    payload = ws.sent_of_type("inventory")[0]["payload"]
+    assert [entry["printer_key"] for entry in payload["printers"]] == ["printer-1", "printer-2"]
+    assert "request_msg_id" not in payload
+
+
+@pytest.mark.asyncio
+async def test_config_reload_forgets_a_removed_printer(file_backed_connection, tmp_path) -> None:
+    hub, ws, _path = file_backed_connection
+    hub._record_events(await hub._collect_snapshots())
+    write_config_file(tmp_path, ["printer-2"])
+
+    await hub._reload_config_if_changed()
+
+    assert sorted(hub._adapters) == ["printer-2"]
+    assert hub._state_store.get("printer-1") is None
+    assert ws.sent_of_type("inventory")[0]["payload"]["printers"][0]["printer_key"] == "printer-2"
+
+
+@pytest.mark.asyncio
+async def test_a_broken_config_leaves_the_running_roster_alone(file_backed_connection, tmp_path) -> None:
+    """Half-typed edits happen; taking a working agent's printers away because
+    the file is mid-save is worse than ignoring the save."""
+    hub, ws, _path = file_backed_connection
+    write_config_file(tmp_path, ["printer-1", "printer-2"], brand="mooonraker")
+
+    await hub._reload_config_if_changed()
+
+    assert sorted(hub._adapters) == ["printer-1"]
+    assert ws.sent_of_type("inventory") == []
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_config_is_not_reapplied(file_backed_connection) -> None:
+    hub, ws, _path = file_backed_connection
+
+    await hub._reload_config_if_changed()
+    await hub._reload_config_if_changed()
+
+    assert ws.sent_of_type("inventory") == []
+
+
+@pytest.mark.asyncio
+async def test_hub_wiring_changes_do_not_apply_to_a_live_session(file_backed_connection, tmp_path, caplog) -> None:
+    """The session was opened with that token; adopting a new one mid-flight
+    would mean tearing down the thing carrying the change."""
+    hub, _ws, _path = file_backed_connection
+    write_config_file(tmp_path, ["printer-1"], agent_token="rotated-token")
+
+    with caplog.at_level(logging.WARNING):
+        await hub._reload_config_if_changed()
+
+    assert hub.config.agent_token == "secret-token"
+    assert "agent_token" in [getattr(record, "error", "") for record in caplog.records]
+
+
+@pytest.mark.asyncio
+async def test_inventory_request_is_answered_with_the_roster(connection) -> None:
+    hub, _adapter, _outbox = connection
+    ws = FakeWebSocket()
+    request = build_envelope("inventory_request", {})
+
+    await hub._handle_message(ws, request)
+
+    payload = ws.sent_of_type("inventory")[0]["payload"]
+    assert payload["request_msg_id"] == request["msg_id"]
+    assert payload["location_key"] == hub.config.location_key
+    assert [entry["printer_key"] for entry in payload["printers"]] == ["printer-1"]
+
+
+@pytest.mark.asyncio
+async def test_inventory_carries_the_same_roster_as_hello(connection) -> None:
+    """The contract promises one parser reads both; that holds only if one
+    function builds the array."""
+    hub, _adapter, _outbox = connection
+    ws = FakeWebSocket()
+
+    await hub._send_hello(ws)
+    await hub._handle_message(ws, build_envelope("inventory_request", {}))
+
+    hello = ws.sent_of_type("hello")[0]["payload"]
+    inventory = ws.sent_of_type("inventory")[0]["payload"]
+    assert hello["printers"] == inventory["printers"]
+
+
+@pytest.mark.asyncio
+async def test_inventory_request_is_not_answered_with_a_command_result(connection) -> None:
+    """It touches no printer, so answering it as a command would invent a
+    command_id the hub never sent."""
+    hub, _adapter, _outbox = connection
+    ws = FakeWebSocket()
+
+    await hub._handle_message(ws, build_envelope("inventory_request", {}))
+
+    assert ws.sent_of_type("command_result") == []
 
 
 @pytest.mark.asyncio

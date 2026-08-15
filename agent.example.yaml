@@ -11,6 +11,12 @@ command_reconnect_backoff_s:
 outbox:
   max_events: 5000
   database_path: data/outbox.sqlite3
+# Files the hub sends for printing. They have to outlive a restart — the start
+# arrives as its own command after the upload — but not a shop-floor disk.
+# `directory` defaults to a folder next to the outbox database.
+print_files:
+  max_age_h: 72
+  max_total_mb: 2048
 updates:
   feed_url: https://downloads.example.com/printer-agent/update.json
   auto_update: false
@@ -20,6 +26,10 @@ printers:
     brand: moonraker
     host: 192.168.10.21
     port: 7125
+    # Only needed when the camera is not where the adapter looks by itself
+    # (`http://<host>/webcam/?action=snapshot`, then `:8080/?action=snapshot`).
+    # No URL and no answer to the probe means the printer reports no camera.
+    camera_snapshot_url: ""
     credentials: {}
   - key: printer-2
     brand: bambu

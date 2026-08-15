@@ -37,12 +37,29 @@ class UpdateConfig:
 
 
 @dataclass(slots=True)
+class PrintFilesConfig:
+    """Where files delivered by `file_offer` are kept, and for how long.
+
+    The cache has to outlive a restart — `start_print` arrives as its own command
+    after the upload — but it must not grow without bound on a shop-floor box.
+    An empty ``directory`` means "next to the outbox database".
+    """
+
+    directory: Path | None = None
+    max_age_h: int = 72
+    max_total_mb: int = 2048
+
+
+@dataclass(slots=True)
 class PrinterConfig:
     key: str
     brand: str
     host: str
     port: int | None = None
     credentials: dict[str, Any] = field(default_factory=dict)
+    #: Still-image URL for the camera, when the printer's is not where the
+    #: adapter would look by itself. Not a credential: it is an address.
+    camera_snapshot_url: str = ""
 
 
 @dataclass(slots=True)
@@ -54,8 +71,19 @@ class AgentConfig:
     heartbeat_interval_s: int = 15
     command_reconnect_backoff_s: BackoffConfig = field(default_factory=BackoffConfig)
     outbox: OutboxConfig = field(default_factory=OutboxConfig)
+    print_files: PrintFilesConfig = field(default_factory=PrintFilesConfig)
     updates: UpdateConfig = field(default_factory=UpdateConfig)
     printers: list[PrinterConfig] = field(default_factory=list)
+    #: File this config was read from, so a long-running agent can notice the
+    #: operator editing it. Set by :func:`parse_config`; ``None`` for a config
+    #: built in memory, and never written back out by :func:`config_to_dict`.
+    source_path: Path | None = None
+
+    def print_files_directory(self) -> Path:
+        """The print-file cache, defaulted next to the outbox it belongs with."""
+        if self.print_files.directory is not None:
+            return self.print_files.directory
+        return self.outbox.database_path.parent / "print-files"
 
 
 _REQUIRED_KEYS = ("hub_url", "agent_token", "location_key")
@@ -76,6 +104,9 @@ def parse_config(
     merged = _apply_env_overrides(data, env)
     config = config_from_dict(merged)
     config.outbox.database_path = _resolve_outbox_path(config.outbox.database_path, config_path)
+    if config.print_files.directory is not None:
+        config.print_files.directory = _resolve_outbox_path(config.print_files.directory, config_path)
+    config.source_path = config_path
     return config, validate_config(config)
 
 
@@ -135,6 +166,15 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
             "database_path": str(config.outbox.database_path),
             "max_events": config.outbox.max_events,
         },
+        "print_files": {
+            **(
+                {"directory": str(config.print_files.directory)}
+                if config.print_files.directory is not None
+                else {}
+            ),
+            "max_age_h": config.print_files.max_age_h,
+            "max_total_mb": config.print_files.max_total_mb,
+        },
         "updates": {
             "feed_url": config.updates.feed_url,
             "auto_update": config.updates.auto_update,
@@ -146,6 +186,11 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
                 "brand": printer.brand,
                 "host": printer.host,
                 **({"port": printer.port} if printer.port is not None else {}),
+                **(
+                    {"camera_snapshot_url": printer.camera_snapshot_url}
+                    if printer.camera_snapshot_url
+                    else {}
+                ),
                 **({"credentials": printer.credentials} if printer.credentials else {}),
             }
             for printer in config.printers
@@ -182,6 +227,32 @@ def _apply_env_overrides(data: dict[str, Any], env: os._Environ[str]) -> dict[st
     return merged
 
 
+def _text(value: Any) -> str:
+    """A YAML scalar as text, where an empty key reads as empty.
+
+    `host:` with nothing after it parses as None, and `str(None)` is the
+    four-character token "None" — a value that looks set, satisfies every
+    required-field check, and surfaces much later as a printer whose hostname
+    cannot be resolved.
+    """
+    return "" if value is None else str(value).strip()
+
+
+def _int(value: Any, default: int, name: str) -> int:
+    """A YAML scalar as a whole number, or a readable refusal.
+
+    An empty key means "unset" and takes the default. Anything else that is not
+    a number is a mistake worth naming: `int()` raising bare `ValueError` out of
+    config loading tells the operator which type failed but not which setting.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ConfigError([f"{name} must be a whole number"]) from None
+
+
 def _parse_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -197,37 +268,45 @@ def _parse_bool(value: Any, default: bool = False) -> bool:
 
 def config_from_dict(data: dict[str, Any]) -> AgentConfig:
     outbox_data = data.get("outbox") or {}
+    print_files_data = data.get("print_files") or {}
     updates_data = data.get("updates") or {}
     backoff_data = data.get("command_reconnect_backoff_s") or {}
     printers: list[PrinterConfig] = []
     for item in data.get("printers", []):
         if not isinstance(item, dict):
             continue
+        key = _text(item.get("key"))
         printers.append(
             PrinterConfig(
-                key=str(item.get("key", "")),
-                brand=str(item.get("brand", "moonraker")).lower(),
-                host=str(item.get("host", "")),
-                port=int(item["port"]) if item.get("port") is not None else None,
+                key=key,
+                brand=(_text(item.get("brand")) or "moonraker").lower(),
+                host=_text(item.get("host")),
+                port=_int(item.get("port"), 0, f"printer {key}: port") if item.get("port") is not None else None,
                 credentials=item.get("credentials") or {},
+                camera_snapshot_url=_text(item.get("camera_snapshot_url")),
             )
         )
     return AgentConfig(
-        hub_url=str(data.get("hub_url", "")).strip(),
-        agent_token=str(data.get("agent_token", "")).strip(),
-        location_key=str(data.get("location_key", "")).strip(),
-        telemetry_interval_s=int(data.get("telemetry_interval_s", 5)),
-        heartbeat_interval_s=int(data.get("heartbeat_interval_s", 15)),
+        hub_url=_text(data.get("hub_url")),
+        agent_token=_text(data.get("agent_token")),
+        location_key=_text(data.get("location_key")),
+        telemetry_interval_s=_int(data.get("telemetry_interval_s"), 5, "telemetry_interval_s"),
+        heartbeat_interval_s=_int(data.get("heartbeat_interval_s"), 15, "heartbeat_interval_s"),
         command_reconnect_backoff_s=BackoffConfig(
-            min_s=int(backoff_data.get("min", 1)),
-            max_s=int(backoff_data.get("max", 60)),
+            min_s=_int(backoff_data.get("min"), 1, "command_reconnect_backoff_s.min"),
+            max_s=_int(backoff_data.get("max"), 60, "command_reconnect_backoff_s.max"),
         ),
         outbox=OutboxConfig(
-            database_path=Path(outbox_data.get("database_path", "data/outbox.sqlite3")),
-            max_events=int(outbox_data.get("max_events", 5000)),
+            database_path=Path(_text(outbox_data.get("database_path")) or "data/outbox.sqlite3"),
+            max_events=_int(outbox_data.get("max_events"), 5000, "outbox.max_events"),
+        ),
+        print_files=PrintFilesConfig(
+            directory=Path(_text(print_files_data.get("directory"))) if _text(print_files_data.get("directory")) else None,
+            max_age_h=_int(print_files_data.get("max_age_h"), 72, "print_files.max_age_h"),
+            max_total_mb=_int(print_files_data.get("max_total_mb"), 2048, "print_files.max_total_mb"),
         ),
         updates=UpdateConfig(
-            feed_url=str(updates_data.get("feed_url", "")).strip(),
+            feed_url=_text(updates_data.get("feed_url")),
             auto_update=_parse_bool(updates_data.get("auto_update"), False),
             check_on_startup=_parse_bool(updates_data.get("check_on_startup"), True),
         ),
@@ -253,6 +332,10 @@ def validate_config(config: AgentConfig) -> list[str]:
         errors.append("command_reconnect_backoff_s.max must be greater than or equal to min")
     if config.outbox.max_events <= 0:
         errors.append("outbox.max_events must be positive")
+    if config.print_files.max_age_h <= 0:
+        errors.append("print_files.max_age_h must be positive")
+    if config.print_files.max_total_mb <= 0:
+        errors.append("print_files.max_total_mb must be positive")
     if config.updates.feed_url and not str(config.updates.feed_url).strip():
         errors.append("updates.feed_url must not be blank")
     if not config.printers:
@@ -266,6 +349,10 @@ def validate_config(config: AgentConfig) -> list[str]:
             errors.append(f"printer {printer.key}: host is required")
         if printer.port is not None and printer.port <= 0:
             errors.append(f"printer {printer.key}: port must be positive")
+        if printer.camera_snapshot_url and not printer.camera_snapshot_url.lower().startswith(
+            ("http://", "https://")
+        ):
+            errors.append(f"printer {printer.key}: camera_snapshot_url must be an http(s) URL")
         if printer.brand == "bambu":
             access_code = str((printer.credentials or {}).get("access_code", "")).strip()
             serial = str((printer.credentials or {}).get("serial", "")).strip()

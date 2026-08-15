@@ -10,6 +10,8 @@ Status: **specification**. This document defines the API surface that an externa
 
 - Учётная система читает состояние оборудования (`GET /printers`, `GET /printers/{id}/state`) — это проекция снимков, которые агент шлёт в хаб.
 - Учётная система ставит задания и управляет печатью через команды (`POST /printers/{id}/commands`), хаб доставляет их агенту, агент — принтеру.
+- Отправка в печать — это ДВЕ команды: хаб сначала доставляет файл на принтер, затем отдельной командой запускает печать. У каждой половины свой `command_id` и свой исход, поэтому «файл доехал, печать не началась» — различимое состояние, а не одна непрозрачная ошибка. Слайсинга в системе нет: на принтер уезжает только то, что он умеет открыть.
+- Камеры в этой версии API нет — сессия просмотра живёт около двух минут и открывается зрителем, истории кадров не существует. Смотреть печать — в карточке принтера RD Control.
 - Идемпотентность обеспечивает сама учётная система: `command_id` — это её собственный GUID документа. Повтор запроса с тем же `command_id` возвращает тот же результат, а не создаёт второе задание.
 - События (смена статуса, ошибка, завершение печати) доставляются вебхуками или опросом `GET /events` с курсором, семантика — at-least-once, дедуп по `event_id`.
 
@@ -89,6 +91,15 @@ Query parameters: `location_key`, `brand`, `status`, `cursor`, `limit` (default 
 
 Use `capabilities` before offering an action in the accounting UI. An action that the printer does not support returns `unsupported` rather than an error — it is a normal outcome, not a failure to retry.
 
+`capabilities` describe what the **agent's adapter for that printer** actually implements, not what the machine could do in principle. Two of them gate whole features:
+
+| Flag | Gates | Meaning when false |
+| --- | --- | --- |
+| `upload` | `upload_file`, and `start_print` for a file the printer does not already hold | this agent cannot put files on this printer; send the job to the operator instead |
+| `camera` | any camera surface | the printer reports no camera, or this brand's frames are not implemented yet |
+
+Partial fleet support is a working state, not a half-broken one: a printer whose brand has no upload yet answers `unsupported`, and the accounting UI should say so rather than offer a button that can only refuse.
+
 ### `GET /printers/{printer_id}/state`
 
 Current normalized snapshot. Shape mirrors `PrinterSnapshot.to_dict()`; absent values are omitted, never sent as `null`.
@@ -112,6 +123,7 @@ Current normalized snapshot. Shape mirrors `PrinterSnapshot.to_dict()`; absent v
   "temps": { "nozzle": 215.0, "nozzle_target": 215.0, "bed": 60.0, "bed_target": 60.0 },
   "error": {},
   "capabilities": { "pause": true },
+  "state": { "ams": { "slots": [ { "index": 0, "material": "PLA", "color": "#000000", "remaining_pct": 87 } ] } },
   "ts": "2026-08-14T12:00:03Z",
   "stale": false
 }
@@ -122,6 +134,9 @@ Current normalized snapshot. Shape mirrors `PrinterSnapshot.to_dict()`; absent v
 - `job.status` is the job enum: `queued`, `uploading`, `printing`, `paused`, `finished`, `failed`, `cancelled`.
 - `ts` is when the agent observed the state, not when the hub answered. `stale` is true when the last snapshot is older than the hub's freshness threshold (agent disconnected or telemetry dropped).
 - Telemetry is lossy by design: temperatures and progress may skip values. Do not use polled state to detect transitions — use events.
+- `status` **outranks the `job` block in the same snapshot.** Some firmware keeps reporting the finished print — file name and progress included — after the machine has gone back to `idle`. A `job` block on a printer that is not printing describes a job that has ended, and the hub closes it: finished at a progress of 99 % or more, not-completed otherwise. There is no separate "print finished" message to wait for.
+- Warm-up counts as printing, not as downtime: `status` is `printing` while the bed and nozzle come up to temperature.
+- `state` carries slow-moving vendor state; `state.ams.slots[]` is the feeding system, one entry per slot (`index`, `material`, `color`, `remaining_pct`). Only `index` is guaranteed. Absent means the printer has no feeding system or the adapter cannot read it — not that the slots are empty.
 
 ### `POST /files`
 
@@ -138,6 +153,12 @@ Response:
 ```
 
 The URL must be reachable by the hub. `sha256` is mandatory and verified before delivery to the agent.
+
+The file is checked **twice on purpose**: the hub re-computes the checksum before handing the file out, and the agent computes it again over the body it received before anything reaches the printer. A mismatch on either side ends the command with `failed` and sends nothing to the machine — printing an unverified file means printing a part nobody planned.
+
+The hub serves the file to the agent from its own address, under the agent's own token; there is no public link, and the accounting system never needs one. If the source file changes after a command was issued, delivery fails with `409` rather than sending the new revision to a job that was planned around the old one.
+
+Only `gcode` (and the `.3mf` a printer accepts directly) is sent to a printer. **Slicing is not part of this API**: `STL` and models are not converted anywhere in the system, and a file the printer cannot open is rejected at registration rather than at the machine.
 
 ### `POST /printers/{printer_id}/commands`
 
@@ -156,11 +177,17 @@ Issues a command. This is the only write path into the printer.
 
 | Action | `args` | Notes |
 | --- | --- | --- |
-| `start_print` | `file_ref` (string, required) | file must be registered via `POST /files` |
+| `start_print` | `file_ref` (required), `remote_name` (optional) | file must be registered via `POST /files`; the hub delivers it to the printer first |
 | `pause` | — | requires `capabilities.pause` |
 | `resume` | — | requires `capabilities.resume` |
 | `cancel` | — | requires `capabilities.cancel` |
-| `upload_file` | `file_ref`, `remote_name` | uploads without starting a print; requires `capabilities.upload` |
+| `upload_file` | `file_ref`, `remote_name` | delivers the file without starting a print; requires `capabilities.upload` |
+
+**A print is two commands, not one.** `start_print` on a file the printer does not hold makes the hub deliver it first (as `upload_file`, which reaches the agent as `file_offer`) and issue the start as its own command once the delivery succeeds. Each half has its own `command_id`, its own result and its own journal entry — which is what makes "the file is on the printer, the print did not start" a distinguishable outcome instead of one opaque failure. Track both, or track the `command_id` you supplied for the start and read the delivery from the events.
+
+`remote_name` is the name the file gets on the printer. Supply it when the operator should recognise it on the machine's own screen; otherwise the hub derives one.
+
+**Material check.** Before delivering a file the hub reads the filaments named in its header and compares them against `state.ams.slots[]` for the target printer. A mismatch refuses the command with `422 material_mismatch` and names the missing filament, rather than starting a print that will come out in the wrong plastic. Overriding it is deliberate and explicit — `args.force_material: true` (specified here, pending hub implementation). A printer that reports no feeding system is not checked, and that is reported as "not checked", never as "matched".
 
 Response `202 Accepted`:
 
@@ -268,7 +295,7 @@ Temperature drift raises **no** event by design — temperatures ride along in l
 | 401 / 403 | `unauthenticated`, `location_out_of_scope` | no |
 | 404 | `printer_not_found`, `command_not_found` | no |
 | 409 | `command_id_conflict` (same id, different payload) | no |
-| 422 | `capability_unsupported` | no |
+| 422 | `capability_unsupported`, `material_mismatch` | no; `material_mismatch` needs an explicit override |
 | 429 | `rate_limited` (see `Retry-After`) | yes, with backoff |
 | 503 | `agent_offline` | yes, or queue on the accounting side |
 
@@ -290,9 +317,9 @@ A suggested binding for a typical ERP data model:
 Recommended sequence for a production order:
 
 1. Publish the G-code, register it: `POST /files` → `file_ref`.
-2. Pick a printer: `GET /printers?location_key=...&status=idle`, check `capabilities`.
-3. Start: `POST /printers/{printer_id}/commands` with `command_id` = operation GUID, `action: "start_print"`.
-4. Wait for `command.completed` with `status: "done"`; treat anything else per the status table above.
+2. Pick a printer: `GET /printers?location_key=...&status=idle`, check `capabilities.upload` and, if the file names a filament, `state.ams.slots[]`.
+3. Start: `POST /printers/{printer_id}/commands` with `command_id` = operation GUID, `action: "start_print"`. The hub delivers the file first and starts the print as a second command.
+4. Wait for `command.completed` with `status: "done"`; treat anything else per the status table above. A delivery that succeeded while the start failed leaves the file on the printer — retry the start rather than the whole sequence.
 5. Track progress from `printer.job_changed` events; write the completion fact when `job.status` becomes `finished`, `failed`, or `cancelled`.
 6. Reconcile on restart: re-read `GET /commands/{command_id}` for every open operation before issuing anything new.
 
@@ -300,8 +327,10 @@ Recommended sequence for a production order:
 
 - No scheduling, queueing, prioritization, or printer selection logic in this API. The accounting system decides which printer runs what.
 - No pricing, costing, or material accounting.
+- No slicing. Only a file the printer can open is ever sent to it.
 - No inbound API on `printer-agent` itself — this remains a hard project boundary.
 - No direct access to the agent's SQLite outbox or to vendor protocols (Moonraker JSON-RPC, Bambu MQTT) from outside the adapters.
+- **No camera in v1.** `capabilities.camera` is readable, but frames are not: a camera session is opened by a viewer, lives about two minutes, and the hub keeps only the newest frame — there is no history to serve and none will be introduced. An accounting system that needs to watch a print links to the printer's card in RD Control.
 
 ## Keeping this document correct
 

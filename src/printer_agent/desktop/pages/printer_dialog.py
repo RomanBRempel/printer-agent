@@ -55,6 +55,8 @@ class PrinterDialog(QDialog):
         self.host_edit = QLineEdit(source.host)
         self.host_edit.setPlaceholderText("192.168.1.50")
         self.port_edit = QLineEdit("" if source.port is None else str(source.port))
+        self.camera_url_edit = QLineEdit(source.camera_snapshot_url)
+        self.camera_url_edit.setPlaceholderText("http://192.168.10.21/webcam/?action=snapshot")
         self.access_code_edit = QLineEdit(access_code)
         self.access_code_edit.setEchoMode(QLineEdit.Password)
         self.serial_edit = QLineEdit(serial)
@@ -87,6 +89,13 @@ class PrinterDialog(QDialog):
         moonraker_layout.addWidget(form_row("API key", self.api_key_edit, hint="Необязательно, если Moonraker без авторизации."))
         layout.addWidget(self._moonraker_fields)
 
+        layout.addWidget(
+            form_row(
+                "Снимок камеры (URL)",
+                self.camera_url_edit,
+                hint="Пусто — агент ищет камеру сам; не нашёл — сообщает хабу, что камеры нет.",
+            )
+        )
         layout.addWidget(form_row("Дополнительные credentials (JSON)", self.extra_edit))
 
         self._error = Caption("")
@@ -160,7 +169,16 @@ class PrinterDialog(QDialog):
             if api_key:
                 credentials["api_key"] = api_key
 
+        camera_url = self.camera_url_edit.text().strip()
+        if camera_url and not camera_url.lower().startswith(("http://", "https://")):
+            return self._fail("URL снимка камеры должен начинаться с http:// или https://.")
+
         self.result_printer = PrinterConfig(
-            key=key, brand=brand, host=host, port=port, credentials=credentials
+            key=key,
+            brand=brand,
+            host=host,
+            port=port,
+            credentials=credentials,
+            camera_snapshot_url=camera_url,
         )
         self.accept()

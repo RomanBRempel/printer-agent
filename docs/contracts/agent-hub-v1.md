@@ -72,6 +72,55 @@ reachable under more than one of them (Creality K-series firmware exposes Moonra
 some builds and only the vendor socket on others), which is why `brand` is an input to
 the identity hash and never an identity on its own.
 
+**`capabilities` state what this adapter does, not what the machine could do.**
+The hub gates commands on them *and* builds its interface from them, so a flag
+raised ahead of the implementation shows the operator a button whose only
+possible answer is `unsupported`. Two of them decide whole features:
+
+| Flag | Opens | Raised when |
+| --- | --- | --- |
+| `upload` | `file_offer` for this printer, and the "send to printer" action | the adapter actually uploads files to this brand |
+| `camera` | `camera_request` and the camera panel | the adapter can produce a still frame from this printer |
+
+`camera: false` is a normal answer, not a defect: the hub says the printer
+reports no camera. The same flags ride along in every snapshot, so an adapter
+that learns the answer only after connecting (a snapshot URL it had to probe for)
+corrects itself through `telemetry` without waiting for the next `hello`.
+
+### `inventory`
+
+The agent's printer roster: in answer to an `inventory_request`, and on its own
+whenever the roster changes.
+
+```json
+{
+  "location_key": "loc-001",
+  "agent_version": "0.1.0",
+  "request_msg_id": "uuid-of-the-inventory-request-envelope",
+  "printers": [
+    {
+      "printer_key": "printer-1",
+      "brand": "moonraker",
+      "capabilities": { "pause": true, "resume": true, "cancel": true, "upload": true, "camera": false, "ams": false, "cfs": false }
+    }
+  ]
+}
+```
+
+`printers[]` is the same array as in `hello`, field for field, so both messages
+are read with one parser.
+
+`request_msg_id` carries the `msg_id` of the envelope being answered. It is
+**omitted** when the agent sends `inventory` on its own — which it does after
+noticing its config file changed, so a printer added at the location reaches the
+hub without waiting for a restart. An unsolicited `inventory` is therefore normal
+traffic, not a protocol error, and it replaces the roster wholesale: a printer
+missing from it has been removed from that agent.
+
+The roster is the set of printers the agent is **configured** for, not the set
+currently answering: an unreachable printer stays in the list, and its state is
+reported through `telemetry` as `offline` like any other.
+
 ### `telemetry`
 
 Batch snapshots, lossy delivery.
@@ -87,6 +136,7 @@ Batch snapshots, lossy delivery.
       "temps": { "nozzle": 215.0, "bed": 60.0 },
       "error": {},
       "capabilities": { "pause": true },
+      "state": { "ams": { "slots": [ { "index": 0, "material": "PLA", "color": "#000000", "remaining_pct": 87 } ] } },
       "ts": "2026-08-14T12:00:00Z"
     }
   ]
@@ -96,6 +146,26 @@ Batch snapshots, lossy delivery.
 Absent values are omitted, never sent as `null`: a snapshot with no error carries
 `"error": {}`, and unknown temperatures leave their keys out entirely. Receivers
 must treat a missing key and an empty object as the same thing.
+
+`state` holds slow-moving vendor state that has no place among the fixed fields.
+It is free-form by design: a receiver reads the parts it knows and passes the
+rest through unchanged. One block is defined today.
+
+**`state.ams.slots[]`** — the feeding system, one entry per slot, in the order the
+printer numbers them. The hub compares it against the filaments named in the
+print file's header before sending a job, which is the only reason it exists.
+
+| Field | Meaning |
+| --- | --- |
+| `index` | Slot number, flat across units (unit 1 tray 0 is index 4 on a four-tray system) |
+| `material` | Filament type as the printer reports it (`PLA`, `PETG`). `type` is accepted as a synonym |
+| `color` | `#RRGGBB`. `colour` is accepted as a synonym |
+| `remaining_pct` | Remaining share of the spool, when the printer can tell |
+
+Only `index` is mandatory: a slot whose material the printer cannot name is
+reported as present and empty rather than left out, because a missing slot and an
+unreadable one mean different things to a material check. A printer with no
+feeding system sends no `ams` block at all, and `capabilities.ams` / `cfs` say so.
 
 ### `event`
 
@@ -151,6 +221,16 @@ time by the age of the message.
 `maintenance` describe a machine and have no job counterpart, so the agent omits
 `job.status` instead of putting a printer value in it.
 
+**`status` outranks the `job` block in the same snapshot.** Some firmware keeps
+reporting the finished print — file name and progress included — after the
+machine has gone back to `idle`; Creality's does. The receiver reads that as a
+job that ended, not as one still running, and a leftover `job` block on a
+printer that is not printing never starts a new one. There is deliberately **no
+"print finished" message**: the transition is derivable from the snapshot, and an
+event that must be produced exactly once at exactly the right moment is a thing
+an edge agent cannot promise. Warm-up is part of printing, not idleness — the
+status during it is `printing`.
+
 ## Hub -> Agent
 
 ### `hello_ack`
@@ -177,6 +257,26 @@ session: the agent logs the reason and does not reconnect, because retrying
 cannot change the answer. This is the rule that keeps an incompatible or
 deauthorised agent from looking like a network failure and looping forever.
 
+### `inventory_request`
+
+Asks the agent for its printer roster without waiting for a reconnect.
+
+```json
+{}
+```
+
+The payload is empty: the request is identified by its envelope `msg_id`, which
+the agent echoes back as `inventory.request_msg_id`. This message exists because
+the roster otherwise arrives only in `hello` — a hub that missed it, or that has
+to reconcile after an operator changed something, had no way to ask for it short
+of dropping the session.
+
+It carries no `command_id` and is **not** answered with a `command_result`: it is
+a request for state, not an action on a printer, and it never touches one. An
+agent too old to know the type ignores it and logs the unknown type, so the hub
+must treat a missing answer as "this agent predates the message", not as a
+failure — send it, and fall back to the roster from `hello`.
+
 ### `command`
 
 ```json
@@ -188,36 +288,114 @@ with `command_result` of status `unsupported`, not dropped.
 
 Idempotency is by `command_id`. Replayed commands must return the same result.
 
+`start_print` takes both names of the same file:
+
+```json
+{ "command_id": "cmd-9", "printer_key": "printer-1", "action": "start_print",
+  "args": { "file_ref": "pf_7f3a…", "remote_name": "BWB-20-D-001-R2.gcode" } }
+```
+
+`file_ref` is the file in the agent's cache, delivered earlier by `file_offer`;
+`remote_name` is what it was stored as on the printer, which is how an adapter
+that prints by printer-side name (Moonraker) addresses it. The duplication is
+deliberate: reconstructing one from the other is where two implementations
+diverge. A `file_ref` the agent no longer holds is answered `failed` with the ref
+in `error_text` — the agent does **not** go looking for the file, it has no URL
+for it and must not guess one. The hub answers that outcome by offering the file
+again.
+
 ### `file_offer`
 
 Pull-based file delivery from hub to agent.
 
 ```json
-{ "command_id": "cmd-2", "printer_key": "printer-1", "url": "https://rd-control.example.com/files/abc.gcode", "sha256": "...", "remote_name": "job.gcode" }
+{
+  "command_id": "cmd-2",
+  "printer_key": "printer-1",
+  "file_ref": "pf_7f3a91c2e5b04d18a6c2f0d9b41e77aa",
+  "url": "https://rd-control.example.com/api/printers/files/pf_7f3a91c2e5b04d18a6c2f0d9b41e77aa",
+  "remote_name": "BWB-20-D-001-R2.gcode",
+  "sha256": "9f2c1f0a4d0c1e5b6a8f0d3b2c4e6a8f0d3b2c4e6a8f0d3b2c4e6a8f0d3b2c4e",
+  "size_bytes": 24815064,
+  "start_after_upload": true,
+  "expires_at": "2026-08-14T12:30:00Z"
+}
 ```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `file_ref` | yes | The file's name in the agent's cache. **The hub assigns it**, and the follow-up `start_print` carries the same value |
+| `url` | yes | Where to fetch it. Always on the hub |
+| `remote_name` | yes | The name the file gets on the printer |
+| `sha256` | yes | Verified by the agent **before** the file reaches the printer |
+| `size_bytes` | yes | Expected length, checked alongside the checksum |
+| `start_after_upload` | no | Informational: the hub will send `start_print` itself |
+| `expires_at` | no | After this, retrying a `503` is pointless |
+
+`file_ref` comes from the hub rather than the agent so that one file has one
+name: an agent-assigned id would have to travel back in `command_result` and be
+parsed out of it, which is a second naming path for the same file.
+
+**`start_after_upload` is not an instruction to print.** The start arrives as its
+own command with its own `command_id`, so its outcome has a command to belong to.
+The flag only tells the agent that the file is about to be needed.
+
+The agent answers `done` once the file is verified and on the printer,
+`unsupported` when `capabilities.upload` is false for that adapter, and `failed`
+with a readable `error_text` for everything else — a checksum mismatch included,
+where nothing is sent to the printer at all.
 
 ### `camera_request`
 
-Starts on-demand JPEG delivery for a printer.
+Starts on-demand frame delivery for a printer.
 
 ```json
-{ "command_id": "cmd-3", "printer_key": "printer-1" }
+{
+  "command_id": "cmd-3",
+  "printer_key": "printer-1",
+  "session_id": "cam_9f2c8a1b",
+  "upload_url": "https://rd-control.example.com/api/printers/camera/cam_9f2c8a1b",
+  "interval_s": 2,
+  "max_bytes": 2097152,
+  "expires_at": "2026-08-14T12:02:00Z"
+}
 ```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `session_id` | yes | Identifies the viewing session; echoed by `camera_stop` |
+| `upload_url` | yes | Where frames are posted |
+| `interval_s` | no | Seconds between frames. **The hub sets the rate**; the agent has none of its own |
+| `max_bytes` | no | Per-frame ceiling |
+| `expires_at` | no | The session's own lifetime, used by the agent as the longest it keeps filming with no answer from the hub |
+
+The agent answers `done` once it has *started* filming — the result confirms the
+session, not the delivery of a frame. Frames themselves go over HTTP, never
+through this socket: the socket has a message-size ceiling and carries a durable
+event stream that must not be filled with pictures.
+
+Only one session runs per printer. The hub does not open a second one, and a
+repeated `camera_request` replaces rather than doubles the stream.
 
 ### `camera_stop`
 
 Stops the active camera session.
 
 ```json
-{ "command_id": "cmd-4", "printer_key": "printer-1" }
+{ "command_id": "cmd-4", "printer_key": "printer-1", "session_id": "cam_9f2c8a1b" }
 ```
 
+`session_id` is **mandatory**. By the time the command arrives the viewer may
+have closed the camera and opened it again, and a stop without a session would
+put out a stream that someone is watching. A stop naming a session that is no
+longer the active one is answered `done` and changes nothing.
+
 `file_offer`, `camera_request` and `camera_stop` are answered with a
-`command_result` carrying the same `command_id`, exactly like `command`. They are
-not implemented yet and currently answer `unsupported`. A message without
-`command_id` cannot be answered identifiably and is dropped with a log line, so
-the field is mandatory for all three. Delivery-specific fields (frame rate,
-resolution, transport) are not specified yet and may be added later.
+`command_result` carrying the same `command_id`, exactly like `command`, and
+idempotency by `command_id` applies to them in the same way: a redelivered
+`file_offer` returns the stored result rather than downloading and uploading a
+second time. A message without `command_id` cannot be answered identifiably and
+is dropped with a log line, so the field is mandatory for all three.
 
 ### `ack`
 
@@ -239,6 +417,83 @@ Used when one message is malformed but the agent itself is fine — the opposite
 `hello_reject`, which ends the session. `msg_id` refers to the refused envelope so
 the agent can stop resending it; without this message a rejected event would be
 retried out of the outbox forever. `code` is free-form for now and is only logged.
+
+**Refusing an event discards it.** The agent settles the referenced message the
+same way an `ack` settles it: the message is gone from the outbox and will not be
+sent again, in this session or any later one. So `error` is the right answer to a
+message the hub will *never* accept, and the wrong answer to one it cannot accept
+*yet* — a printer awaiting attachment, a temporary storage failure. For those,
+staying silent keeps the event pending and the agent resends it, which is the
+behaviour that survives the wait.
+
+## HTTP side channels
+
+Two payloads do not belong on the control socket: print files, which run to
+hundreds of megabytes, and camera frames, which are a lossy stream. Both use
+plain HTTP against the hub, both are still **outbound only** — the agent opens no
+port for either — and both authenticate with the same `Authorization: Bearer
+<agent_token>` the WebSocket handshake uses. A `?token=` query parameter is not
+accepted anywhere: it would end up in access logs.
+
+Both addresses are named by the command that needs them. The agent never
+constructs one.
+
+### Fetching a print file
+
+```
+GET <file_offer.url>          →  200, body = the file
+```
+
+Answer headers: `Content-Length`, `X-Print-File-Sha256`, `X-Print-File-Name`,
+`Content-Disposition`. The agent streams the body to a temporary file, hashes it
+on the way past, and moves it into its cache under `file_ref` only after the
+checksum and the length both match.
+
+| Status | Meaning | Agent |
+| --- | --- | --- |
+| `401` | no header, or the token was refused | `failed`, reason in `error_text` |
+| `403` | the file belongs to a printer of another agent | `failed`; a repeat cannot change it |
+| `404` | unknown `file_ref`, or it was cleaned up | `failed`; the hub materialises the file again |
+| `409` | the source file changed after the command was issued | `failed`. Printing it would put the wrong revision on the bed |
+| `503` | the hub cannot serve it right now | retry with backoff, within `expires_at` |
+
+An `X-Print-File-Sha256` that disagrees with the command's `sha256` is refused
+before the body is read: the hub is serving a different revision than the command
+was issued for.
+
+### Posting a camera frame
+
+```
+POST <camera_request.upload_url>   body = the image bytes
+```
+
+`Content-Type` is `image/jpeg`, `image/png` or `image/webp`; `X-Captured-At`
+(ISO-8601, by the agent's clock) is optional. The hub keeps only the newest
+frame — there is no history, and none may be introduced.
+
+**The answer to a frame outranks `camera_stop`:**
+
+| Status | `continue` | Agent |
+| --- | --- | --- |
+| `200` | `true` | next frame after `interval_s` from the answer |
+| `400` | `true` | this frame was unusable; log it and keep filming |
+| `413` | `true` | frame above `max_bytes`; reduce it and keep filming |
+| `409` / `404` | `false` | **stop immediately** — do not wait for `camera_stop` |
+| `500` | `true` | a hub-side fault; carry on as normal |
+
+The `continue` flag in the body decides; the status is what the agent falls back
+on when there is no body. This pair is the primary way a stream ends: a stop
+command may never arrive — the session can expire while the agent is
+reconnecting — and a camera nobody is watching has to switch itself off.
+
+The hub's session expires on its own, and **only a viewer extends it**. Frames do
+not, or the stream would feed itself forever. An agent that gets no answer at all
+for the length of `expires_at` stops filming: a lost link must not leave a camera
+running.
+
+Frames are never queued and never resent. Like telemetry, they are lossy on
+purpose — a frame delivered a minute late describes a print that has since
+changed, which is worse than no frame at all.
 
 ## Vocabularies
 

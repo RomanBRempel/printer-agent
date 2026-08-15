@@ -35,7 +35,14 @@ class PrinterAdapter(ABC):
     def capabilities(self) -> PrinterCapabilities:
         raise NotImplementedError
 
-    async def start_print(self, file_ref: str) -> dict[str, Any]:
+    async def start_print(self, file_ref: str, remote_name: str | None = None) -> dict[str, Any]:
+        """Print a file already delivered to this printer.
+
+        ``file_ref`` names the file in the agent's own cache; ``remote_name`` is
+        what it was stored as on the printer. Adapters that address a print by
+        the printer-side name need the second one, and the hub sends both rather
+        than making every adapter reconstruct one from the other.
+        """
         raise UnsupportedCommandError(f"start_print is not supported for {self.printer.brand}")
 
     async def pause(self) -> dict[str, Any]:

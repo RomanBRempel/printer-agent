@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from printer_agent.adapters.base import PrinterAdapter
-from printer_agent.config import PrinterConfig
+from printer_agent.config import AgentConfig, PrinterConfig
 from printer_agent.contracts import (
     AGENT_TO_HUB_TYPES,
     HUB_TO_AGENT_TYPES,
@@ -35,6 +35,7 @@ from printer_agent.contracts import (
 )
 from printer_agent.core.outbox import EventOutbox
 from printer_agent.uplink.commands import CommandProcessor
+from printer_agent.uplink.connection import inventory_payload
 
 CONTRACT_DOC = Path(__file__).resolve().parents[1] / "docs" / "contracts" / "agent-hub-v1.md"
 
@@ -114,6 +115,9 @@ class _StubAdapter(PrinterAdapter):
     async def get_state(self) -> PrinterSnapshot:
         return PrinterSnapshot(printer_key=self.printer_key, status=PrinterStatus.idle, status_raw="idle")
 
+    def capabilities(self) -> PrinterCapabilities:
+        return PrinterCapabilities()
+
 
 def _nulls(value: Any, path: str = "") -> list[str]:
     if value is None:
@@ -186,6 +190,32 @@ def test_hello_reject_example_uses_a_documented_code(contract: ParsedContract) -
 
 def test_command_example_uses_a_documented_action(contract: ParsedContract) -> None:
     assert contract.one_block("command")["action"] in contract.vocabularies["command_action"]
+
+
+def test_inventory_shape_matches_what_the_agent_sends(contract: ParsedContract) -> None:
+    config = AgentConfig(hub_url="https://hub.example.com/api/printers/agent", agent_token="t", location_key="loc-001")
+    adapter = _StubAdapter(PrinterConfig(key="printer-1", brand="moonraker", host="127.0.0.1"))
+
+    payload = inventory_payload(config, [adapter], "0.1.0", "msg-1")
+
+    assert set(contract.one_block("inventory")) == set(payload)
+
+
+def test_inventory_repeats_the_hello_printer_entry(contract: ParsedContract) -> None:
+    # The document promises one parser reads both arrays. An entry that drifts
+    # here is exactly the divergence that shows up as a hub quietly storing a
+    # printer with half its fields.
+    hello_entry = contract.one_block("hello")["printers"][0]
+    inventory_entry = contract.one_block("inventory")["printers"][0]
+
+    assert set(hello_entry) == set(inventory_entry)
+    assert set(hello_entry["capabilities"]) == set(inventory_entry["capabilities"])
+
+
+def test_inventory_request_carries_no_command_id(contract: ParsedContract) -> None:
+    # It acts on no printer, so it is answered with `inventory`, not with a
+    # `command_result` — and a command_id would imply the opposite.
+    assert "command_id" not in contract.one_block("inventory_request")
 
 
 def test_command_bearing_hub_messages_all_carry_a_command_id(contract: ParsedContract) -> None:

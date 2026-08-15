@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -11,12 +12,14 @@ PROTOCOL_VERSION = 1
 
 class MessageType(StrEnum):
     hello = "hello"
+    inventory = "inventory"
     telemetry = "telemetry"
     event = "event"
     command_result = "command_result"
     heartbeat = "heartbeat"
     hello_ack = "hello_ack"
     hello_reject = "hello_reject"
+    inventory_request = "inventory_request"
     command = "command"
     file_offer = "file_offer"
     camera_request = "camera_request"
@@ -28,6 +31,7 @@ class MessageType(StrEnum):
 AGENT_TO_HUB_TYPES = frozenset(
     {
         MessageType.hello.value,
+        MessageType.inventory.value,
         MessageType.telemetry.value,
         MessageType.event.value,
         MessageType.command_result.value,
@@ -39,6 +43,7 @@ HUB_TO_AGENT_TYPES = frozenset(
     {
         MessageType.hello_ack.value,
         MessageType.hello_reject.value,
+        MessageType.inventory_request.value,
         MessageType.command.value,
         MessageType.file_offer.value,
         MessageType.camera_request.value,
@@ -174,6 +179,27 @@ class PrinterCapabilities:
 
 
 @dataclass(slots=True)
+class AmsSlot:
+    """One slot of a feeding system, as the hub's material check reads it.
+
+    The check compares the filaments named in the print file's header against
+    what is actually loaded, so `material` is the value that matters and the
+    rest is for the operator's eyes.
+    """
+
+    index: int
+    material: str | None = None
+    color: str | None = None
+    remaining_pct: float | None = None
+
+
+def ams_state(slots: Iterable[AmsSlot]) -> dict[str, Any]:
+    """The `state.ams` block of a snapshot, or nothing when there are no slots."""
+    cleaned = [_clean_nested(asdict(slot)) for slot in slots]
+    return {"ams": {"slots": cleaned}} if cleaned else {}
+
+
+@dataclass(slots=True)
 class PrinterSnapshot:
     printer_key: str
     status: PrinterStatus
@@ -182,6 +208,10 @@ class PrinterSnapshot:
     temps: TemperatureSnapshot = field(default_factory=TemperatureSnapshot)
     error: ErrorSnapshot = field(default_factory=ErrorSnapshot)
     capabilities: PrinterCapabilities = field(default_factory=PrinterCapabilities)
+    #: Slow-moving vendor state that has no place among the fixed fields above —
+    #: today only `ams.slots[]`. Free-form on purpose: a receiver reads the parts
+    #: it knows and passes the rest through.
+    state: dict[str, Any] = field(default_factory=dict)
     ts: str = field(default_factory=lambda: utc_now_iso())
 
     def to_dict(self) -> dict[str, Any]:
@@ -193,6 +223,7 @@ class PrinterSnapshot:
             "temps": _clean_nested(asdict(self.temps)),
             "error": _clean_nested(asdict(self.error)),
             "capabilities": _clean_nested(asdict(self.capabilities)),
+            "state": _clean_nested(self.state),
             "ts": self.ts,
         }
 

@@ -13,6 +13,7 @@ from printer_agent.config import (
     UpdateConfig,
     config_to_dict,
     load_config,
+    parse_config,
     save_config,
 )
 
@@ -73,3 +74,63 @@ def test_config_roundtrip_through_yaml(tmp_path: Path) -> None:
     reloaded = load_config(config_path)
 
     assert config_to_dict(reloaded) == config_to_dict(config)
+
+
+def write(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "agent.yaml"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+BLANK_SCALARS = """
+hub_url: https://rd-control.example.com/api/printers/agent
+agent_token: token
+location_key: loc-1
+printers:
+  - key: printer-1
+    brand:
+    host:
+"""
+
+
+def test_a_key_with_no_value_reads_as_empty_not_as_none(tmp_path: Path) -> None:
+    """`host:` parses as None, and `str(None)` is the token "None": a value that
+    looks set, satisfies every required-field check, and fails much later as a
+    hostname nothing can resolve."""
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(write(tmp_path, BLANK_SCALARS))
+
+    assert "printer printer-1: host is required" in excinfo.value.errors
+
+
+def test_a_blank_brand_falls_back_to_the_default(tmp_path: Path) -> None:
+    config, _errors = parse_config(write(tmp_path, BLANK_SCALARS))
+
+    assert config.printers[0].brand == "moonraker"
+
+
+def test_a_blank_optional_path_is_absent_rather_than_a_path_named_none(tmp_path: Path) -> None:
+    config, _errors = parse_config(
+        write(
+            tmp_path,
+            BLANK_SCALARS.replace("printers:", "print_files:\n  directory:\nprinters:"),
+        )
+    )
+
+    assert config.print_files.directory is None
+
+
+def test_a_non_numeric_setting_names_itself(tmp_path: Path) -> None:
+    """`int()` raising on its own says which type failed, not which setting."""
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(write(tmp_path, BLANK_SCALARS.replace("location_key: loc-1", "location_key: loc-1\ntelemetry_interval_s: every 5s")))
+
+    assert excinfo.value.errors == ["telemetry_interval_s must be a whole number"]
+
+
+def test_a_blank_interval_takes_the_default(tmp_path: Path) -> None:
+    config, _errors = parse_config(
+        write(tmp_path, BLANK_SCALARS.replace("location_key: loc-1", "location_key: loc-1\ntelemetry_interval_s:"))
+    )
+
+    assert config.telemetry_interval_s == 5

@@ -32,6 +32,15 @@ class PrinterStateStore:
     def get(self, printer_key: str) -> PrinterSnapshot | None:
         return self._snapshots.get(printer_key)
 
+    def forget(self, printer_key: str) -> None:
+        """Drop a printer's history when it leaves the config.
+
+        Without this, a printer removed and later added back would be diffed
+        against state from before it left, and the first observation after its
+        return would raise no `snapshot` event.
+        """
+        self._snapshots.pop(printer_key, None)
+
     def update(self, snapshot: PrinterSnapshot) -> StateChange | None:
         previous = self._snapshots.get(snapshot.printer_key)
         kinds = self._diff(previous, snapshot)

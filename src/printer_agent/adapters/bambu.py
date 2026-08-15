@@ -10,7 +10,7 @@ from typing import Any
 from aiomqtt import Client
 
 from ..config import PrinterConfig
-from ..contracts import ErrorSnapshot, JobSnapshot, JobStatus, PrinterCapabilities, PrinterSnapshot, PrinterStatus, TemperatureSnapshot, job_status_for, utc_now_iso
+from ..contracts import AmsSlot, ErrorSnapshot, JobSnapshot, JobStatus, PrinterCapabilities, PrinterSnapshot, PrinterStatus, TemperatureSnapshot, ams_state, job_status_for, utc_now_iso
 from .base import PrinterAdapter, UnsupportedCommandError
 
 
@@ -35,6 +35,62 @@ def normalize_bambu_status(raw_status: str) -> PrinterStatus:
     return _BAMBU_STATUS_MAP.get(raw_status.lower(), PrinterStatus.maintenance)
 
 BAMBU_USER_CANCELLED = 50348044
+
+#: Trays per AMS unit, used to give the slots one flat numbering across units —
+#: the printer numbers trays 0..3 inside each unit and identifies the unit
+#: separately, but the hub compares against a single list of loaded filaments.
+BAMBU_TRAYS_PER_UNIT = 4
+
+
+def bambu_ams_slots(print_state: dict[str, Any]) -> list[AmsSlot]:
+    """Read the feeding system out of a `print` report.
+
+    Shapes come from the printer's own pushall report: `ams.ams[]` is the list
+    of units, each with a `tray[]` of loaded spools. `tray_color` is RGBA hex
+    without a marker, and `remain` is -1 when the printer cannot tell — both are
+    dropped rather than reported as a value the hub would trust.
+    """
+    ams = print_state.get("ams")
+    units = ams.get("ams") if isinstance(ams, dict) else None
+    if not isinstance(units, list):
+        return []
+
+    slots: list[AmsSlot] = []
+    for ordinal, unit in enumerate(units):
+        if not isinstance(unit, dict):
+            continue
+        unit_index = BambuAdapter._safe_int(unit.get("id"))
+        unit_index = ordinal if unit_index is None else unit_index
+        trays = unit.get("tray")
+        if not isinstance(trays, list):
+            continue
+        for tray_ordinal, tray in enumerate(trays):
+            if not isinstance(tray, dict):
+                continue
+            tray_index = BambuAdapter._safe_int(tray.get("id"))
+            tray_index = tray_ordinal if tray_index is None else tray_index
+            material = str(tray.get("tray_type") or "").strip() or None
+            remaining = BambuAdapter._safe_float(tray.get("remain"))
+            slots.append(
+                AmsSlot(
+                    index=unit_index * BAMBU_TRAYS_PER_UNIT + tray_index,
+                    material=material,
+                    color=_tray_color(tray.get("tray_color")),
+                    remaining_pct=remaining if remaining is not None and remaining >= 0 else None,
+                )
+            )
+    return slots
+
+
+def _tray_color(value: Any) -> str | None:
+    text = str(value or "").strip().lstrip("#")
+    if len(text) < 6:
+        return None
+    try:
+        int(text[:6], 16)
+    except ValueError:
+        return None
+    return f"#{text[:6].upper()}"
 
 BAMBU_SSDP_PORT = 2021
 BAMBU_SSDP_GROUP = "239.255.255.250"
@@ -190,9 +246,19 @@ class BambuAdapter(PrinterAdapter):
         return "Bambu MQTT cache is empty"
 
     def capabilities(self) -> PrinterCapabilities:
-        return PrinterCapabilities(pause=True, resume=True, cancel=True, upload=True, ams=True, camera=True)
+        # `upload` and `camera` stay down until this adapter really does them:
+        # the hub turns both flags into buttons, and a button that can only
+        # answer "unsupported" reads to the operator as a broken printer.
+        return PrinterCapabilities(
+            pause=True,
+            resume=True,
+            cancel=True,
+            upload=False,
+            camera=False,
+            ams=bool(bambu_ams_slots(self._latest_print or {})),
+        )
 
-    async def start_print(self, file_ref: str) -> dict[str, Any]:
+    async def start_print(self, file_ref: str, remote_name: str | None = None) -> dict[str, Any]:
         raise UnsupportedCommandError("Bambu live start_print is not implemented yet")
 
     async def pause(self) -> dict[str, Any]:
@@ -384,6 +450,7 @@ class BambuAdapter(PrinterAdapter):
             temps=temps,
             error=error,
             capabilities=capabilities,
+            state=ams_state(bambu_ams_slots(print_state)),
         )
 
     @staticmethod

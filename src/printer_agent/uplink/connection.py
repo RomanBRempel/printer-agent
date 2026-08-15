@@ -10,7 +10,7 @@ from urllib.parse import urlparse, urlunparse
 import aiohttp
 
 from ..adapters.base import PrinterAdapter
-from ..config import AgentConfig
+from ..config import AgentConfig, parse_config
 from ..contracts import (
     COMMAND_BEARING_TYPES,
     PROTOCOL_VERSION,
@@ -25,17 +25,18 @@ from ..contracts import (
     is_retryable_hello_reject,
     utc_now_iso,
 )
+from ..core.filecache import PrintFileCache
 from ..core.outbox import EventOutbox
 from ..core.registry import build_adapter
 from ..core.state import PrinterStateStore
+from .camera import CameraService
 from .commands import CommandProcessor
+from .files import PrintFileService
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_AGENT_PATH = "/api/printers/agent"
 OUTBOX_FLUSH_LIMIT = 200
-# Hub messages that expect a command_result but that this agent cannot execute.
-UNSUPPORTED_MESSAGE_TYPES = frozenset(COMMAND_BEARING_TYPES - {MessageType.command.value})
 
 
 class HubRejected(RuntimeError):
@@ -62,21 +63,88 @@ def hub_auth_headers(agent_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {agent_token}"}
 
 
+def printer_roster(adapters: list[PrinterAdapter]) -> list[dict[str, Any]]:
+    """The `printers[]` array, built once for both `hello` and `inventory`.
+
+    The contract says the two carry the same array field for field, so the hub
+    reads them with one parser; that only stays true if one function builds it.
+    """
+    return [
+        {
+            "printer_key": adapter.printer_key,
+            "brand": adapter.printer.brand,
+            "capabilities": asdict(adapter.capabilities()),
+        }
+        for adapter in adapters
+    ]
+
+
 def hello_payload(config: AgentConfig, adapters: list[PrinterAdapter], agent_version: str) -> dict[str, Any]:
     """The handshake payload, shared with the connectivity check."""
     return {
         "protocol_version": PROTOCOL_VERSION,
         "agent_version": agent_version,
         "location_key": config.location_key,
-        "printers": [
-            {
-                "printer_key": adapter.printer_key,
-                "brand": adapter.printer.brand,
-                "capabilities": asdict(adapter.capabilities()),
-            }
-            for adapter in adapters
-        ],
+        "printers": printer_roster(adapters),
     }
+
+
+def inventory_payload(
+    config: AgentConfig, adapters: list[PrinterAdapter], agent_version: str, request_msg_id: str = ""
+) -> dict[str, Any]:
+    """The printer roster: who this agent is configured for.
+
+    `request_msg_id` is omitted when the agent sends this on its own after the
+    config changed — an absent value is left out rather than sent empty, as
+    everywhere else on this wire.
+    """
+    payload: dict[str, Any] = {
+        "location_key": config.location_key,
+        "agent_version": agent_version,
+        "printers": printer_roster(adapters),
+    }
+    if request_msg_id:
+        payload["request_msg_id"] = request_msg_id
+    return payload
+
+
+def _config_stamp(config: AgentConfig) -> tuple[int, int] | None:
+    """Cheap fingerprint of the config file: (mtime_ns, size), or None.
+
+    Size is in there because a same-second rewrite of the same length is what an
+    editor that preserves mtime granularity produces, and losing that edit is
+    worse than one extra reload.
+    """
+    if config.source_path is None:
+        return None
+    try:
+        stat = config.source_path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _restart_required_changes(running: AgentConfig, incoming: AgentConfig) -> list[str]:
+    """Settings a live agent cannot adopt, named so the log says which one.
+
+    The session was opened with the hub URL, token and location, and the outbox
+    file is already open: adopting any of them mid-flight would mean tearing
+    down the very things that carry the change. The update channel is read once
+    at service start. Printers, intervals and backoff are read every cycle and
+    are applied without a restart.
+    """
+    changed: list[str] = []
+    if running.hub_url != incoming.hub_url:
+        changed.append("hub_url")
+    if running.agent_token != incoming.agent_token:
+        changed.append("agent_token")
+    if running.location_key != incoming.location_key:
+        changed.append("location_key")
+    if running.outbox.database_path != incoming.outbox.database_path:
+        changed.append("outbox.database_path")
+    if running.updates != incoming.updates:
+        changed.append("updates")
+    return changed
 
 
 @dataclass(slots=True)
@@ -93,7 +161,16 @@ class HubConnection:
         self.outbox = outbox
         self.state = HubConnectionState()
         self._stop_event = asyncio.Event()
-        self._command_processor = CommandProcessor(outbox)
+        self._files = PrintFileService(
+            PrintFileCache(
+                config.print_files_directory(),
+                max_age_h=config.print_files.max_age_h,
+                max_total_mb=config.print_files.max_total_mb,
+            ),
+            config.agent_token,
+        )
+        self._camera = CameraService(config.agent_token)
+        self._command_processor = CommandProcessor(outbox, self._files, self._camera)
         self._adapters = {printer.key: build_adapter(printer) for printer in config.printers}
         self._state_store = PrinterStateStore()
         self._connected_adapters: set[str] = set()
@@ -101,6 +178,10 @@ class HubConnection:
         self._send_lock = asyncio.Lock()
         self._heartbeat_deadline = 0.0
         self._inflight_events: dict[str, float] = {}
+        self._config_stamp = _config_stamp(config)
+        #: File transfers running outside the receive loop, kept referenced so
+        #: the event loop cannot collect a task mid-download.
+        self._transfers: set[asyncio.Task[None]] = set()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -113,6 +194,10 @@ class HubConnection:
             poll_task.cancel()
             with suppress(asyncio.CancelledError):
                 await poll_task
+            for transfer in list(self._transfers):
+                transfer.cancel()
+            with suppress(Exception, asyncio.CancelledError):
+                await self._camera.stop_all()
             with suppress(Exception, asyncio.CancelledError):
                 await self._disconnect_adapters()
 
@@ -205,32 +290,52 @@ class HubConnection:
                 self.outbox.ack_event(acked_msg_id)
                 self._inflight_events.pop(acked_msg_id, None)
             return
-        if message_type == "error":
-            # Hub extension over agent-hub-v1: a per-message refusal that keeps
-            # the session open. Silence here would mean resending forever.
+        if message_type == MessageType.error.value:
+            # A per-message refusal that keeps the session open. The referenced
+            # message stops being pending: the hub has answered about it, and
+            # a refusal it will repeat forever — telemetry for a printer not
+            # attached to this agent, say — would otherwise resend out of the
+            # outbox for as long as the agent runs.
+            refused_msg_id = str(message_payload.get("msg_id", ""))
             logger.warning(
                 "hub refused a message",
                 extra={
                     "action": "hub_error",
                     "code": str(message_payload.get("code", "")),
                     "error": str(message_payload.get("message", "")),
-                    "ref_msg_id": str(message_payload.get("msg_id", "")),
+                    "ref_msg_id": refused_msg_id,
                 },
             )
+            if refused_msg_id:
+                self.outbox.discard_event(refused_msg_id)
+                self._inflight_events.pop(refused_msg_id, None)
             return
-        if message_type == MessageType.command.value:
-            await self._handle_command(ws, message_payload)
+        if message_type == MessageType.inventory_request.value:
+            await self._send_inventory(ws, str(payload.get("msg_id", "")))
             return
-        if message_type in UNSUPPORTED_MESSAGE_TYPES:
-            await self._reply_unsupported(ws, str(message_type), message_payload)
+        if message_type in COMMAND_BEARING_TYPES:
+            await self._handle_command(ws, str(message_type), message_payload)
             return
         logger.info("ignored message", extra={"action": "hub_message", "message_type": str(message_type)})
 
-    async def _handle_command(self, ws: aiohttp.ClientWebSocketResponse, command: dict[str, Any]) -> None:
+    async def _handle_command(
+        self, ws: aiohttp.ClientWebSocketResponse, message_type: str, command: dict[str, Any]
+    ) -> None:
+        """Answer every command-bearing hub message the same way.
+
+        `command`, `file_offer`, `camera_request` and `camera_stop` differ only
+        in what they ask an adapter to do: all four are answered with a
+        `command_result` carrying their own `command_id`, and a message without
+        one references nothing the hub could match an answer to, so it is dropped
+        with a log line instead of being answered anonymously.
+        """
         command_id = str(command.get("command_id", ""))
         printer_key = str(command.get("printer_key", ""))
         if not command_id:
-            logger.warning("command without command_id", extra={"action": "hub_command"})
+            logger.warning(
+                "hub message without command_id",
+                extra={"action": "hub_command", "message_type": message_type},
+            )
             return
         adapter = self._adapters.get(printer_key)
         if adapter is None:
@@ -248,40 +353,77 @@ class HubConnection:
             self.outbox.record_command_result(
                 command_id, printer_key, result["status"], result["error_text"], {}
             )
+            await self._send(ws, build_envelope(MessageType.command_result.value, result))
+            return
+
+        if message_type == MessageType.file_offer.value:
+            # Hundreds of megabytes over a shop-floor link take minutes. Running
+            # that inline would stall the receive loop for the whole transfer —
+            # no heartbeat, no acks, no second command — so it runs beside it and
+            # answers when it is done.
+            self._start_transfer(adapter, dict(command), command_id)
+            return
+
+        if message_type == MessageType.camera_request.value:
+            result = await self._command_processor.dispatch_camera_request(adapter, command)
+        elif message_type == MessageType.camera_stop.value:
+            result = await self._command_processor.dispatch_camera_stop(adapter, command)
         else:
             result = await self._command_processor.dispatch(adapter, command)
         await self._send(ws, build_envelope(MessageType.command_result.value, result))
 
-    async def _reply_unsupported(
-        self, ws: aiohttp.ClientWebSocketResponse, message_type: str, message_payload: dict[str, Any]
-    ) -> None:
-        command_id = str(message_payload.get("command_id", ""))
-        if not command_id:
-            # A command_result without command_id references nothing and the hub
-            # rejects it; there is nothing useful to answer with.
+    def _start_transfer(self, adapter: PrinterAdapter, offer: dict[str, Any], command_id: str) -> None:
+        task = asyncio.create_task(
+            self._run_transfer(adapter, offer), name=f"printer-agent-file-offer-{command_id}"
+        )
+        self._transfers.add(task)
+        task.add_done_callback(self._transfers.discard)
+
+    async def _run_transfer(self, adapter: PrinterAdapter, offer: dict[str, Any]) -> None:
+        try:
+            result = await self._command_processor.dispatch_file_offer(adapter, offer)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - the dispatcher maps its own failures
             logger.warning(
-                "unsupported hub message without command_id",
-                extra={"action": "hub_message", "message_type": message_type},
+                "file transfer could not be dispatched",
+                extra={"action": "file_offer", "error": str(exc) or exc.__class__.__name__},
             )
             return
-        await self._send(
-            ws,
-            build_envelope(
-                MessageType.command_result.value,
-                {
-                    "command_id": command_id,
-                    "printer_key": str(message_payload.get("printer_key", "")),
-                    "status": CommandStatus.unsupported.value,
-                    "error_text": f"{message_type} is not implemented yet",
-                    "response": {},
+        ws = self._ws
+        if ws is None or ws.closed:
+            # The result is already in the outbox: the hub redelivers the command
+            # after the reconnect and gets this same answer without a second
+            # download.
+            logger.warning(
+                "file transfer finished while the hub was unreachable",
+                extra={
+                    "action": "file_offer",
+                    "command_id": str(result.get("command_id", "")),
+                    "status": str(result.get("status", "")),
                 },
-            ),
-        )
+            )
+            return
+        await self._send(ws, build_envelope(MessageType.command_result.value, result))
 
     async def _send_hello(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         payload = hello_payload(self.config, list(self._adapters.values()), self._agent_version())
         await self._send(ws, build_envelope(MessageType.hello.value, payload))
         self.state.last_hello_at = utc_now_iso()
+
+    async def _send_inventory(self, ws: aiohttp.ClientWebSocketResponse, request_msg_id: str) -> None:
+        payload = inventory_payload(
+            self.config, list(self._adapters.values()), self._agent_version(), request_msg_id
+        )
+        logger.info(
+            "hub asked for the printer roster",
+            extra={
+                "action": "hub_inventory_request",
+                "printers": str(len(payload["printers"])),
+                "request_msg_id": request_msg_id,
+            },
+        )
+        await self._send(ws, build_envelope(MessageType.inventory.value, payload))
 
     async def _send_heartbeat(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         await self._send(ws, build_envelope(MessageType.heartbeat.value, {"location_key": self.config.location_key}))
@@ -301,6 +443,7 @@ class HubConnection:
     async def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
+                await self._reload_config_if_changed()
                 snapshots = await self._collect_snapshots()
                 self._record_events(snapshots)
                 await self._flush_outbox()
@@ -310,6 +453,88 @@ class HubConnection:
             except Exception as exc:  # pragma: no cover - integration path
                 logger.warning("telemetry cycle failed", extra={"action": "telemetry", "error": str(exc)})
             await self._sleep_unless_stopped(self.config.telemetry_interval_s)
+
+    # -- config reload ---------------------------------------------------
+
+    async def _reload_config_if_changed(self) -> None:
+        """Pick up an edited printer list without restarting the agent.
+
+        A printer added to `agent.yaml` used to reach the hub only after a
+        service restart, because the roster is built once at startup — and an
+        operator who added one and saw nothing had no way to tell that from a
+        printer that was simply unreachable.
+        """
+        stamp = _config_stamp(self.config)
+        if stamp is None or stamp == self._config_stamp:
+            return
+        # Stamped before parsing, so a file that cannot be read is reported once
+        # rather than on every poll.
+        self._config_stamp = stamp
+        try:
+            config, errors = parse_config(self.config.source_path)
+        except Exception as exc:
+            logger.warning("config reload failed", extra={"action": "config_reload", "error": str(exc)})
+            return
+        if errors:
+            # The running config is known good; a half-edited file must not take
+            # printers away from a working agent.
+            logger.warning(
+                "config on disk is not runnable; keeping the running one",
+                extra={"action": "config_reload", "error": "; ".join(errors)},
+            )
+            return
+        await self._apply_config(config)
+
+    async def _apply_config(self, config: AgentConfig) -> None:
+        previous = {printer.key: printer for printer in self.config.printers}
+        incoming = {printer.key: printer for printer in config.printers}
+        removed = [key for key in previous if key not in incoming]
+        added = [key for key in incoming if key not in previous]
+        rebuilt = [key for key, printer in incoming.items() if key in previous and previous[key] != printer]
+
+        for name in _restart_required_changes(self.config, config):
+            logger.warning(
+                "config change needs an agent restart to take effect",
+                extra={"action": "config_reload", "error": name},
+            )
+
+        for key in removed + rebuilt:
+            adapter = self._adapters.pop(key, None)
+            self._connected_adapters.discard(key)
+            self._state_store.forget(key)
+            # The frame loop holds the old adapter; leaving it running would keep
+            # filming through a connection nothing else uses any more.
+            with suppress(Exception):
+                await self._camera.stop(key, "")
+            if adapter is not None:
+                with suppress(Exception):
+                    await adapter.disconnect()
+        for key in added + rebuilt:
+            self._adapters[key] = build_adapter(incoming[key])
+
+        # Read fresh every cycle, so assigning them is all it takes.
+        self.config.printers = list(config.printers)
+        self.config.telemetry_interval_s = config.telemetry_interval_s
+        self.config.heartbeat_interval_s = config.heartbeat_interval_s
+        self.config.command_reconnect_backoff_s = config.command_reconnect_backoff_s
+        self.config.outbox.max_events = config.outbox.max_events
+        if not (removed or added or rebuilt):
+            return
+        logger.info(
+            "printer roster reloaded",
+            extra={
+                "action": "config_reload",
+                "printers": str(len(self._adapters)),
+                "added": ",".join(added),
+                "removed": ",".join(removed),
+                "rebuilt": ",".join(rebuilt),
+            },
+        )
+        ws = self._ws
+        if ws is not None and not ws.closed:
+            # The hub keyed its list on the last roster it saw; telling it now is
+            # the whole point of noticing the edit.
+            await self._send_inventory(ws, "")
 
     async def _collect_snapshots(self) -> list[PrinterSnapshot]:
         if not self._adapters:
