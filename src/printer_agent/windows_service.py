@@ -11,8 +11,8 @@ from .aio import run as run_async
 from .config import ConfigError, load_config
 from .core.outbox import EventOutbox
 from .logsetup import configure_logging
+from .updater import AutoUpdater
 from .uplink.connection import HubConnection
-from .updates import apply_update, check_for_update
 
 try:  # pragma: no cover - Windows-specific dependency
     import servicemanager
@@ -31,6 +31,78 @@ CONFIG_DIR = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "printer-a
 CONFIG_PATH = CONFIG_DIR / "agent.yaml"
 
 SERVICE_KEY = rf"SYSTEM\CurrentControlSet\Services\{SERVICE_NAME}"
+
+#: Seconds the restarter waits before starting the service again. The stop has
+#: to finish first — the adapters close their sessions, the outbox closes its
+#: database — and a start racing that shutdown fails with "service is stopping".
+RESTART_DELAY_S = 8
+
+
+def restart_command() -> list[str]:
+    """The detached command line that stops this service and starts it again.
+
+    A service cannot restart itself: whatever issues the start has to outlive
+    the stop, and every thread of this process is gone by then. So the update
+    hands the job to a short-lived child.
+
+    Waiting for SCM recovery instead would not work here — recovery actions fire
+    on a *crash*, and an update exits cleanly. The alternative, `sc failureflag
+    1`, would also restart the service when an operator stops it on purpose,
+    which is worse than the problem it solves.
+    """
+    return [
+        "cmd.exe",
+        "/c",
+        f"sc stop {SERVICE_NAME} & "
+        # ping as a sleep: timeout.exe needs a console this process does not have.
+        f"ping -n {RESTART_DELAY_S} 127.0.0.1 > nul & "
+        f"sc start {SERVICE_NAME}",
+    ]
+
+
+def recovery_command() -> list[str]:
+    """Tell the SCM to bring the service back if it dies.
+
+    Deliberately without `failureflag`: recovery then applies to crashes only.
+    Turning it on would also restart the service when an operator stops it on
+    purpose, which is a worse surprise than the outage it prevents.
+    """
+    return [
+        "sc.exe",
+        "failure",
+        SERVICE_NAME,
+        "reset=",
+        "86400",
+        "actions=",
+        "restart/5000/restart/15000/restart/60000",
+    ]
+
+
+def configure_service_recovery() -> None:
+    """Apply the recovery policy. Requires administrator; failure is not fatal."""
+    import subprocess
+
+    subprocess.run(recovery_command(), check=False, capture_output=True, text=True)  # noqa: S603
+
+
+def restart_service() -> None:
+    """Ask a detached child to cycle the service, then let this process end."""
+    import subprocess
+
+    creation_flags = 0
+    if os.name == "nt":  # pragma: no branch - the service only runs on Windows
+        creation_flags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    subprocess.Popen(  # noqa: S603 - fixed command line, no user input
+        restart_command(),
+        creationflags=creation_flags,
+        close_fds=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def service_environment_paths() -> list[Path]:
@@ -128,33 +200,41 @@ if _IMPORT_ERROR is None:
 
         async def _run(self):
             config = load_config(CONFIG_PATH)
-            if config.updates.auto_update and config.updates.check_on_startup and config.updates.feed_url:
-                try:
-                    update_status = check_for_update(config.updates.feed_url)
-                    if update_status.update_available and update_status.manifest is not None:
-                        servicemanager.LogInfoMsg(
-                            f"printer-agent update available: {update_status.current_version} -> {update_status.latest_version}"
-                        )
-                        applied = apply_update(update_status.manifest)
-                        servicemanager.LogInfoMsg(applied.message)
-                        if applied.installed:
-                            servicemanager.LogInfoMsg("printer-agent updated successfully; exiting so the service restarts on the new version")
-                            return
-                        servicemanager.LogErrorMsg(f"printer-agent update failed: {applied.message}")
-                except Exception as exc:  # pragma: no cover - update path is best-effort
-                    servicemanager.LogErrorMsg(f"printer-agent update check failed: {exc}")
-
             outbox = EventOutbox(config.outbox.database_path)
             connection = HubConnection(config, outbox)
+            # The updater runs beside the session rather than before it, so a
+            # long-lived service keeps checking; the old code checked once at
+            # start, which a box that stays up for weeks never reached again.
+            updater = AutoUpdater(
+                config,
+                is_busy=connection.is_busy,
+                restart=self._restart_for_update,
+            )
             connection_task = asyncio.create_task(connection.run())
+            updater_task = asyncio.create_task(updater.run(), name="printer-agent-updater")
             try:
                 await asyncio.get_running_loop().run_in_executor(None, self.stop_requested.wait)
             finally:
+                updater.stop()
                 connection.stop()
-                connection_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await connection_task
+                for task in (updater_task, connection_task):
+                    task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await task
                 outbox.close()
+
+        def _restart_for_update(self) -> None:
+            """Hand the restart to a detached child, then stop this service."""
+            servicemanager.LogInfoMsg("printer-agent updated; restarting the service")
+            try:
+                restart_service()
+            except Exception as exc:  # pragma: no cover - service runtime path
+                servicemanager.LogErrorMsg(f"printer-agent could not restart itself: {exc}")
+                return
+            # The child is waiting on our stop; asking for it here means the new
+            # version is running seconds later instead of at the next reboot.
+            self.stop_requested.set()
+            win32event.SetEvent(self.stop_event)
 else:
     PrinterAgentService = None
 

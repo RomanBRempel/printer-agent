@@ -186,6 +186,17 @@ class HubConnection:
     def stop(self) -> None:
         self._stop_event.set()
 
+    def is_busy(self) -> bool:
+        """True while stopping the agent would throw work away.
+
+        Restarting does not disturb a print — the printer runs the job itself,
+        and the outbox carries unacked events across — but it does destroy what
+        the agent holds in memory: a file part-way to a printer, and a camera
+        session someone is watching. Those are what an unattended update waits
+        for.
+        """
+        return bool(self._transfers) or self._camera.has_sessions()
+
     async def run(self) -> None:
         poll_task = asyncio.create_task(self._poll_loop(), name="printer-agent-poll")
         try:

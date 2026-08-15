@@ -34,6 +34,10 @@ class UpdateConfig:
     feed_url: str = ""
     auto_update: bool = False
     check_on_startup: bool = True
+    #: How often a *running* agent re-asks the feed. Without this the check
+    #: happened once at service start, so a box that stays up for weeks never
+    #: saw a release. Zero keeps the old startup-only behaviour.
+    check_interval_h: int = 24
 
 
 @dataclass(slots=True)
@@ -179,6 +183,7 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
             "feed_url": config.updates.feed_url,
             "auto_update": config.updates.auto_update,
             "check_on_startup": config.updates.check_on_startup,
+            "check_interval_h": config.updates.check_interval_h,
         },
         "printers": [
             {
@@ -309,6 +314,7 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
             feed_url=_text(updates_data.get("feed_url")),
             auto_update=_parse_bool(updates_data.get("auto_update"), False),
             check_on_startup=_parse_bool(updates_data.get("check_on_startup"), True),
+            check_interval_h=int(updates_data.get("check_interval_h", 24) or 0),
         ),
         printers=printers,
     )
@@ -338,6 +344,11 @@ def validate_config(config: AgentConfig) -> list[str]:
         errors.append("print_files.max_total_mb must be positive")
     if config.updates.feed_url and not str(config.updates.feed_url).strip():
         errors.append("updates.feed_url must not be blank")
+    if config.updates.check_interval_h < 0:
+        errors.append("updates.check_interval_h must not be negative")
+    # `auto_update` without a feed is pointless but deliberately *not* an error:
+    # an agent already running that combination would refuse to start after an
+    # update, which turns a useless setting into an outage.
     if not config.printers:
         errors.append("printers must not be empty")
     for printer in config.printers:

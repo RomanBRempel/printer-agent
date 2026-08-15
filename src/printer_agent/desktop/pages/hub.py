@@ -184,10 +184,14 @@ class HubPage(Page):
                 database_path=Path(self.outbox_edit.text().strip() or "data/outbox.sqlite3"),
                 max_events=self.outbox_max_spin.value(),
             ),
+            # Carried over field by field: this page does not edit the update
+            # channel, and rebuilding the block from three of its four fields
+            # would quietly reset the fourth to its default on every save.
             updates=UpdateConfig(
                 feed_url=config.updates.feed_url,
                 auto_update=config.updates.auto_update,
                 check_on_startup=config.updates.check_on_startup,
+                check_interval_h=config.updates.check_interval_h,
             ),
             printers=list(config.printers),
         )

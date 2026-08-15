@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtWidgets import QLabel, QLineEdit, QPushButton, QWidget
+from PySide6.QtWidgets import QLabel, QLineEdit, QPushButton, QSpinBox, QWidget
 
 from ... import __version__
 from ...updates import apply_update, check_for_update
@@ -62,10 +62,22 @@ class UpdatesPage(Page):
         startup_label.setObjectName("Secondary")
         card.add(inline_row(self.auto_toggle, auto_label))
         card.add(inline_row(self.startup_toggle, startup_label))
+
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(0, 720)
+        self.interval_spin.setSuffix(" ч")
+        card.add(
+            form_row(
+                "Проверять раз в",
+                self.interval_spin,
+                hint="0 — проверять только при старте службы.",
+            )
+        )
         card.add(
             Caption(
-                "Автообновление выполняется службой при запуске: агент ставит новую версию "
-                "и завершается, чтобы Windows перезапустила его уже на ней."
+                "Служба проверяет ленту сама и ставит новую версию, когда ни один файл не "
+                "передаётся на принтер и никто не смотрит камеру: идущую печать перезапуск "
+                "не трогает. После установки служба перезапускается сама."
             )
         )
 
@@ -82,12 +94,14 @@ class UpdatesPage(Page):
         self.feed_edit.setText(updates.feed_url)
         self.auto_toggle.setChecked(updates.auto_update)
         self.startup_toggle.setChecked(updates.check_on_startup)
+        self.interval_spin.setValue(updates.check_interval_h)
 
     def _save(self) -> None:
         config = self.state.config
         config.updates.feed_url = self.feed_edit.text().strip()
         config.updates.auto_update = self.auto_toggle.isChecked()
         config.updates.check_on_startup = self.startup_toggle.isChecked()
+        config.updates.check_interval_h = self.interval_spin.value()
         self.state.set_config(config)
         saved, detail = self.state.persist()
         self.notify(detail, "success" if saved else "error")

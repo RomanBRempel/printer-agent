@@ -86,6 +86,9 @@ class CameraService:
     def active_session(self, printer_key: str) -> CameraSession | None:
         return self._sessions.get(printer_key)
 
+    def has_sessions(self) -> bool:
+        return bool(self._sessions)
+
     async def start(self, adapter: PrinterAdapter, payload: dict[str, Any]) -> dict[str, Any]:
         if not adapter.capabilities().camera:
             raise UnsupportedCommandError(

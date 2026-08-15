@@ -19,8 +19,14 @@ print_files:
   max_total_mb: 2048
 updates:
   feed_url: https://downloads.example.com/printer-agent/update.json
+  # With auto_update the service installs a new version by itself and restarts,
+  # waiting until no print file is being transferred and no camera session is
+  # open — a running print is not a reason to wait, the printer runs it alone.
   auto_update: false
   check_on_startup: true
+  # How often a running agent re-asks the feed. 0 keeps the old behaviour:
+  # only at service start, which a box that stays up for weeks never reaches.
+  check_interval_h: 24
 printers:
   - key: printer-1
     brand: moonraker

@@ -207,12 +207,33 @@ def run_agent(config: AgentConfig) -> int:
     logger = getLogger(__name__)
 
     async def _serve() -> None:
+        import asyncio
+        from contextlib import suppress
+
+        from .updater import AutoUpdater
+
         outbox = EventOutbox(config.outbox.database_path)
         connection = HubConnection(config, outbox)
+        updater = AutoUpdater(
+            config,
+            is_busy=connection.is_busy,
+            # A console run has nobody to restart it: the operator is at the
+            # keyboard, and killing their session to swap versions would be a
+            # surprise. The service is the unattended host, and it restarts.
+            restart=lambda: logger.info(
+                "update installed; restart the agent to run it",
+                extra={"action": "auto_update"},
+            ),
+        )
+        updater_task = asyncio.create_task(updater.run(), name="printer-agent-updater")
         try:
             await connection.run()
         finally:
+            updater.stop()
             connection.stop()
+            updater_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await updater_task
             outbox.close()
 
     logger.info(
@@ -304,9 +325,12 @@ def _service_command(parser: argparse.ArgumentParser, args) -> int:
 
     # Without this the service host cannot find python3XX.dll and dies before
     # running a line of our code, which the SCM reports only as a timeout.
-    from .windows_service import configure_service_environment
+    from .windows_service import configure_service_environment, configure_service_recovery
 
     configure_service_environment()
+    # An edge box has nobody logged in to notice a stopped service, so the SCM
+    # is asked to bring it back after a crash.
+    configure_service_recovery()
     print(f"installed Windows service with config {CONFIG_PATH}")
     if errors:
         # Registered but not yet runnable. Say so plainly: the service will fail
