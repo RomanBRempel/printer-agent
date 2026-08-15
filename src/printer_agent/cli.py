@@ -7,9 +7,28 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .config import AgentConfig, ConfigError, load_config, parse_config, save_config
+from .config import (
+    AgentConfig,
+    ConfigError,
+    load_config,
+    load_config_file,
+    parse_config,
+    save_config,
+    validate_config,
+)
 from .core.outbox import EventOutbox
 from .logsetup import configure_logging
+from .settings_bundle import (
+    MODE_FULL,
+    MODE_PRINTERS,
+    BundleError,
+    TransferReport,
+    apply_bundle,
+    build_bundle,
+    describe_bundle,
+    read_bundle,
+    write_bundle,
+)
 from .updates import apply_update, check_for_update, publish_manifest
 
 
@@ -37,6 +56,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     update_parser.add_argument("--feed-url", help="Override the update feed URL")
     update_parser.add_argument("--apply", action="store_true", help="Install the available update")
+
+    export_parser = subparsers.add_parser(
+        "export-settings",
+        help="Write a transferable settings bundle for another installation",
+        parents=[config_parent],
+    )
+    export_parser.add_argument("--output", required=True, help="Path of the bundle file to write")
+    export_parser.add_argument(
+        "--include-secrets",
+        action="store_true",
+        help="Carry the agent token and printer access codes (the file becomes as sensitive as agent.yaml)",
+    )
+    export_parser.add_argument("--note", default="", help="Free-text note stored in the bundle")
+
+    import_parser = subparsers.add_parser(
+        "import-settings",
+        help="Apply a settings bundle from another installation to this one",
+        parents=[config_parent],
+    )
+    import_parser.add_argument("bundle", help="Path of the bundle file to apply")
+    import_parser.add_argument(
+        "--mode",
+        choices=(MODE_FULL, MODE_PRINTERS),
+        default=MODE_FULL,
+        help="full: everything the bundle carries; printers: only the printer inventory",
+    )
+    import_parser.add_argument(
+        "--dry-run", action="store_true", help="Report what would change without writing the config"
+    )
 
     publish_parser = subparsers.add_parser("publish-update", help="Write an update manifest file")
     publish_parser.add_argument("--version", required=True, help="Release version to publish")
@@ -80,6 +128,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(f"wrote update manifest for {manifest.version} to {args.output}")
         return 0
+
+    if args.command in {"export-settings", "import-settings"}:
+        # Both read and write the file directly, and neither needs it to be
+        # runnable: exporting a half-configured agent is legitimate, and
+        # importing is how a blank one gets configured in the first place.
+        try:
+            return _settings_transfer_command(args)
+        except (BundleError, ConfigError) as exc:
+            parser.exit(status=2, message=f"settings transfer failed: {exc}\n")
 
     if args.command == "run":
         # The only command that genuinely needs a runnable config.
@@ -128,9 +185,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def run_agent(config: AgentConfig) -> int:
     """Run the hub session and the printer poll loop until interrupted."""
-    import asyncio
     from logging import getLogger
 
+    from .aio import run as run_async
     from .uplink.connection import HubConnection, HubRejected
 
     logger = getLogger(__name__)
@@ -149,13 +206,63 @@ def run_agent(config: AgentConfig) -> int:
         extra={"action": "startup", "hub_url": config.hub_url, "printers": str(len(config.printers))},
     )
     try:
-        asyncio.run(_serve())
+        run_async(_serve())
     except HubRejected as exc:
         logger.error("hub rejected this agent", extra={"action": "shutdown", "reason": str(exc)})
         return 2
     except KeyboardInterrupt:  # pragma: no cover - interactive path
         logger.info("printer-agent stopped", extra={"action": "shutdown"})
     return 0
+
+
+def _settings_transfer_command(args) -> int:
+    if args.command == "export-settings":
+        config = load_config_file(args.config)
+        bundle = build_bundle(
+            config, include_secrets=args.include_secrets, note=args.note
+        )
+        written = write_bundle(bundle, args.output)
+        info = describe_bundle(bundle)
+        print(f"wrote settings bundle to {written}")
+        print(f"printers={len(info.printer_keys)}")
+        print(f"contains_secrets={info.contains_secrets}")
+        if info.contains_secrets:
+            print("warning: this file carries secrets - move it like you would agent.yaml")
+        for entry in info.redacted:
+            print(f"redacted: {entry}")
+        return 0
+
+    bundle = read_bundle(args.bundle)
+    info = describe_bundle(bundle)
+    current = load_config_file(args.config)
+    merged, report = apply_bundle(bundle, current, mode=args.mode)
+
+    print(f"bundle from location {info.source_location_key or '(unset)'} exported {info.exported_at}")
+    _print_report(report)
+
+    errors = validate_config(merged)
+    if args.dry_run:
+        print(f"dry run: {args.config} not written")
+    else:
+        save_config(merged, args.config)
+        print(f"wrote {args.config}")
+    if errors:
+        print("configuration is not runnable yet:")
+        for error in errors:
+            print(f"  - {error}")
+    # A bundle that landed but left the agent unconfigurable is not a success:
+    # an installer script has to be able to tell the difference.
+    return 1 if errors else 0
+
+
+def _print_report(report: TransferReport) -> None:
+    for label, entries in (
+        ("applied", report.applied),
+        ("kept local", report.kept_local),
+        ("still missing", report.missing),
+    ):
+        if entries:
+            print(f"{label}: {', '.join(entries)}")
 
 
 def _service_command(parser: argparse.ArgumentParser, args) -> int:

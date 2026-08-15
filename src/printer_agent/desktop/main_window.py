@@ -23,6 +23,7 @@ from .pages import (
     LogsPage,
     Page,
     PrintersPage,
+    TransferPage,
     UpdatesPage,
 )
 from .probe import HealthSnapshot, HealthWatcher, PrinterProbe, ProbeResult
@@ -95,6 +96,7 @@ class MainWindow(QMainWindow):
         self.dashboard = DashboardPage(self.state)
         self.hub = HubPage(self.state)
         self.printers = PrintersPage(self.state)
+        self.transfer = TransferPage(self.state)
         self.updates = UpdatesPage(self.state)
         self.logs = LogsPage(self.state)
         self.appearance = AppearancePage(self.state)
@@ -105,6 +107,7 @@ class MainWindow(QMainWindow):
             self.dashboard,
             self.hub,
             self.printers,
+            self.transfer,
             self.updates,
             self.logs,
             self.appearance,

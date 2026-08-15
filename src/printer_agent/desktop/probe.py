@@ -15,6 +15,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from ..adapters.base import PrinterAdapter
+from ..aio import run as run_async
 from ..config import PrinterConfig
 from ..contracts import PrinterSnapshot
 from ..core.outbox import EventOutbox
@@ -64,7 +65,7 @@ class PrinterProbe(QThread):
 
     def run(self) -> None:  # noqa: D102 - QThread entry point
         try:
-            asyncio.run(self._main())
+            run_async(self._main())
         except Exception:
             # A dead probe must never take the window down with it.
             pass

@@ -98,6 +98,33 @@ python -m printer_agent --config agent.yaml run
 python -m printer_agent --config agent.yaml status
 ```
 
+## Move settings to another installation
+
+A *settings bundle* carries the tedious part of a setup — hub wiring, intervals, update
+channel and the printer inventory — from one agent to another. It is not a copy of
+`agent.yaml`: the outbox database path stays on the machine that owns it, and secrets
+(`agent_token`, printer `access_code`) are left out unless `--include-secrets` is given.
+
+```bash
+python -m printer_agent --config agent.yaml export-settings --output printer-agent-settings.yaml
+python -m printer_agent --config agent.yaml export-settings --output bundle.yaml --include-secrets --note "new PC"
+python -m printer_agent --config agent.yaml import-settings printer-agent-settings.yaml
+python -m printer_agent --config agent.yaml import-settings bundle.yaml --mode printers --dry-run
+```
+
+Import merges the bundle over the local config instead of overwriting the file, so a
+redacted bundle applied to an already-configured agent keeps the token and access codes
+that agent already had. Everything else is reported by name — what was applied, what was
+kept local, and which secrets still have to be filled in. `import-settings` exits `1` when
+the result is not runnable yet, so an installer script can tell a partial import from a
+finished one; the file is still written.
+
+`--mode printers` replaces only the printer inventory and leaves the local hub wiring,
+intervals and update settings untouched — the form to use when the two agents serve
+different locations.
+
+The same operation is on the **Перенос настроек** page of the desktop app.
+
 ## Update the app
 
 Use the update feed configured under `updates.feed_url` to check or install a newer package build.
@@ -175,6 +202,7 @@ Pages:
 | Обзор | Windows service state with start/stop/restart, outbox counters, hub wiring, config validation |
 | Хаб | Hub URL, agent token, location key, intervals, backoff, outbox — **and the agent → hub check** |
 | Принтеры | Printer inventory, network discovery, add/edit/remove, live status, **agent → printer check** |
+| Перенос настроек | Export the settings to a bundle file and import one from another installation |
 | Обновления | Update feed URL, check and apply a release, auto-update toggles |
 | Логи | Tail of the rotating log files under `ProgramData\printer-agent\logs` |
 | Оформление | Light / dark / follow-system theme, eight accent colours, poll interval |

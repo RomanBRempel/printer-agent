@@ -100,6 +100,17 @@ def load_config(path: str | Path = "agent.yaml", env: os._Environ[str] | None = 
     return config
 
 
+def load_config_file(path: str | Path = "agent.yaml") -> AgentConfig:
+    """Read the file exactly as it sits on disk: no env overrides, no path fixups.
+
+    Tools that read a config only to write it back — the settings transfer — must
+    round-trip what the operator wrote. Going through :func:`parse_config` would
+    bake a temporary ``HUB_URL`` from the environment into the saved file.
+    """
+    config_path = Path(path)
+    return config_from_dict(_read_yaml(config_path) if config_path.exists() else {})
+
+
 def save_config(config: AgentConfig, path: str | Path) -> None:
     target_path = Path(path)
     target_path.parent.mkdir(parents=True, exist_ok=True)

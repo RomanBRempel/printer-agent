@@ -4,6 +4,7 @@ from .dashboard import DashboardPage
 from .hub import HubPage
 from .logs import LogsPage
 from .printers import PrintersPage
+from .transfer import TransferPage
 from .updates import UpdatesPage
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     "LogsPage",
     "Page",
     "PrintersPage",
+    "TransferPage",
     "UpdatesPage",
 ]

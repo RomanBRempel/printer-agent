@@ -7,6 +7,7 @@ import threading
 from contextlib import suppress
 from pathlib import Path
 
+from .aio import run as run_async
 from .config import ConfigError, load_config
 from .core.outbox import EventOutbox
 from .logsetup import configure_logging
@@ -117,7 +118,7 @@ if _IMPORT_ERROR is None:
             self.ReportServiceStatus(win32service.SERVICE_RUNNING)
             servicemanager.LogInfoMsg("printer-agent service starting")
             try:
-                asyncio.run(self._run())
+                run_async(self._run())
             except ConfigError as exc:
                 servicemanager.LogErrorMsg(f"printer-agent configuration error: {exc}")
                 raise

@@ -78,7 +78,7 @@ def test_the_service_reports_running_before_doing_any_work():
     body = source[source.index("def SvcDoRun") : source.index("async def _run")]
 
     assert "SERVICE_RUNNING" in body
-    assert body.index("ReportServiceStatus") < body.index("asyncio.run")
+    assert body.index("ReportServiceStatus") < body.index("run_async(")
 
 
 def test_service_environment_covers_the_dll_search_path():

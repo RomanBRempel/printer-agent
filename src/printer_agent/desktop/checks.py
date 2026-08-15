@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Callable
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
+from ..aio import run as run_async
 from ..uplink.diagnostics import CheckResult, CheckStep
 from .theme import Palette
 from .widgets import Caption
@@ -30,7 +30,7 @@ class CheckRunner(QThread):
 
     def run(self) -> None:  # noqa: D102 - QThread entry point
         try:
-            result = asyncio.run(self._factory())
+            result = run_async(self._factory())
         except Exception as exc:
             result = CheckResult(
                 ok=False,
@@ -54,7 +54,7 @@ class AsyncRunner(QThread):
 
     def run(self) -> None:  # noqa: D102 - QThread entry point
         try:
-            self.completed.emit(asyncio.run(self._factory()), "")
+            self.completed.emit(run_async(self._factory()), "")
         except Exception as exc:
             self.completed.emit(None, str(exc) or exc.__class__.__name__)
 

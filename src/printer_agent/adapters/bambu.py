@@ -135,6 +135,9 @@ class BambuAdapter(PrinterAdapter):
         self._latest_snapshot: PrinterSnapshot | None = None
         self._connected = False
         self._message_count = 0
+        #: Why the subscription is not delivering, kept so an empty cache can say
+        #: what went wrong instead of only that it is empty.
+        self._last_error: str = ""
         #: MQTT client id. Defaults to the serial; a second consumer (the desktop
         #: app) overrides it so the broker does not evict the service's session.
         self.client_identifier: str | None = None
@@ -169,13 +172,22 @@ class BambuAdapter(PrinterAdapter):
                 status_raw="offline",
                 job=JobSnapshot(),
                 temps=TemperatureSnapshot(),
-                error=ErrorSnapshot(code="offline", message="Bambu MQTT cache is empty"),
+                error=ErrorSnapshot(code="offline", message=self._empty_cache_message()),
                 capabilities=self.capabilities(),
                 ts=utc_now_iso(),
             )
         snapshot = self._snapshot_from_state(self._latest_print, self._latest_info, self._latest_error)
         self._latest_snapshot = snapshot
         return snapshot
+
+    def _empty_cache_message(self) -> str:
+        if not self._serial_number:
+            return "Bambu printer requires a serial number"
+        if self._last_error:
+            return f"Bambu MQTT is not delivering: {self._last_error}"
+        if self._connected:
+            return "Bambu MQTT connected, waiting for the first report"
+        return "Bambu MQTT cache is empty"
 
     def capabilities(self) -> PrinterCapabilities:
         return PrinterCapabilities(pause=True, resume=True, cancel=True, upload=True, ams=True, camera=True)
@@ -223,12 +235,16 @@ class BambuAdapter(PrinterAdapter):
                     timeout=10,
                 ) as client:
                     self._connected = True
+                    self._last_error = ""
                     self._connected_event.set()
                     await client.subscribe(f"device/{serial}/report")
+                    # The printer answers a pushall with a full report but never
+                    # sends a PUBACK for it, so anything above qos 0 waits out the
+                    # client timeout and tears down the subscription we just made.
                     await client.publish(
                         f"device/{serial}/request",
                         json.dumps({"pushing": {"sequence_id": "0", "command": "pushall", "push_target": 1}}),
-                        qos=1,
+                        qos=0,
                     )
                     backoff = 1.0
                     async for message in client.messages:
@@ -241,8 +257,9 @@ class BambuAdapter(PrinterAdapter):
                         await self._handle_payload(payload)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 self._connected = False
+                self._last_error = str(exc) or exc.__class__.__name__
                 if not self._connected_event.is_set():
                     self._connected_event.set()
                 await asyncio.sleep(backoff)
@@ -265,18 +282,21 @@ class BambuAdapter(PrinterAdapter):
         serial = self._serial_number
         if not serial:
             raise UnsupportedCommandError("Bambu printer requires a serial number")
+        # A second client on the subscription's own id makes the broker evict the
+        # session that feeds the cache, so commands take a suffixed one; qos stays
+        # at 0 because the printer does not acknowledge publishes on this topic.
         async with Client(
             hostname=self.printer.host,
             port=self.printer.port or 8883,
             username="bblp",
             password=self._access_code,
-            identifier=serial,
+            identifier=f"{self.client_identifier or serial}-cmd",
             keepalive=30,
             tls_context=self._tls_context(),
             tls_insecure=True,
             timeout=10,
         ) as client:
-            await client.publish(f"device/{serial}/request", json.dumps(message), qos=1)
+            await client.publish(f"device/{serial}/request", json.dumps(message), qos=0)
 
     @property
     def _serial_number(self) -> str:
