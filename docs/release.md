@@ -16,40 +16,50 @@ check honest.
 
 ## Order
 
+**Pushing the tag publishes the release.**
+[.github/workflows/release.yml](../.github/workflows/release.yml) builds the
+wheel, writes the manifest from that same wheel, and creates the release with
+both. Nothing is uploaded by hand.
+
 1. Bump the version in **both** [pyproject.toml](../pyproject.toml) and
    [src/printer_agent/\_\_init\_\_.py](../src/printer_agent/__init__.py). They are
    read by different things — pip and `hello` — and a mismatch is invisible
    until the hub reports a version nobody built.
 2. `python -m pytest` — green, including the live-test skip.
-3. Commit, tag `vX.Y.Z`, push both.
-4. Build the wheel: `python -m build --wheel`.
-5. Create the release and upload the wheel:
-   `gh release create vX.Y.Z dist/printer_agent-*.whl --title vX.Y.Z --notes-file -`
-6. Write the manifest **from the uploaded file**, not from the local one:
-
-   ```bash
-   python -m printer_agent publish-update \
-     --version X.Y.Z \
-     --package-url "https://github.com/RomanBRempel/printer-agent/releases/download/vX.Y.Z/printer_agent-X.Y.Z-py3-none-any.whl" \
-     --sha256 from-url \
-     --output dist/printer-agent-update.json
-   ```
-
-7. Upload the manifest: `gh release upload vX.Y.Z dist/printer-agent-update.json`
-8. Verify from outside, the way an agent does it: fetch the `latest` manifest,
+3. Commit, tag `vX.Y.Z`, push both. The workflow does the rest.
+4. Verify from outside, the way an agent does it: fetch the `latest` manifest,
    download its `package_url`, compare the checksum, and install the result into
    a throwaway directory (`pip install --no-deps --target`).
+
+**Do not publish a release by hand while the workflow is running.** Both write
+the same two assets, and the loser's manifest ends up describing the winner's
+wheel — see below. If a release has to be authored manually (the workflow is
+broken, or the assets need correcting), take the checksum off the *published*
+file rather than the local build:
+
+```bash
+python -m printer_agent publish-update \
+  --version X.Y.Z \
+  --package-url "https://github.com/RomanBRempel/printer-agent/releases/download/vX.Y.Z/printer_agent-X.Y.Z-py3-none-any.whl" \
+  --sha256 from-url \
+  --output dist/printer-agent-update.json
+```
 
 ## Two traps, both already sprung
 
 **The checksum has to come off the published file.** A wheel built twice from
 the same commit is two different files: zip entries carry build timestamps, and
-on Windows the line endings git hands the build can differ between runs. A
-manifest hashed from the local copy therefore describes a download that nobody
-will ever receive — every agent fails with `downloaded package sha256 does not
-match manifest`, while the release looks perfectly fine from the machine that
-published it. That is what `--sha256 from-url` is for; it downloads what the
-release serves and hashes that.
+the line endings differ between a Windows checkout and the workflow's Linux
+one. A manifest hashed from the local copy therefore describes a download that
+nobody will ever receive — every agent fails with `downloaded package sha256
+does not match manifest`, while the release looks perfectly fine from the
+machine that published it.
+
+That is exactly how 0.1.0a10 broke: a hand-run `gh release create` raced the
+workflow, the workflow's Linux-built wheel replaced the uploaded one, and a
+later `--clobber` swapped the wheel back while leaving the workflow's manifest
+in place. The pair was inconsistent for hours, and the shop floor found it, not
+the release. Let the workflow publish, and verify afterwards.
 
 **A pre-release is invisible to the update feed.** GitHub resolves
 `/releases/latest/` to the newest release *that is not a pre-release*, so
