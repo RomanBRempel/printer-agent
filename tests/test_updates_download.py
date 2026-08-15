@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 from pathlib import Path
 
 import pytest
@@ -104,3 +105,47 @@ def test_a_missing_console_interpreter_falls_back(monkeypatch, tmp_path):
     monkeypatch.setattr(updates.sys, "executable", str(tmp_path / "pythonw.exe"))
 
     assert updates.pip_executable() == str(tmp_path / "pythonw.exe")
+
+
+def test_the_manifest_checksum_comes_from_the_published_file(monkeypatch, tmp_path):
+    """A wheel built twice from one commit is two different files.
+
+    Zip timestamps differ, and on Windows so do the line endings git hands the
+    build. A manifest hashed from the local copy therefore describes a download
+    nobody will ever get: every agent refuses the update with "sha256 does not
+    match manifest", and the release looks fine from the machine that published
+    it and broken from the shop floor.
+    """
+    from printer_agent.cli import main
+
+    published = b"the bytes the release actually serves"
+    local_build = tmp_path / "printer_agent-9.9.9-py3-none-any.whl"
+    local_build.write_bytes(b"the bytes this machine happened to build")
+    monkeypatch.setattr(updates, "urlopen", lambda url: _FakeResponse(published))
+
+    output = tmp_path / "printer-agent-update.json"
+    exit_code = main(
+        [
+            "publish-update",
+            "--version",
+            "9.9.9",
+            "--package-url",
+            "https://example.com/printer_agent-9.9.9-py3-none-any.whl",
+            "--sha256",
+            "from-url",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    manifest = json.loads(output.read_text(encoding="utf-8"))
+    assert manifest["sha256"] == hashlib.sha256(published).hexdigest()
+    assert manifest["sha256"] != hashlib.sha256(local_build.read_bytes()).hexdigest()
+
+
+def test_a_local_package_path_is_hashed_from_disk(tmp_path):
+    package = tmp_path / "printer_agent-9.9.9-py3-none-any.whl"
+    package.write_bytes(PAYLOAD)
+
+    assert updates.sha256_of_url(str(package)) == hashlib.sha256(PAYLOAD).hexdigest()

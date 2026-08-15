@@ -29,7 +29,10 @@ from .settings_bundle import (
     read_bundle,
     write_bundle,
 )
-from .updates import apply_update, check_for_update, publish_manifest
+from .updates import apply_update, check_for_update, publish_manifest, sha256_of_url
+
+#: Value of `--sha256` that means "download the published package and hash it".
+SHA256_FROM_URL = "from-url"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -90,7 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
     publish_parser.add_argument("--version", required=True, help="Release version to publish")
     publish_parser.add_argument("--package-url", required=True, help="Wheel or source distribution URL")
     publish_parser.add_argument("--output", required=True, help="Path to the manifest JSON file")
-    publish_parser.add_argument("--sha256", default="", help="Optional SHA-256 checksum")
+    publish_parser.add_argument(
+        "--sha256",
+        default="",
+        help="SHA-256 checksum, or 'from-url' to read it off the published package",
+    )
     publish_parser.add_argument("--notes", default="", help="Optional release notes")
     publish_parser.add_argument("--published-at", default="", help="Optional ISO timestamp")
     return parser
@@ -118,11 +125,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "publish-update":
         # A release-authoring command; it never reads the agent config.
+        sha256 = args.sha256
+        if sha256 == SHA256_FROM_URL:
+            # Hash what the release actually serves. The locally built copy is a
+            # different file — same code, different bytes — and a manifest built
+            # from it describes a download that no agent will ever accept.
+            sha256 = sha256_of_url(args.package_url)
+            print(f"read sha256 {sha256} from {args.package_url}")
         manifest = publish_manifest(
             version=args.version,
             package_url=args.package_url,
             destination=args.output,
-            sha256=args.sha256,
+            sha256=sha256,
             notes=args.notes,
             published_at=args.published_at,
         )

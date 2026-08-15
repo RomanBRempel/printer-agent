@@ -158,6 +158,23 @@ def apply_update(manifest: UpdateManifest) -> UpdateStatus:
     )
 
 
+def sha256_of_url(package_url: str) -> str:
+    """Checksum of the package **as served**, not as built.
+
+    The two are not the same file. A wheel built twice from one commit differs
+    byte for byte — zip timestamps, and on Windows the line endings git hands
+    the build — so a manifest whose checksum came from the local copy describes
+    a file nobody will ever download. Every agent then refuses the update with
+    "sha256 does not match manifest", and the release looks broken from the shop
+    floor while looking fine from the machine that published it.
+    """
+    parsed = urlparse(package_url)
+    if parsed.scheme not in {"http", "https"}:
+        return hashlib.sha256(Path(package_url).read_bytes()).hexdigest()
+    with urlopen(package_url) as response:  # nosec: B310 - release URLs are operator-controlled
+        return hashlib.sha256(response.read()).hexdigest()
+
+
 def publish_manifest(version: str, package_url: str, destination: str | Path, *, sha256: str = "", notes: str = "", published_at: str = "") -> UpdateManifest:
     manifest = UpdateManifest(
         version=version.strip(),
