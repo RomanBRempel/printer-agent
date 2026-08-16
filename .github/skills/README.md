@@ -8,7 +8,7 @@
 
 | Skill | Description |
 |-------|-------------|
-| [premium-frontend-ui](./premium-frontend-ui/SKILL.md) | Immersive, high-performance web experiences with advanced motion, typography, and architectural craftsmanship. |
+| [premium-frontend-ui](./premium-frontend-ui/SKILL.md) | A comprehensive guide for GitHub Copilot to craft immersive, high-performance web experiences wit... \| As an AI engineering assistant, your role when building premium frontend experiences goes beyond ... |
 
 <!-- agent-ninja-END -->
 

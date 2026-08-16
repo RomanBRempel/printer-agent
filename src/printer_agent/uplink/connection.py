@@ -38,6 +38,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_AGENT_PATH = "/api/printers/agent"
 OUTBOX_FLUSH_LIMIT = 200
 
+#: How long a printer may take to answer one poll. Deliberately *not* the
+#: telemetry interval: that says how often to ask, not how slow a machine is
+#: allowed to be. A Creality K-series answers `printer.objects.query` in well
+#: over the 5 s a default interval allowed, so every poll of a printing K1 was
+#: cancelled and reported as offline while the desktop app — which waits 12 s —
+#: showed the same printer running.
+PRINTER_POLL_TIMEOUT_S = 20.0
+
 
 class HubRejected(RuntimeError):
     """The hub refused this agent for a reason reconnecting cannot fix."""
@@ -122,6 +130,21 @@ def _config_stamp(config: AgentConfig) -> tuple[int, int] | None:
     except OSError:
         return None
     return (stat.st_mtime_ns, stat.st_size)
+
+
+def _failure_reason(exc: Exception, timeout: float) -> str:
+    """Name a poll failure in words an operator can act on.
+
+    `asyncio.TimeoutError` carries an empty `str()`, so the obvious rendering
+    yields nothing at all. This used to fall back to the printer's brand, which
+    put `{"code": "offline", "message": "moonraker"}` on the hub's printer page —
+    a word that names the adapter and says nothing about what went wrong. Say
+    the budget instead: "the printer needed longer than we waited" is the one
+    fact that distinguishes a slow machine from an absent one.
+    """
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return f"no answer within {timeout:g}s"
+    return str(exc) or exc.__class__.__name__
 
 
 def _restart_required_changes(running: AgentConfig, incoming: AgentConfig) -> list[str]:
@@ -550,35 +573,42 @@ class HubConnection:
     async def _collect_snapshots(self) -> list[PrinterSnapshot]:
         if not self._adapters:
             return []
-        timeout = max(5, self.config.telemetry_interval_s)
+        timeout = max(PRINTER_POLL_TIMEOUT_S, self.config.telemetry_interval_s)
         results = await asyncio.gather(
             *(self._poll_adapter(key, adapter, timeout) for key, adapter in self._adapters.items())
         )
         return list(results)
 
     async def _poll_adapter(self, key: str, adapter: PrinterAdapter, timeout: float) -> PrinterSnapshot:
-        await self._ensure_adapter_connected(key, adapter)
+        await self._ensure_adapter_connected(key, adapter, timeout)
         try:
             return await asyncio.wait_for(adapter.get_state(), timeout=timeout)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._connected_adapters.discard(key)
+            reason = _failure_reason(exc, timeout)
             logger.warning(
-                "printer poll failed", extra={"action": "poll", "printer_key": key, "error": str(exc)}
+                "printer poll failed", extra={"action": "poll", "printer_key": key, "error": reason}
             )
-            return self._offline_snapshot(adapter, exc)
+            return self._offline_snapshot(adapter, reason)
 
-    async def _ensure_adapter_connected(self, key: str, adapter: PrinterAdapter) -> None:
+    async def _ensure_adapter_connected(
+        self, key: str, adapter: PrinterAdapter, timeout: float = PRINTER_POLL_TIMEOUT_S
+    ) -> None:
         if key in self._connected_adapters:
             return
         try:
-            await adapter.connect()
+            # Bounded like the poll itself: this runs before it, so an unbounded
+            # connect to a host that drops packets would hold up the whole
+            # gathered cycle — every other printer's telemetry with it.
+            await asyncio.wait_for(adapter.connect(), timeout=timeout)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning(
-                "printer connect failed", extra={"action": "poll", "printer_key": key, "error": str(exc)}
+                "printer connect failed",
+                extra={"action": "poll", "printer_key": key, "error": _failure_reason(exc, timeout)},
             )
             return
         self._connected_adapters.add(key)
@@ -648,14 +678,14 @@ class HubConnection:
                     extra={"action": "shutdown", "printer_key": key, "error": str(exc)},
                 )
 
-    def _offline_snapshot(self, adapter: PrinterAdapter, exc: Exception) -> PrinterSnapshot:
+    def _offline_snapshot(self, adapter: PrinterAdapter, reason: str) -> PrinterSnapshot:
         return PrinterSnapshot(
             printer_key=adapter.printer_key,
             status=PrinterStatus.offline,
             status_raw="offline",
             job=JobSnapshot(),
             temps=TemperatureSnapshot(),
-            error=ErrorSnapshot(code="offline", message=str(exc) or adapter.printer.brand),
+            error=ErrorSnapshot(code="offline", message=reason),
             capabilities=adapter.capabilities(),
         )
 

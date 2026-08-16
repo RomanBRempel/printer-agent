@@ -83,6 +83,16 @@ CAMERA_SNAPSHOT_CANDIDATES: tuple[str, ...] = (
 #: A snapshot request has to fail fast: it runs inside the frame interval.
 CAMERA_TIMEOUT_S = 10.0
 
+#: Bound on a state query. aiohttp's own default is five minutes, so without
+#: this a host that drops packets rather than refusing them rides all the way to
+#: the caller's timeout — and that one arrives as a bare `TimeoutError` with no
+#: message. Kept under the poll budget in `uplink.connection` so the failure the
+#: hub sees is this adapter's own ("Cannot connect to host ...") and names the
+#: address. `sock_connect` is the short one: a printer that is off answers
+#: nothing at the TCP layer, and there is no point spending the whole budget
+#: learning that.
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15.0, sock_connect=5.0)
+
 
 async def discover_moonraker(
     hosts: list[str], *, ports: tuple[int, ...] = MOONRAKER_DISCOVERY_PORTS, timeout_s: float = 1.5
@@ -299,7 +309,9 @@ class MoonrakerAdapter(PrinterAdapter):
                 headers["X-Api-Key"] = str(api_key)
             if bearer_token:
                 headers["Authorization"] = f"Bearer {bearer_token}"
-            self._session = aiohttp.ClientSession(headers=headers)
+            # Upload and camera pass their own timeouts; this is the default the
+            # state queries and `printer.info` inherit.
+            self._session = aiohttp.ClientSession(headers=headers, timeout=REQUEST_TIMEOUT)
         return self._session
 
     async def _call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:

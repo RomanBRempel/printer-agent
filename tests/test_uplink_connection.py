@@ -19,7 +19,12 @@ from printer_agent.contracts import (
     build_envelope,
 )
 from printer_agent.core.outbox import EventOutbox
-from printer_agent.uplink.connection import DEFAULT_AGENT_PATH, HubConnection, HubRejected
+from printer_agent.uplink.connection import (
+    DEFAULT_AGENT_PATH,
+    PRINTER_POLL_TIMEOUT_S,
+    HubConnection,
+    HubRejected,
+)
 
 
 class FakeMessage:
@@ -194,6 +199,55 @@ async def test_unreachable_printer_reports_offline_instead_of_failing(connection
     snapshots = await hub._collect_snapshots()
 
     assert [snapshot.status for snapshot in snapshots] == [PrinterStatus.offline]
+
+
+@pytest.mark.asyncio
+async def test_poll_budget_does_not_follow_the_telemetry_interval(connection) -> None:
+    """How often we ask must not decide how long a printer may take to answer.
+
+    The budget used to be `max(5, telemetry_interval_s)`. A printing Creality K1
+    needs longer than that for one state query, so every poll of it was
+    cancelled and the hub was told the printer was offline — while the desktop
+    app, which waits 12 s, showed the same machine printing.
+    """
+    hub, _adapter, _outbox = connection
+    seen: list[float] = []
+    original = hub._poll_adapter
+
+    async def spy(key, adapter, timeout):
+        seen.append(timeout)
+        return await original(key, adapter, timeout)
+
+    hub._poll_adapter = spy
+
+    hub.config.telemetry_interval_s = 1
+    await hub._collect_snapshots()
+    assert seen == [PRINTER_POLL_TIMEOUT_S]
+
+    # A slower cadence still widens it: the interval is a floor, never a ceiling.
+    seen.clear()
+    hub.config.telemetry_interval_s = 60
+    await hub._collect_snapshots()
+    assert seen == [60]
+
+
+@pytest.mark.asyncio
+async def test_a_poll_timeout_names_the_budget_rather_than_the_brand(connection) -> None:
+    """`asyncio.TimeoutError` has an empty `str()`.
+
+    The fallback used to be the printer's brand, which put
+    `{"code": "offline", "message": "moonraker"}` on the hub's printer page — the
+    name of the adapter, telling an operator nothing about what went wrong.
+    """
+    hub, adapter, _outbox = connection
+    adapter.raise_on_get_state = asyncio.TimeoutError()
+
+    snapshot = (await hub._collect_snapshots())[0]
+
+    assert snapshot.status is PrinterStatus.offline
+    assert snapshot.error is not None
+    assert snapshot.error.message != adapter.printer.brand
+    assert snapshot.error.message == f"no answer within {PRINTER_POLL_TIMEOUT_S:g}s"
 
 
 @pytest.mark.asyncio
