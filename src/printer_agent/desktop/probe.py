@@ -25,6 +25,19 @@ from .system import ServiceInfo, query_service
 PROBE_TIMEOUT_S = 12.0
 
 
+async def _close_quietly(adapter: PrinterAdapter) -> None:
+    """Release an adapter's connection without letting the failure escape.
+
+    Whoever builds an adapter owns closing it: aiohttp holds an open session
+    inside one, and a collected session logs `Unclosed client session` and
+    strands its socket.
+    """
+    try:
+        await asyncio.wait_for(adapter.disconnect(), timeout=3)
+    except Exception:
+        pass
+
+
 @dataclass(slots=True)
 class ProbeResult:
     printer_key: str
@@ -112,14 +125,20 @@ class PrinterProbe(QThread):
                 adapters[printer.key] = adapter
             snapshot = await asyncio.wait_for(adapter.get_state(), timeout=PROBE_TIMEOUT_S)
         except (TimeoutError, asyncio.TimeoutError):
+            # A `connect()` that timed out never reached the line that files the
+            # adapter, so this frame holds the only reference to it — and it is
+            # already carrying an open HTTP session. Dropping it here leaks that
+            # session, once per probe, for as long as the printer stays
+            # unreachable. An adapter that *is* filed keeps its session on
+            # purpose: only the state query timed out, and the next cycle reuses
+            # the connection.
+            if adapter is not None and adapters.get(printer.key) is not adapter:
+                await _close_quietly(adapter)
             return ProbeResult(printer_key=printer.key, snapshot=None, error="Таймаут опроса принтера")
         except Exception as exc:
             adapters.pop(printer.key, None)
             if adapter is not None:
-                try:
-                    await asyncio.wait_for(adapter.disconnect(), timeout=3)
-                except Exception:
-                    pass
+                await _close_quietly(adapter)
             return ProbeResult(printer_key=printer.key, snapshot=None, error=str(exc) or exc.__class__.__name__)
         return ProbeResult(printer_key=printer.key, snapshot=snapshot)
 
