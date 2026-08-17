@@ -111,9 +111,12 @@ whenever the roster changes.
 are read with one parser.
 
 `request_msg_id` carries the `msg_id` of the envelope being answered. It is
-**omitted** when the agent sends `inventory` on its own — which it does after
-noticing its config file changed, so a printer added at the location reaches the
-hub without waiting for a restart. An unsolicited `inventory` is therefore normal
+**omitted** when the agent sends `inventory` on its own, which it does for two
+reasons: its config file changed, so a printer added at the location reaches the
+hub without waiting for a restart; or a **capability changed under an unchanged
+roster** — a camera is found by asking the printer, and that answer can arrive
+long after `hello`, or only once the client holding the printer's camera port
+goes away. An unsolicited `inventory` is therefore normal
 traffic, not a protocol error, and it replaces the roster wholesale: a printer
 missing from it has been removed from that agent.
 
@@ -292,7 +295,8 @@ Idempotency is by `command_id`. Replayed commands must return the same result.
 
 ```json
 { "command_id": "cmd-9", "printer_key": "printer-1", "action": "start_print",
-  "args": { "file_ref": "pf_7f3a…", "remote_name": "BWB-20-D-001-R2.gcode" } }
+  "args": { "file_ref": "pf_7f3a…", "remote_name": "BWB-20-D-001-R2.gcode",
+            "ams_mapping": [2, 0] } }
 ```
 
 `file_ref` is the file in the agent's cache, delivered earlier by `file_offer`;
@@ -303,6 +307,14 @@ diverge. A `file_ref` the agent no longer holds is answered `failed` with the re
 in `error_text` — the agent does **not** go looking for the file, it has no URL
 for it and must not guess one. The hub answers that outcome by offering the file
 again.
+
+`ams_mapping` (optional) is which loaded slot each filament of the program goes
+to, in the program's own filament order. The hub works it out by matching the
+program against the slots the printer itself reported, so it is better informed
+than the printer's own pick — an adapter that drops it hands the choice back to
+the machine, and a job in the wrong material is scrap rather than a warning.
+Adapters whose printers have no addressable feeding system ignore the field; its
+absence means "do not involve the feeder", not "choose freely".
 
 ### `file_offer`
 

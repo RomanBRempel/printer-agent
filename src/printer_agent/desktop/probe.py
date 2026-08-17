@@ -121,6 +121,11 @@ class PrinterProbe(QThread):
                 if hasattr(adapter, "client_identifier"):
                     serial = str((printer.credentials or {}).get("serial", "")).strip()
                     adapter.client_identifier = f"{serial}-agent-ui" if serial else None
+                # The camera port has no such escape: it serves one client at a
+                # time, so probing it here would take the stream away from the
+                # service session that is sending frames to the hub.
+                if hasattr(adapter, "camera_probes_enabled"):
+                    adapter.camera_probes_enabled = False
                 await asyncio.wait_for(adapter.connect(), timeout=PROBE_TIMEOUT_S)
                 adapters[printer.key] = adapter
             snapshot = await asyncio.wait_for(adapter.get_state(), timeout=PROBE_TIMEOUT_S)

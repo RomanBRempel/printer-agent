@@ -277,6 +277,10 @@ async def check_printer(printer: PrinterConfig, timeout_s: float = DEFAULT_TIMEO
     if hasattr(adapter, "client_identifier"):
         serial = str((printer.credentials or {}).get("serial", "")).strip()
         adapter.client_identifier = f"{serial}-agent-check" if serial else None
+    # A check must not take the camera away from the running service: the Bambu
+    # camera port serves one client at a time.
+    if hasattr(adapter, "camera_probes_enabled"):
+        adapter.camera_probes_enabled = False
 
     started = recorder.start("connect")
     try:

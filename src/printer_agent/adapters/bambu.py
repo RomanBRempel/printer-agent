@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ftplib
 import json
 import ssl
 from contextlib import suppress
@@ -12,6 +13,7 @@ from aiomqtt import Client
 from ..config import PrinterConfig
 from ..contracts import AmsSlot, ErrorSnapshot, JobSnapshot, JobStatus, PrinterCapabilities, PrinterSnapshot, PrinterStatus, TemperatureSnapshot, ams_state, job_status_for, utc_now_iso
 from .base import PrinterAdapter, UnsupportedCommandError
+from .bambu_camera import BambuChamberCamera
 
 
 _BAMBU_STATUS_MAP = {
@@ -35,6 +37,68 @@ def normalize_bambu_status(raw_status: str) -> PrinterStatus:
     return _BAMBU_STATUS_MAP.get(raw_status.lower(), PrinterStatus.maintenance)
 
 BAMBU_USER_CANCELLED = 50348044
+
+#: Implicit FTPS port. Bambu wraps the control channel in TLS from the first
+#: byte instead of upgrading a plain session with `AUTH TLS` on 21, which is why
+#: `ftplib.FTP_TLS` cannot be used as it comes.
+BAMBU_FTPS_PORT = 990
+
+#: The only account the printer has. The password is the access code — the same
+#: one MQTT and the camera port authenticate with.
+BAMBU_FTPS_USER = "bblp"
+
+#: Where uploads land. The FTP root is the printer's storage; a subdirectory
+#: would have to exist on every model, and it does not.
+BAMBU_UPLOAD_DIR = "/"
+
+#: Default address the print command uses to find an uploaded file. X-series
+#: mounts storage at `/sdcard`, P- and A-series address the root — and the MQTT
+#: report does not say which machine this is (see `capabilities()` on the same
+#: fact for the camera). Overridden per printer by `credentials.print_url_prefix`
+#: in `agent.yaml`; the value actually used is returned in the command result so
+#: a print that never starts can be diagnosed without guessing.
+BAMBU_PRINT_URL_PREFIX = "file:///sdcard/"
+
+#: Plate inside a sliced `.3mf` project. Bambu Studio numbers plates from one
+#: and writes this path for the first of them; multi-plate projects are not a
+#: case the hub produces — it sends one part per program.
+BAMBU_PROJECT_PLATE = "Metadata/plate_1.gcode"
+
+
+class _ImplicitFTPS(ftplib.FTP_TLS):
+    """`ftplib` client for implicit FTPS.
+
+    Two departures from the standard class, and both are required by real
+    servers rather than by Bambu specifically:
+
+    * the control socket is wrapped in TLS as soon as it is created, because
+      the server expects a handshake and not a plaintext greeting;
+    * the data connection reuses the control connection's TLS session. Servers
+      built on OpenSSL 1.1+ commonly require this to prove the data channel
+      belongs to the authenticated session, and without it a transfer opens and
+      then dies — which reads as a network fault rather than a protocol one.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._sock: Any = None
+
+    @property
+    def sock(self) -> Any:
+        return self._sock
+
+    @sock.setter
+    def sock(self, value: Any) -> None:
+        if value is not None and not isinstance(value, ssl.SSLSocket):
+            value = self.context.wrap_socket(value, server_hostname=self.host)
+        self._sock = value
+
+    def ntransfercmd(self, cmd: str, rest: Any = None) -> tuple[Any, int | None]:
+        conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
+        if self._prot_p:
+            session = getattr(self.sock, "session", None)
+            conn = self.context.wrap_socket(conn, server_hostname=self.host, session=session)
+        return conn, size
 
 #: Trays per AMS unit, used to give the slots one flat numbering across units —
 #: the printer numbers trays 0..3 inside each unit and identifies the unit
@@ -197,6 +261,22 @@ class BambuAdapter(PrinterAdapter):
         #: MQTT client id. Defaults to the serial; a second consumer (the desktop
         #: app) overrides it so the broker does not evict the service's session.
         self.client_identifier: str | None = None
+        #: Chamber camera on its own TCP port. P- and A-series serve it and X1
+        #: does not, and nothing in the MQTT report names the model reliably, so
+        #: the capability follows a probe rather than the brand.
+        self._camera = BambuChamberCamera(
+            host=printer.host,
+            access_code=self._access_code,
+            printer_key=printer.key,
+            ssl_context=self._tls_context(),
+        )
+        self._camera_probe_task: asyncio.Task[None] | None = None
+        #: Whether this consumer may open the camera port at all. The port takes
+        #: one client at a time, so a second consumer of the same printer — the
+        #: desktop app, a connectivity check — would take the stream away from
+        #: the session that actually sends frames to the hub. Only the service
+        #: leaves this on.
+        self.camera_probes_enabled = True
 
     async def connect(self) -> None:
         if self._connection_task is not None and not self._connection_task.done():
@@ -208,9 +288,19 @@ class BambuAdapter(PrinterAdapter):
             await asyncio.wait_for(self._connected_event.wait(), timeout=15)
         except TimeoutError:
             pass
+        # Beside the connect, never inside it: the caller bounds `connect()` by
+        # the poll budget, and a camera port that accepts and then says nothing
+        # would spend that budget and leave the whole printer reported offline.
+        self._schedule_camera_probe()
 
     async def disconnect(self) -> None:
         self._stop_event.set()
+        if self._camera_probe_task is not None:
+            self._camera_probe_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await self._camera_probe_task
+            self._camera_probe_task = None
+        await self._camera.close()
         if self._connection_task is not None:
             self._connection_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -219,6 +309,10 @@ class BambuAdapter(PrinterAdapter):
         self._connected = False
 
     async def get_state(self) -> PrinterSnapshot:
+        # The port serves one client at a time, so a printer watched from Bambu
+        # Studio when the agent started answers nothing at all. Retrying on the
+        # poll is what lets the camera appear once that client goes away.
+        self._schedule_camera_probe()
         if self._latest_snapshot is not None and self._connected:
             return self._latest_snapshot
         if self._latest_print is None:
@@ -246,20 +340,106 @@ class BambuAdapter(PrinterAdapter):
         return "Bambu MQTT cache is empty"
 
     def capabilities(self) -> PrinterCapabilities:
-        # `upload` and `camera` stay down until this adapter really does them:
-        # the hub turns both flags into buttons, and a button that can only
-        # answer "unsupported" reads to the operator as a broken printer.
+        # `upload` follows what this adapter can actually do, never intent: the
+        # hub turns the flag into a button, and a button that can only answer
+        # "unsupported" reads to the operator as a broken printer. FTPS
+        # authenticates with the access code, so without one the answer is no —
+        # and the hub then says so before anyone presses anything, instead of
+        # after a failed transfer. `camera` follows the probe for the same
+        # reason — X1 firmware has no chamber stream on this port, and a Bambu
+        # is not enough to know which it is.
         return PrinterCapabilities(
             pause=True,
             resume=True,
             cancel=True,
-            upload=False,
-            camera=False,
+            upload=bool(self._access_code),
+            camera=self._camera.available,
             ams=bool(bambu_ams_slots(self._latest_print or {})),
         )
 
-    async def start_print(self, file_ref: str, remote_name: str | None = None) -> dict[str, Any]:
-        raise UnsupportedCommandError("Bambu live start_print is not implemented yet")
+    async def start_print(
+        self,
+        file_ref: str,
+        remote_name: str | None = None,
+        ams_mapping: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Start a print of a file already uploaded to the printer's storage.
+
+        Two shapes, chosen by what the file is. A sliced Bambu project (`.3mf`)
+        is printed with `project_file`, and the plate inside it is named
+        separately in `param` — the file is an archive, and the printer needs to
+        be told which plate of it to run. A bare `.gcode` is printed with
+        `gcode_file`, whose `param` is the path itself.
+
+        The URL prefix is configuration, not a guess. X-series addresses SD as
+        `/sdcard`, P- and A-series address the FTP root directly, and nothing in
+        the MQTT report names the model reliably (the same fact that made the
+        camera capability a probe rather than a brand rule). Guessing it wrong
+        fails silently — MQTT does not acknowledge, so the outcome is "the print
+        never started" with nothing to read — so the prefix is a printer setting
+        with a documented default, and the value actually used comes back in the
+        result for exactly that diagnosis.
+        """
+        name = (remote_name or file_ref or "").strip()
+        if not name:
+            raise RuntimeError("start_print needs a file name")
+
+        prefix = self._print_url_prefix()
+        url = f"{prefix}{name}"
+        payload: dict[str, Any] = {
+            "sequence_id": "0",
+            "url": url,
+            "subtask_name": Path(name).stem,
+            # Levelling stays on: it costs a minute and saves a plate. The
+            # calibrations below do not — they add minutes to every job, and the
+            # operator runs them when the machine needs them, not per print.
+            "bed_leveling": True,
+            "flow_cali": False,
+            "vibration_cali": False,
+            "layer_inspect": False,
+            "timelapse": False,
+            "use_ams": False,
+        }
+        if name.lower().endswith(".3mf"):
+            payload["command"] = "project_file"
+            payload["param"] = BAMBU_PROJECT_PLATE
+            # Zeroes, not the hub's identifiers: these name a task in Bambu's
+            # own cloud, and a foreign number here has been known to make the
+            # printer look for a project it cannot fetch.
+            payload.update({"profile_id": "0", "project_id": "0", "subtask_id": "0", "task_id": "0"})
+        else:
+            payload["command"] = "gcode_file"
+            payload["param"] = url[len("file://"):] if url.startswith("file://") else url
+
+        if ams_mapping:
+            # The hub matched the program against the slots this printer
+            # reported, so its answer is more informed than the printer's own
+            # pick. Without a mapping the AMS stays out of it entirely: letting
+            # the printer choose a slot it was not told about is how a job comes
+            # out in the wrong material.
+            payload["use_ams"] = True
+            payload["ams_mapping"] = list(ams_mapping)
+
+        await self._publish_json({"print": payload})
+        return {
+            "ok": True,
+            "filename": name,
+            "url": url,
+            "command": payload["command"],
+            "use_ams": payload["use_ams"],
+        }
+
+    def _print_url_prefix(self) -> str:
+        """Where the printer expects to find the uploaded file.
+
+        Configurable per printer (`credentials.print_url_prefix` in `agent.yaml`)
+        because the answer differs by series and cannot be detected. A trailing
+        slash is added rather than demanded: an operator editing YAML should not
+        have a print fail over a missing character.
+        """
+        configured = str(self.printer.credentials.get("print_url_prefix", "")).strip()
+        prefix = configured or BAMBU_PRINT_URL_PREFIX
+        return prefix if prefix.endswith("/") else f"{prefix}/"
 
     async def pause(self) -> dict[str, Any]:
         await self._publish_json({"print": {"sequence_id": "0", "command": "pause"}})
@@ -274,10 +454,82 @@ class BambuAdapter(PrinterAdapter):
         return {"ok": True}
 
     async def upload_file(self, local_path: str | Path, remote_name: str) -> dict[str, Any]:
-        raise UnsupportedCommandError("Bambu FTPS upload is not implemented in the live test adapter")
+        """Put a print file on the printer's storage over FTPS.
+
+        Bambu serves **implicit** FTPS on 990 — TLS from the first byte, not
+        `AUTH TLS` on 21 — with a self-signed certificate and the access code as
+        the password. `ftplib` speaks explicit FTPS only, hence the subclass
+        below; verification is off for the same reason it is off for MQTT and
+        the camera port: the certificate is the printer's own and there is no
+        authority to check it against.
+
+        Runs in a worker thread: `ftplib` is blocking, and a multi-megabyte
+        upload on the event loop would stall telemetry for the whole location
+        for as long as it takes.
+        """
+        source = Path(local_path)
+        if not source.is_file():
+            raise RuntimeError(f"{source} is not a file")
+        if not self._access_code:
+            raise UnsupportedCommandError(
+                f"printer {self.printer.key} has no access code, which FTPS authenticates with"
+            )
+        name = (remote_name or source.name).strip() or source.name
+
+        await asyncio.to_thread(self._ftps_upload, source, name)
+        return {"ok": True, "remote_name": name, "size_bytes": source.stat().st_size}
+
+    def _ftps_upload(self, source: Path, name: str) -> None:
+        """Blocking half of :meth:`upload_file` — runs in a worker thread."""
+        client = _ImplicitFTPS(context=self._tls_context())
+        client.connect(host=self.printer.host, port=BAMBU_FTPS_PORT, timeout=30)
+        try:
+            client.login(user=BAMBU_FTPS_USER, passwd=self._access_code)
+            # Encrypts the data channel too. Without it the printer accepts the
+            # login and then refuses the transfer — an authentication that looks
+            # like it worked, which is the confusing half of this protocol.
+            client.prot_p()
+            if BAMBU_UPLOAD_DIR not in ("", "/"):
+                client.cwd(BAMBU_UPLOAD_DIR)
+            with source.open("rb") as handle:
+                client.storbinary(f"STOR {name}", handle)
+        finally:
+            # The printer keeps a small number of control connections and hands
+            # out no more until they time out, so a leaked one costs the next
+            # upload, not just this one.
+            with suppress(Exception):
+                client.quit()
+            with suppress(Exception):
+                client.close()
 
     async def get_camera_frame(self) -> bytes:
-        raise UnsupportedCommandError("Bambu camera frame capture is not implemented yet")
+        if not self._access_code:
+            raise UnsupportedCommandError(
+                f"printer {self.printer.key} has no access code, which the camera port authenticates with"
+            )
+        return await self._camera.frame()
+
+    def _schedule_camera_probe(self) -> None:
+        """Find out whether this printer serves the chamber stream, off the poll.
+
+        The task is kept referenced: a probe collected mid-connect would leave
+        the capability down with nothing in the log to say why.
+        """
+        if not self.camera_probes_enabled:
+            return
+        if self._camera_probe_task is not None and not self._camera_probe_task.done():
+            return
+        if not self._camera.due_for_probe():
+            return
+        self._camera_probe_task = asyncio.create_task(
+            self._probe_camera(), name=f"printer-agent-bambu-camera-probe-{self.printer.key}"
+        )
+
+    async def _probe_camera(self) -> None:
+        if await self._camera.probe():
+            # The cached snapshot was built while the flag was still down, and
+            # the hub reads capabilities out of it.
+            self._latest_snapshot = None
 
     async def _run_connection_loop(self) -> None:
         serial = self._serial_number

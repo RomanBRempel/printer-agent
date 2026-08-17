@@ -208,7 +208,14 @@ class CrealityAdapter(PrinterAdapter):
             camera=False,
         )
 
-    async def start_print(self, file_ref: str, remote_name: str | None = None) -> dict[str, Any]:
+    async def start_print(
+        self,
+        file_ref: str,
+        remote_name: str | None = None,
+        ams_mapping: list[int] | None = None,
+    ) -> dict[str, Any]:
+        # Accepted for one signature across adapters; this printer has no
+        # addressable feeding system to map filaments onto.
         raise UnsupportedCommandError("Creality print start is not implemented yet")
 
     async def pause(self) -> dict[str, Any]:

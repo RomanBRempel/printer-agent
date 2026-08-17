@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextlib import suppress
 from dataclasses import asdict, dataclass
@@ -85,6 +86,16 @@ def printer_roster(adapters: list[PrinterAdapter]) -> list[dict[str, Any]]:
         }
         for adapter in adapters
     ]
+
+
+def roster_stamp(printers: list[dict[str, Any]]) -> str:
+    """Fingerprint of the roster as the hub last saw it.
+
+    Capabilities are not all known at handshake time — a camera is found by
+    probing the printer, which outlives `hello` — so the roster the agent sent
+    can stop being true without anything in the config changing.
+    """
+    return json.dumps(printers, sort_keys=True)
 
 
 def hello_payload(config: AgentConfig, adapters: list[PrinterAdapter], agent_version: str) -> dict[str, Any]:
@@ -202,6 +213,9 @@ class HubConnection:
         self._heartbeat_deadline = 0.0
         self._inflight_events: dict[str, float] = {}
         self._config_stamp = _config_stamp(config)
+        #: The roster as the hub last saw it, so a capability that only becomes
+        #: true after the handshake is announced instead of waiting for one.
+        self._roster_stamp = ""
         #: File transfers running outside the receive loop, kept referenced so
         #: the event loop cannot collect a task mid-download.
         self._transfers: set[asyncio.Task[None]] = set()
@@ -443,6 +457,7 @@ class HubConnection:
     async def _send_hello(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         payload = hello_payload(self.config, list(self._adapters.values()), self._agent_version())
         await self._send(ws, build_envelope(MessageType.hello.value, payload))
+        self._roster_stamp = roster_stamp(payload["printers"])
         self.state.last_hello_at = utc_now_iso()
 
     async def _send_inventory(self, ws: aiohttp.ClientWebSocketResponse, request_msg_id: str) -> None:
@@ -458,6 +473,7 @@ class HubConnection:
             },
         )
         await self._send(ws, build_envelope(MessageType.inventory.value, payload))
+        self._roster_stamp = roster_stamp(payload["printers"])
 
     async def _send_heartbeat(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         await self._send(ws, build_envelope(MessageType.heartbeat.value, {"location_key": self.config.location_key}))
@@ -482,11 +498,30 @@ class HubConnection:
                 self._record_events(snapshots)
                 await self._flush_outbox()
                 await self._send_telemetry(snapshots)
+                await self._announce_roster_changes()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - integration path
                 logger.warning("telemetry cycle failed", extra={"action": "telemetry", "error": str(exc)})
             await self._sleep_unless_stopped(self.config.telemetry_interval_s)
+
+    async def _announce_roster_changes(self) -> None:
+        """Re-send the roster when a capability changed under it.
+
+        A camera is found by asking the printer, and that answer can arrive long
+        after `hello` — or only once the operator closes Bambu Studio, which
+        holds the camera port to itself. The flags ride along in every snapshot,
+        but a hub that keyed its printer list on the handshake would keep showing
+        a camera the agent has since learned to serve.
+        """
+        ws = self._ws
+        if ws is None or ws.closed:
+            return
+        stamp = roster_stamp(printer_roster(list(self._adapters.values())))
+        if stamp == self._roster_stamp:
+            return
+        logger.info("printer capabilities changed", extra={"action": "hub_inventory"})
+        await self._send_inventory(ws, "")
 
     # -- config reload ---------------------------------------------------
 

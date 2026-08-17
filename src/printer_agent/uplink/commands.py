@@ -99,6 +99,18 @@ class CommandProcessor:
     async def _start_print(self, adapter: PrinterAdapter, args: dict[str, Any]) -> dict[str, Any]:
         file_ref = str(args.get("file_ref", "")).strip()
         remote_name = str(args.get("remote_name", "")).strip() or None
+        # Which loaded slot each filament of the program goes to. The hub has
+        # already matched the program against the slots this printer reports, so
+        # dropping the answer here would hand the choice back to the printer —
+        # which knows less about the program than the hub does. Anything that is
+        # not a list of slot numbers is ignored rather than passed on: a bad
+        # mapping prints in the wrong material, which is scrap, not a warning.
+        ams_mapping = args.get("ams_mapping")
+        if isinstance(ams_mapping, list):
+            slots = [int(slot) for slot in ams_mapping if isinstance(slot, int)]
+            ams_mapping = slots if len(slots) == len(ams_mapping) else None
+        else:
+            ams_mapping = None
         if not file_ref:
             raise RuntimeError("start_print without file_ref")
         if self._files is not None and not self._files.has_cached(file_ref):
@@ -108,7 +120,7 @@ class CommandProcessor:
             raise RuntimeError(
                 f"print file {file_ref} is not in this agent's cache; send the file again"
             )
-        return await adapter.start_print(file_ref, remote_name)
+        return await adapter.start_print(file_ref, remote_name, ams_mapping=ams_mapping)
 
     async def _run(
         self,

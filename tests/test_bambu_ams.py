@@ -97,7 +97,9 @@ def test_capabilities_report_what_this_adapter_actually_does() -> None:
     capabilities = adapter.capabilities()
 
     assert capabilities.ams is True
-    # Neither is implemented for this brand yet.
-    assert capabilities.upload is False
+    # Upload is implemented and the access code is set, so the flag is up. It
+    # follows the access code rather than the brand: FTPS authenticates with it,
+    # and a printer configured without one can only refuse the transfer.
+    assert capabilities.upload is True
     assert capabilities.camera is False
     assert capabilities.pause is True

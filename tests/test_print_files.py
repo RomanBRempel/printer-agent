@@ -36,6 +36,9 @@ class RecordingAdapter(PrinterAdapter):
         self._upload = upload
         self.uploads: list[tuple[Path, str]] = []
         self.prints: list[tuple[str, str | None]] = []
+        #: Slot mapping the hub worked out, kept separately so a test can assert
+        #: it arrived — dropping it silently is the failure mode that matters.
+        self.print_mappings: list[list[int] | None] = []
 
     async def connect(self) -> None:
         return None
@@ -53,8 +56,14 @@ class RecordingAdapter(PrinterAdapter):
         self.uploads.append((Path(local_path), remote_name))
         return {"ok": True}
 
-    async def start_print(self, file_ref: str, remote_name: str | None = None) -> dict[str, Any]:
+    async def start_print(
+        self,
+        file_ref: str,
+        remote_name: str | None = None,
+        ams_mapping: list[int] | None = None,
+    ) -> dict[str, Any]:
         self.prints.append((file_ref, remote_name))
+        self.print_mappings.append(ams_mapping)
         return {"ok": True}
 
 

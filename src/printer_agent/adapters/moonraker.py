@@ -201,7 +201,14 @@ class MoonrakerAdapter(PrinterAdapter):
             pause=True, resume=True, cancel=True, upload=True, camera=bool(self._camera_url)
         )
 
-    async def start_print(self, file_ref: str, remote_name: str | None = None) -> dict[str, Any]:
+    async def start_print(
+        self,
+        file_ref: str,
+        remote_name: str | None = None,
+        ams_mapping: list[int] | None = None,
+    ) -> dict[str, Any]:
+        # Klipper has no feeding system of its own, so `ams_mapping` has nothing
+        # to address and is accepted only to keep one signature across adapters.
         # Moonraker addresses a print by the name the file has on the printer,
         # which is what the upload put there — the cache's file_ref never
         # reaches the machine.
