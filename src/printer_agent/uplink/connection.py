@@ -464,10 +464,14 @@ class HubConnection:
         payload = inventory_payload(
             self.config, list(self._adapters.values()), self._agent_version(), request_msg_id
         )
+        # Which of the two cases this is has to be readable in the log. Both
+        # send the same message, and reading an unsolicited announcement as an
+        # answer to the hub is how an afternoon goes into looking for a request
+        # the hub never made.
         logger.info(
-            "hub asked for the printer roster",
+            "answered the hub's roster request" if request_msg_id else "sent the printer roster unasked",
             extra={
-                "action": "hub_inventory_request",
+                "action": "hub_inventory_request" if request_msg_id else "hub_inventory",
                 "printers": str(len(payload["printers"])),
                 "request_msg_id": request_msg_id,
             },
