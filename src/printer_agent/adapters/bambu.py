@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import ftplib
 import json
+import logging
+import re
 import ssl
 import time
+import zipfile
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -15,6 +18,8 @@ from ..config import PrinterConfig
 from ..contracts import AmsSlot, ErrorSnapshot, JobSnapshot, JobStatus, PrinterCapabilities, PrinterSnapshot, PrinterStatus, TemperatureSnapshot, ams_state, job_status_for, utc_now_iso
 from .base import PrinterAdapter, UnsupportedCommandError
 from .bambu_camera import BambuChamberCamera
+
+logger = logging.getLogger(__name__)
 
 
 _BAMBU_STATUS_MAP = {
@@ -97,10 +102,49 @@ FTPS_TIMEOUT_S = 120
 #: the whole upload. See :meth:`_ImplicitFTPS.storbinary`.
 FTPS_TLS_SHUTDOWN_TIMEOUT_S = 5
 
-#: Plate inside a sliced `.3mf` project. Bambu Studio numbers plates from one
-#: and writes this path for the first of them; multi-plate projects are not a
-#: case the hub produces — it sends one part per program.
+#: Fallback plate inside a sliced `.3mf`, used only when the archive cannot be
+#: read. Bambu Studio numbers plates from one, but it writes the gcode for the
+#: plate that was *sliced* — export plate 2 of a two-plate project and the
+#: archive contains `Metadata/plate_2.gcode` and no `plate_1.gcode` at all.
+#: Asking for a plate that is not in the file is answered `0500-4003`, "could
+#: not parse the print file", which names neither the plate nor the file.
 BAMBU_PROJECT_PLATE = "Metadata/plate_1.gcode"
+
+#: Entries in a sliced `.3mf` that are a plate's gcode. `plate_1.png` and
+#: `plate_1.json` sit beside them for plates that were never sliced, so the
+#: extension is what separates a printable plate from a thumbnail.
+_PLATE_ENTRY = re.compile(r"^Metadata/plate_(\d+)\.gcode$")
+
+
+def plate_in_project(path: str | Path) -> str | None:
+    """Which plate of a sliced `.3mf` the printer should be told to run.
+
+    Returns `None` for a file that is not a readable archive, or holds no plate
+    gcode at all — the caller keeps the default rather than inventing a path,
+    and an unprintable file fails at the printer with its own reason instead of
+    being mislabelled here.
+
+    A project with several sliced plates is not something the hub produces (it
+    sends one part per program), so the lowest-numbered one is taken and the
+    ambiguity logged rather than guessed at length.
+    """
+    try:
+        with zipfile.ZipFile(path) as archive:
+            plates = sorted(
+                (int(match.group(1)), match.group(0))
+                for match in (_PLATE_ENTRY.match(name) for name in archive.namelist())
+                if match is not None
+            )
+    except (OSError, zipfile.BadZipFile):
+        return None
+    if not plates:
+        return None
+    if len(plates) > 1:
+        logger.warning(
+            "sliced project holds more than one plate; printing the first",
+            extra={"action": "print", "plates": ", ".join(name for _, name in plates)},
+        )
+    return plates[0][1]
 
 
 class _ImplicitFTPS(ftplib.FTP_TLS):
@@ -332,6 +376,11 @@ class BambuAdapter(PrinterAdapter):
         self._latest_info: dict[str, Any] | None = None
         self._latest_error: dict[str, Any] | None = None
         self._latest_snapshot: PrinterSnapshot | None = None
+        #: Uploaded name -> the plate inside it. Read from the archive while the
+        #: agent still has the local copy, because `start_print` has only a name
+        #: on the printer and no way to look inside it. Empty after a restart,
+        #: which falls back to the default — the behaviour that was there before.
+        self._plate_by_name: dict[str, str] = {}
         self._connected = False
         #: When the MQTT session was last known to be down, on the monotonic
         #: clock. Set from the start: an adapter that has never connected has
@@ -521,7 +570,7 @@ class BambuAdapter(PrinterAdapter):
         }
         if name.lower().endswith(".3mf"):
             payload["command"] = "project_file"
-            payload["param"] = BAMBU_PROJECT_PLATE
+            payload["param"] = self._plate_by_name.get(name, BAMBU_PROJECT_PLATE)
             # Zeroes, not the hub's identifiers: these name a task in Bambu's
             # own cloud, and a foreign number here has been known to make the
             # printer look for a project it cannot fetch.
@@ -545,6 +594,10 @@ class BambuAdapter(PrinterAdapter):
             "filename": name,
             "url": url,
             "command": payload["command"],
+            # Both travel back for the same reason the address does: MQTT does
+            # not acknowledge, so a print that never starts is diagnosed from
+            # what was sent and nothing else.
+            "param": payload["param"],
             "use_ams": payload["use_ams"],
         }
 
@@ -612,7 +665,19 @@ class BambuAdapter(PrinterAdapter):
         name = (remote_name or source.name).strip() or source.name
 
         await asyncio.to_thread(self._ftps_upload, source, name)
-        return {"ok": True, "remote_name": name, "size_bytes": source.stat().st_size}
+        plate = None
+        if name.lower().endswith(".3mf"):
+            # Now, while the local copy is still here: the printer will only be
+            # addressed by a name from here on.
+            plate = await asyncio.to_thread(plate_in_project, source)
+            if plate:
+                self._plate_by_name[name] = plate
+        return {
+            "ok": True,
+            "remote_name": name,
+            "size_bytes": source.stat().st_size,
+            **({"plate": plate} if plate else {}),
+        }
 
     def _ftps_upload(self, source: Path, name: str) -> None:
         """Blocking half of :meth:`upload_file` — runs in a worker thread.

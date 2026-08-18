@@ -237,7 +237,7 @@ async def test_data_channel_is_encrypted_before_the_transfer(ftps, tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_control_connection_is_always_released(ftps, tmp_path) -> None:
+async def test_control_connection_is_always_released(ftps, tmp_path, monkeypatch) -> None:
     """Принтер держит немного управляющих соединений — утёкшее стоит следующей загрузки."""
     source = tmp_path / "part.gcode"
     source.write_bytes(b"x")
@@ -246,14 +246,14 @@ async def test_control_connection_is_always_released(ftps, tmp_path) -> None:
     def explode(self: FakeFTPS, command: str, handle: Any) -> None:
         raise ftplib.error_perm("550 no space")
 
-    FakeFTPS.storbinary = explode  # type: ignore[assignment]
-    try:
-        # Отказ приходит обёрнутым: оператор читает эту строку целиком, и без
-        # шага и адреса «550 no space» не говорит, на чём именно всё встало.
-        with pytest.raises(RuntimeError, match="550 no space"):
-            await adapter.upload_file(source, "part.gcode")
-    finally:
-        del FakeFTPS.storbinary
+    # monkeypatch, а не присваивание с `del`: удаление снимает и подменыш, и
+    # настоящий метод класса, и следующий тест, которому нужна загрузка, падает
+    # на пустом месте.
+    monkeypatch.setattr(FakeFTPS, "storbinary", explode)
+    # Отказ приходит обёрнутым: оператор читает эту строку целиком, и без шага
+    # и адреса «550 no space» не говорит, на чём именно всё встало.
+    with pytest.raises(RuntimeError, match="550 no space"):
+        await adapter.upload_file(source, "part.gcode")
 
     order = [name for name, _ in ftps.instances[0].calls]
     assert "quit" in order or "close" in order
@@ -437,3 +437,86 @@ def test_unusable_ftps_timeout_falls_back_instead_of_meaning_never():
 
     for bad in ("0", "-5", "soon", ""):
         assert _adapter_with({"ftps_timeout_s": bad})._ftps_timeout() == float(FTPS_TIMEOUT_S)
+
+
+# ─── Какую плиту печатать ───────────────────────────────────────────────────
+#
+# `param` указывал `Metadata/plate_1.gcode` всегда. Но Studio кладёт в архив
+# gcode той плиты, которую нарезали: экспорт второй плиты двухплитного проекта
+# даёт `Metadata/plate_2.gcode` и никакого `plate_1.gcode` — только его png и
+# json, которые лежат там и для ненарезанных плит. Просьба напечатать плиту,
+# которой в файле нет, получает `0500-4003`, «не удалось разобрать файл»: код,
+# не называющий ни плиту, ни файл.
+
+
+def make_project(path: Path, *plates: int, extras: tuple[str, ...] = ()) -> Path:
+    import zipfile
+
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("3D/3dmodel.model", "<model/>")
+        for plate in plates:
+            archive.writestr(f"Metadata/plate_{plate}.gcode", "G1 X0\n")
+            archive.writestr(f"Metadata/plate_{plate}.png", b"\x89PNG")
+        for name in extras:
+            archive.writestr(name, b"x")
+    return path
+
+
+def test_the_plate_that_was_sliced_is_the_one_printed(tmp_path) -> None:
+    """Ровно файл с площадки: нарезана вторая плита, первой в архиве нет."""
+    source = make_project(
+        tmp_path / "part.gcode.3mf", 2, extras=("Metadata/plate_1.png", "Metadata/plate_1.json")
+    )
+
+    assert bambu.plate_in_project(source) == "Metadata/plate_2.gcode"
+
+
+def test_a_thumbnail_is_not_a_plate(tmp_path) -> None:
+    """`plate_1.png` есть и у плиты, которую никто не нарезал."""
+    import zipfile
+
+    source = tmp_path / "part.gcode.3mf"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("Metadata/plate_1.png", b"\x89PNG")
+        archive.writestr("Metadata/plate_1.json", "{}")
+
+    assert bambu.plate_in_project(source) is None
+
+
+def test_an_unreadable_file_keeps_the_default_instead_of_inventing_one(tmp_path) -> None:
+    """Пусть принтер откажет со своей причиной, а не с нашей выдуманной."""
+    source = tmp_path / "part.gcode.3mf"
+    source.write_bytes(b"not a zip at all")
+
+    assert bambu.plate_in_project(source) is None
+
+
+@pytest.mark.asyncio
+async def test_the_upload_remembers_the_plate_and_the_start_asks_for_it(
+    ftps, published, tmp_path
+) -> None:
+    """`start_print` знает только имя на принтере — заглянуть внутрь уже нечем.
+
+    Поэтому плиту читают, пока локальная копия ещё здесь.
+    """
+    source = make_project(tmp_path / "part.gcode.3mf", 2)
+    adapter = make_adapter()
+
+    upload = await adapter.upload_file(source, "part.gcode.3mf")
+    await adapter.start_print("f00d", "part.gcode.3mf")
+
+    assert upload["plate"] == "Metadata/plate_2.gcode"
+    assert published.messages[0]["print"]["param"] == "Metadata/plate_2.gcode"
+
+
+@pytest.mark.asyncio
+async def test_a_start_without_the_upload_falls_back_to_the_first_plate(published) -> None:
+    """Перезапуск между загрузкой и стартом — прежнее поведение, не регрессия."""
+    adapter = make_adapter()
+
+    result = await adapter.start_print("f00d", "part.gcode.3mf")
+
+    assert published.messages[0]["print"]["param"] == bambu.BAMBU_PROJECT_PLATE
+    # Возвращается наверх, потому что MQTT ничего не подтверждает: печать,
+    # которая не началась, диагностируется только по тому, что было послано.
+    assert result["param"] == bambu.BAMBU_PROJECT_PLATE
