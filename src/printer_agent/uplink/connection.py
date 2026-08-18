@@ -11,7 +11,15 @@ from urllib.parse import urlparse, urlunparse
 import aiohttp
 
 from ..adapters.base import PrinterAdapter
-from ..config import AgentConfig, parse_config
+from ..config import (
+    AgentConfig,
+    config_from_dict,
+    config_to_dict,
+    load_config_file,
+    parse_config,
+    save_config,
+    validate_config,
+)
 from ..contracts import (
     COMMAND_BEARING_TYPES,
     PROTOCOL_VERSION,
@@ -32,6 +40,12 @@ from ..core.registry import build_adapter
 from ..core.state import PrinterStateStore
 from .camera import CameraService
 from .commands import CommandProcessor
+from ..settings_bundle import (
+    BundleError,
+    apply_remote_settings,
+    readonly_settings,
+    redacted_settings,
+)
 from .files import PrintFileService
 
 logger = logging.getLogger(__name__)
@@ -361,6 +375,12 @@ class HubConnection:
         if message_type == MessageType.inventory_request.value:
             await self._send_inventory(ws, str(payload.get("msg_id", "")))
             return
+        if message_type == MessageType.settings_request.value:
+            await self._send_settings(ws, str(payload.get("msg_id", "")))
+            return
+        if message_type == MessageType.settings_update.value:
+            await self._handle_settings_update(ws, message_payload)
+            return
         if message_type in COMMAND_BEARING_TYPES:
             await self._handle_command(ws, str(message_type), message_payload)
             return
@@ -478,6 +498,120 @@ class HubConnection:
         )
         await self._send(ws, build_envelope(MessageType.inventory.value, payload))
         self._roster_stamp = roster_stamp(payload["printers"])
+
+    async def _send_settings(self, ws: aiohttp.ClientWebSocketResponse, request_msg_id: str) -> None:
+        """Answer a `settings_request` with the config, secrets redacted."""
+        config = self._config_on_disk()
+        payload = {
+            "location_key": self.config.location_key,
+            "agent_version": self._agent_version(),
+            "settings": redacted_settings(config),
+            "readonly": readonly_settings(self.config),
+        }
+        if request_msg_id:
+            payload["request_msg_id"] = request_msg_id
+        logger.info(
+            "sent the agent settings",
+            extra={
+                "action": "hub_settings",
+                "printers": str(len(payload["settings"]["printers"])),
+                "request_msg_id": request_msg_id,
+            },
+        )
+        await self._send(ws, build_envelope(MessageType.settings.value, payload))
+
+    async def _handle_settings_update(
+        self, ws: aiohttp.ClientWebSocketResponse, payload: dict[str, Any]
+    ) -> None:
+        command_id = str(payload.get("command_id", ""))
+        if not command_id:
+            logger.warning(
+                "hub message without command_id",
+                extra={"action": "hub_command", "message_type": MessageType.settings_update.value},
+            )
+            return
+        result = await self._command_processor.dispatch_settings_update(
+            payload, self._apply_remote_settings
+        )
+        await self._send(ws, build_envelope(MessageType.command_result.value, result))
+
+    async def _apply_remote_settings(self, settings: Any) -> dict[str, Any]:
+        """Write a hub change set into `agent.yaml`, or refuse without writing.
+
+        Nothing here rebuilds an adapter or restarts anything: the file is the
+        source of truth, and the poll loop's ordinary reload notices the change
+        within one `telemetry_interval_s`, rebuilds what moved and announces the
+        new roster. So the `command_result` says the change was accepted, and
+        the `inventory` that follows says it took effect.
+        """
+        path = self.config.source_path
+        if path is None:
+            raise RuntimeError(
+                "this agent has no config file to write; it is configured from the environment"
+            )
+
+        current = self._config_on_disk()
+        try:
+            merged, report = apply_remote_settings(settings, current)
+        except BundleError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        errors = validate_config(self._with_session_identity(merged))
+        if errors:
+            # Nothing is written. A hub that can leave the file unloadable can
+            # take a location off the air with one bad form submission, and the
+            # agent would then be answering from a config nobody can see.
+            raise RuntimeError("; ".join(errors))
+        if not report.applied:
+            refused = ", ".join(report.rejected)
+            raise RuntimeError(
+                f"nothing to apply: {refused} cannot be set from the hub"
+                if refused
+                else "nothing to apply: the change set is empty"
+            )
+
+        save_config(merged, path)
+        logger.info(
+            "applied settings from the hub",
+            extra={
+                "action": "hub_settings_update",
+                "applied": ", ".join(report.applied),
+                "rejected": ", ".join(report.rejected),
+            },
+        )
+        return {
+            "applied": report.applied,
+            "kept_local": report.kept_local,
+            "rejected": report.rejected,
+            "missing": report.missing,
+            # The fields a restart would be needed for are exactly the ones this
+            # path refuses, so there is nothing left that needs one.
+            "restart_required": False,
+        }
+
+    def _config_on_disk(self) -> AgentConfig:
+        """The config as written, without environment overrides.
+
+        `parse_config` would fold a temporary `HUB_URL` into what gets saved
+        back — the same reason the settings transfer reads the file directly.
+        """
+        path = self.config.source_path
+        return load_config_file(path) if path is not None else self.config
+
+    def _with_session_identity(self, config: AgentConfig) -> AgentConfig:
+        """`config` with the fields the hub cannot set taken from the running one.
+
+        Validation has to judge the part the hub can affect. An agent configured
+        entirely from the environment has no `hub_url` in its file, and checking
+        the merged file as-is would refuse every remote change for a reason that
+        has nothing to do with the change.
+        """
+        data = config_to_dict(config)
+        data["hub_url"] = self.config.hub_url
+        data["agent_token"] = self.config.agent_token
+        data["location_key"] = self.config.location_key
+        data["outbox"]["database_path"] = str(self.config.outbox.database_path)
+        return config_from_dict(data)
 
     async def _send_heartbeat(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         await self._send(ws, build_envelope(MessageType.heartbeat.value, {"location_key": self.config.location_key}))

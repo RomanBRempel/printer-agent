@@ -68,6 +68,26 @@ class CommandProcessor:
 
         return await self._run(command_id, printer_key, "file_offer", run)
 
+    async def dispatch_settings_update(
+        self,
+        payload: dict[str, Any],
+        apply: Callable[[Any], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """A command about the agent rather than about one printer.
+
+        It goes through :meth:`_run` like every other command, for the one
+        reason that matters here: the stored result is consulted first, so a
+        `settings_update` redelivered because the socket dropped while its
+        answer was in flight does not get applied twice. `printer_key` is empty
+        because there is no printer in it.
+        """
+        command_id = str(payload["command_id"])
+
+        async def run() -> dict[str, Any]:
+            return await apply(payload.get("settings"))
+
+        return await self._run(command_id, "", "settings_update", run)
+
     async def dispatch_camera_request(
         self, adapter: PrinterAdapter, payload: dict[str, Any]
     ) -> dict[str, Any]:

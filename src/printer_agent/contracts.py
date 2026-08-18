@@ -13,6 +13,7 @@ PROTOCOL_VERSION = 1
 class MessageType(StrEnum):
     hello = "hello"
     inventory = "inventory"
+    settings = "settings"
     telemetry = "telemetry"
     event = "event"
     command_result = "command_result"
@@ -20,6 +21,8 @@ class MessageType(StrEnum):
     hello_ack = "hello_ack"
     hello_reject = "hello_reject"
     inventory_request = "inventory_request"
+    settings_request = "settings_request"
+    settings_update = "settings_update"
     command = "command"
     file_offer = "file_offer"
     camera_request = "camera_request"
@@ -32,6 +35,7 @@ AGENT_TO_HUB_TYPES = frozenset(
     {
         MessageType.hello.value,
         MessageType.inventory.value,
+        MessageType.settings.value,
         MessageType.telemetry.value,
         MessageType.event.value,
         MessageType.command_result.value,
@@ -44,6 +48,8 @@ HUB_TO_AGENT_TYPES = frozenset(
         MessageType.hello_ack.value,
         MessageType.hello_reject.value,
         MessageType.inventory_request.value,
+        MessageType.settings_request.value,
+        MessageType.settings_update.value,
         MessageType.command.value,
         MessageType.file_offer.value,
         MessageType.camera_request.value,
@@ -52,6 +58,13 @@ HUB_TO_AGENT_TYPES = frozenset(
         MessageType.error.value,
     }
 )
+
+#: Stands in for a secret the agent will not send upward. It travels in
+#: `settings` and may come back in a `settings_update`, where it means "keep the
+#: value you have" — a hub that renders the settings block and posts it back
+#: must not overwrite a working access code with this string.
+REDACTED = "__redacted__"
+
 
 # Hub messages that carry a command_id and are answered with a command_result.
 COMMAND_BEARING_TYPES = frozenset(

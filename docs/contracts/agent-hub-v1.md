@@ -124,6 +124,55 @@ The roster is the set of printers the agent is **configured** for, not the set
 currently answering: an unreachable printer stays in the list, and its state is
 reported through `telemetry` as `offline` like any other.
 
+### `settings`
+
+What the agent is currently configured with, in answer to a `settings_request`.
+
+```json
+{
+  "location_key": "loc-001",
+  "agent_version": "0.1.0a19",
+  "request_msg_id": "uuid-of-the-settings-request-envelope",
+  "settings": {
+    "telemetry_interval_s": 5,
+    "heartbeat_interval_s": 15,
+    "command_reconnect_backoff_s": { "min": 1, "max": 60 },
+    "outbox": { "max_events": 5000 },
+    "print_files": { "max_age_h": 72, "max_total_mb": 2048 },
+    "updates": { "feed_url": "https://…", "auto_update": true, "check_on_startup": true, "check_interval_h": 6 },
+    "printers": [
+      {
+        "key": "printer-1",
+        "brand": "moonraker",
+        "host": "10.13.0.130",
+        "port": 7125,
+        "camera_snapshot_url": "",
+        "credentials": { "api_key": "__redacted__" }
+      }
+    ]
+  },
+  "readonly": {
+    "hub_url": "https://hub.example.com/api/printers/agent",
+    "outbox": { "database_path": "C:\\ProgramData\\printer-agent\\outbox.sqlite3" }
+  }
+}
+```
+
+`settings` holds exactly the fields a `settings_update` may change, in the shape
+it must send them back. `readonly` holds what the agent will show but never let
+the hub write — see `settings_update`. `agent_token` appears in neither: it is
+the credential this very session authenticated with, and the hub already has it.
+
+**Every secret is replaced with the string `__redacted__`.** The agent never
+sends a printer's access code, API key or password upward, whatever the hub asks.
+A field whose value is `__redacted__` means "set, and not shown"; a field that is
+absent or empty means "not set" — the hub needs to tell those apart to render an
+editor that does not silently blank a working credential.
+
+`request_msg_id` carries the `msg_id` of the envelope being answered. Unlike
+`inventory`, this message is never sent unsolicited: settings change because
+someone changed them, and whoever did already knows.
+
 ### `telemetry`
 
 Batch snapshots, lossy delivery.
@@ -195,6 +244,10 @@ state to compare against.
 
 `status` comes from the `command_status` vocabulary. An action the printer's
 protocol does not implement is `unsupported`, not `failed`.
+
+`printer_key` is the empty string for a command that is about the agent rather
+than about one printer — currently only `settings_update`. It is present and
+empty rather than omitted, so a hub can read the field unconditionally.
 
 ### `heartbeat`
 
@@ -291,6 +344,98 @@ a request for state, not an action on a printer, and it never touches one. An
 agent too old to know the type ignores it and logs the unknown type, so the hub
 must treat a missing answer as "this agent predates the message", not as a
 failure — send it, and fall back to the roster from `hello`.
+
+### `settings_request`
+
+Asks the agent what it is configured with.
+
+```json
+{}
+```
+
+Answered with `settings`. Like `inventory_request` it carries no `command_id`
+and gets no `command_result`: it is a request for state, not an action. An agent
+too old to know the type ignores it and logs the unknown type, so a missing
+answer means "this agent predates the message", not a failure.
+
+### `settings_update`
+
+Changes the agent's configuration from the hub.
+
+```json
+{
+  "command_id": "cmd-9",
+  "settings": {
+    "telemetry_interval_s": 10,
+    "printers": [
+      { "key": "printer-1", "brand": "moonraker", "host": "10.13.0.130", "port": 7125 },
+      { "key": "a1-mini-sancho", "brand": "bambu", "host": "10.13.0.126", "credentials": { "access_code": "12345678", "serial": "0309…" } }
+    ]
+  }
+}
+```
+
+Answered with a `command_result` whose `printer_key` is the empty string: this
+command is about the agent, not about one printer.
+
+**A partial change set, not a mirror.** A key the hub omits is left exactly as it
+is; the agent's file stays the source of truth for everything not mentioned. A
+hub that renders the whole `settings` block and posts it back unchanged is
+therefore also correct — it just changes nothing.
+
+**`printers` is the exception: present means "this is the whole list".** There is
+no other way to express a removal, so a `printers` array replaces the roster
+wholesale and a printer missing from it is dropped from the agent. Omit the key
+entirely to leave the roster alone; sending `[]` removes every printer, which the
+agent will do.
+
+**`__redacted__` means "keep what you have".** The hub reads secrets out of
+`settings` as that marker, so posting the block back must not overwrite the real
+access code with the literal string. The same rule covers a secret the hub simply
+omits: an absent or `__redacted__` credential keeps the value the agent already
+holds, and only a non-empty, non-marker value replaces it. To *clear* a
+credential, send it as `null`.
+
+**Four fields are refused, not ignored.** `hub_url`, `agent_token`,
+`location_key` and `outbox.database_path` name the session and the open database
+— the two things a running agent cannot swap without tearing itself down — and a
+mistake in them leaves the agent with no channel to be repaired through. They
+come back in `rejected` rather than being silently dropped, because a silent drop
+reads to the operator as a change that worked. They stay the operator's job, on
+the machine, through the desktop app or a settings bundle.
+
+The `response` of the `command_result` reports every field by what happened to it:
+
+```json
+{
+  "applied": ["telemetry_interval_s", "printers[2]"],
+  "kept_local": ["printers.a1-mini-sancho.credentials.access_code"],
+  "rejected": ["hub_url"],
+  "missing": ["printers.jekson-p1s.credentials.access_code"],
+  "restart_required": false
+}
+```
+
+- `applied` — written to the file.
+- `kept_local` — the hub sent nothing (or the marker) and the agent's own value stands.
+- `rejected` — refused by the rules above; the hub should show these, not retry them.
+- `missing` — still not set anywhere, and the adapter needs it. A Bambu without an
+  access code cannot connect or accept a file, so the printer will report
+  `offline` until someone supplies one.
+- `restart_required` — a change was written that only a restart will pick up.
+  Currently always `false`; the fields that would need one are the rejected four.
+
+`status` is `done` when anything was applied, and `failed` when nothing was —
+either because the merged configuration does not validate (then nothing is
+written at all, and `error_text` names the failures) or because the change set
+consisted only of rejected fields. A `settings_update` never leaves the file in a
+state the agent would refuse to load: it is validated before it is written.
+
+Applying is not instant. The agent writes the file and its ordinary config reload
+picks it up within one `telemetry_interval_s`, rebuilding the adapters for
+printers that were added, removed or edited and sending an unsolicited
+`inventory`. The `command_result` therefore says the change was *accepted*, and
+the `inventory` that follows says it took effect.
 
 ### `command`
 

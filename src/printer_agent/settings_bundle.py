@@ -24,6 +24,7 @@ import yaml
 
 from . import __version__
 from .config import AgentConfig, PrinterConfig, config_from_dict, config_to_dict
+from .contracts import REDACTED
 
 BUNDLE_KIND = "printer-agent-settings"
 BUNDLE_VERSION = 1
@@ -75,6 +76,11 @@ class TransferReport:
     applied: list[str] = field(default_factory=list)
     kept_local: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
+    #: Fields the sender is not allowed to set. Only the remote path fills this:
+    #: an import from a file is done by someone standing at the machine, who may
+    #: change anything. Refusals are reported rather than dropped — a silent drop
+    #: reads as a change that worked.
+    rejected: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -284,7 +290,16 @@ def apply_bundle(
 def _merge_printers(
     incoming: list[Any], local: list[PrinterConfig], report: TransferReport
 ) -> list[dict[str, Any]]:
-    """Bundle entries win, except for secrets this machine already knows."""
+    """Incoming entries win, except for secrets this machine already knows.
+
+    Three ways an incoming credential can be absent, and they mean different
+    things. Left out entirely, or empty, or the string :data:`REDACTED` — which
+    is what the agent sent the hub in the first place, so a hub that renders the
+    settings and posts them back arrives here — all mean *keep what this machine
+    has*. An explicit ``null`` means *clear it*, and is the only way to take a
+    credential away remotely. Collapsing the two is how a form save wipes a
+    working access code, or how a revoked one comes back.
+    """
     by_key = {printer.key: printer for printer in local}
     merged: list[dict[str, Any]] = []
 
@@ -298,8 +313,17 @@ def _merge_printers(
             name: value for name, value in (item.get("credentials") or {}).items()
         }
 
+        cleared = {name for name, value in credentials.items() if value is None}
+        for name in sorted(cleared):
+            credentials.pop(name)
+            report.applied.append(f"printers.{key}.credentials.{name} cleared")
+        for name in [name for name, value in credentials.items() if value == REDACTED]:
+            credentials.pop(name)
+
         existing = by_key.get(key)
         for name, value in (existing.credentials if existing else {}).items():
+            if name in cleared:
+                continue
             if name.lower() in SECRET_CREDENTIAL_KEYS and value and not credentials.get(name):
                 credentials[name] = value
                 report.kept_local.append(f"printers.{key}.credentials.{name}")
@@ -313,3 +337,138 @@ def _merge_printers(
         merged.append(entry)
 
     return merged
+
+
+# --------------------------------------------------------------------------- #
+# remote configuration
+# --------------------------------------------------------------------------- #
+
+#: What a `settings_update` from the hub may change. Everything else in the
+#: config is either derived or on :data:`REMOTE_BLOCKED_KEYS`.
+REMOTE_WRITABLE_KEYS = (
+    "telemetry_interval_s",
+    "heartbeat_interval_s",
+    "command_reconnect_backoff_s",
+    "outbox",
+    "print_files",
+    "updates",
+    "printers",
+)
+
+#: What the hub may see but never set. These name the session and the open
+#: database — the two things a running agent cannot swap without tearing itself
+#: down — and a mistake in them leaves no channel through which to repair the
+#: agent. They stay the operator's job, on the machine.
+REMOTE_BLOCKED_KEYS = ("hub_url", "agent_token", "location_key")
+
+#: Same, one level down.
+REMOTE_BLOCKED_SUBKEYS = {"outbox": ("database_path",)}
+
+
+def redacted_settings(config: AgentConfig) -> dict[str, Any]:
+    """The writable settings, with every secret replaced by :data:`REDACTED`.
+
+    Two things must stay distinguishable to whoever renders an editor from this:
+    a secret that is set (the marker) and one that is not (absent). Collapsing
+    them is how a form saves a blank over a working access code.
+    """
+    data = config_to_dict(config)
+    settings: dict[str, Any] = {
+        key: data[key] for key in REMOTE_WRITABLE_KEYS if key != "printers" and key in data
+    }
+    settings["outbox"] = {"max_events": data["outbox"]["max_events"]}
+    settings["printers"] = [
+        {
+            **{name: value for name, value in printer.items() if name != "credentials"},
+            **(
+                {
+                    "credentials": {
+                        name: (REDACTED if _is_secret(name) and value else value)
+                        for name, value in printer["credentials"].items()
+                    }
+                }
+                if printer.get("credentials")
+                else {}
+            ),
+        }
+        for printer in data["printers"]
+    ]
+    return settings
+
+
+def readonly_settings(config: AgentConfig) -> dict[str, Any]:
+    """What the hub is shown but cannot write.
+
+    `agent_token` is deliberately absent: it is the credential this very session
+    authenticated with, so the hub already has it, and echoing a secret back
+    serves nothing.
+    """
+    return {
+        "hub_url": config.hub_url,
+        "outbox": {"database_path": str(config.outbox.database_path)},
+    }
+
+
+def apply_remote_settings(
+    settings: Any, current: AgentConfig
+) -> tuple[AgentConfig, TransferReport]:
+    """Merge a hub `settings_update` over ``current``.
+
+    A partial change set, not a mirror: a key the sender omits keeps the value
+    the agent has, so the file on the machine stays the source of truth for
+    everything the hub did not mention. ``printers`` is the exception — present
+    means "this is the whole list", because there is no other way to express a
+    removal.
+    """
+    if not isinstance(settings, dict):
+        raise BundleError("settings must be a mapping")
+
+    report = TransferReport()
+    base = config_to_dict(current)
+
+    for key in REMOTE_BLOCKED_KEYS:
+        if key in settings:
+            report.rejected.append(key)
+    for key, names in REMOTE_BLOCKED_SUBKEYS.items():
+        section = settings.get(key)
+        if isinstance(section, dict):
+            report.rejected.extend(name for name in names if name in section)
+
+    for key in ("telemetry_interval_s", "heartbeat_interval_s"):
+        if settings.get(key) not in (None, ""):
+            base[key] = settings[key]
+            report.applied.append(key)
+
+    backoff = settings.get("command_reconnect_backoff_s")
+    if isinstance(backoff, dict) and backoff:
+        base["command_reconnect_backoff_s"] = {
+            **base["command_reconnect_backoff_s"],
+            **{name: backoff[name] for name in ("min", "max") if name in backoff},
+        }
+        report.applied.append("command_reconnect_backoff_s")
+
+    outbox = settings.get("outbox")
+    if isinstance(outbox, dict) and outbox.get("max_events"):
+        base["outbox"]["max_events"] = outbox["max_events"]
+        report.applied.append("outbox.max_events")
+
+    for section in ("print_files", "updates"):
+        incoming = settings.get(section)
+        if isinstance(incoming, dict) and incoming:
+            base[section] = {**base[section], **incoming}
+            report.applied.append(section)
+
+    if "printers" in settings:
+        incoming_printers = settings["printers"]
+        if not isinstance(incoming_printers, list):
+            raise BundleError("printers must be a list")
+        base["printers"] = _merge_printers(incoming_printers, current.printers, report)
+        report.applied.append(f"printers[{len(base['printers'])}]")
+    else:
+        report.kept_local.append("printers")
+
+    return config_from_dict(base), report
+
+
+def _is_secret(name: str) -> bool:
+    return name.lower() in SECRET_CREDENTIAL_KEYS
