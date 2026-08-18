@@ -11,6 +11,7 @@ from printer_agent.config import (
     OutboxConfig,
     PrinterConfig,
     UpdateConfig,
+    config_from_dict,
     config_to_dict,
     load_config,
     parse_config,
@@ -134,3 +135,61 @@ def test_a_blank_interval_takes_the_default(tmp_path: Path) -> None:
     )
 
     assert config.telemetry_interval_s == 5
+
+
+# ── Настройка не на своём уровне ────────────────────────────────────────────
+
+
+def test_a_credential_written_beside_host_is_named_not_swallowed(caplog) -> None:
+    """`print_url_prefix` рядом с `host` — валидный YAML, который исчезает.
+
+    Строка в файле есть, оператор её видит, агент работает так, будто её нет.
+    Молчание тут хуже и отказа, и ошибки: чинить нечего, потому что всё уже
+    «настроено».
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        config = config_from_dict(
+            {
+                "printers": [
+                    {
+                        "key": "jekson-h2d",
+                        "brand": "bambu",
+                        "host": "10.13.0.158",
+                        "print_url_prefix": "file:///",
+                        "credentials": {"access_code": "x", "serial": "y"},
+                    }
+                ]
+            }
+        )
+
+    assert "print_url_prefix" not in config.printers[0].credentials
+    # Поля лежат в `extra`, а не в тексте: хендлер агента пишет их отдельными
+    # ключами, и проверять надо то, что реально уедет в журнал.
+    warned = [r for r in caplog.records if r.message == "ignored an unknown printer setting"]
+    assert [r.printer_key for r in warned] == ["jekson-h2d"]
+    assert warned[0].error == "print_url_prefix (it belongs under credentials)"
+
+
+def test_a_known_key_says_nothing(caplog) -> None:
+    """Предупреждение на каждой обычной записи обесценило бы само себя."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        config_from_dict(
+            {
+                "printers": [
+                    {
+                        "key": "k2plus",
+                        "brand": "moonraker",
+                        "host": "10.13.0.130",
+                        "port": 7125,
+                        "camera_snapshot_url": "http://10.13.0.130/webcam/?action=snapshot",
+                        "credentials": {"api_key": "x"},
+                    }
+                ]
+            }
+        )
+
+    assert "ignored an unknown printer setting" not in caplog.text

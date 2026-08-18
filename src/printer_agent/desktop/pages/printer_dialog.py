@@ -40,6 +40,7 @@ class PrinterDialog(QDialog):
         access_code = str(credentials.pop("access_code", ""))
         serial = str(credentials.pop("serial", ""))
         api_key = str(credentials.pop("api_key", ""))
+        print_url_prefix = str(credentials.pop("print_url_prefix", ""))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -60,6 +61,8 @@ class PrinterDialog(QDialog):
         self.access_code_edit = QLineEdit(access_code)
         self.access_code_edit.setEchoMode(QLineEdit.Password)
         self.serial_edit = QLineEdit(serial)
+        self.print_url_prefix_edit = QLineEdit(print_url_prefix)
+        self.print_url_prefix_edit.setPlaceholderText("file:///sdcard/")
         self.api_key_edit = QLineEdit(api_key)
         self.api_key_edit.setEchoMode(QLineEdit.Password)
         self.extra_edit = QLineEdit(
@@ -80,6 +83,17 @@ class PrinterDialog(QDialog):
         bambu_layout.setSpacing(14)
         bambu_layout.addWidget(form_row("Access code", self.access_code_edit))
         bambu_layout.addWidget(form_row("Серийный номер", self.serial_edit))
+        bambu_layout.addWidget(
+            form_row(
+                "Где принтер ищет файл",
+                self.print_url_prefix_edit,
+                hint=(
+                    "Пусто — file:///sdcard/. X-серия и A1 понимают его; H2D и часть "
+                    "моделей ждут корень FTP — file:/// — и отвечают на чужой адрес "
+                    "ошибкой 0500-4002."
+                ),
+            )
+        )
         layout.addWidget(self._bambu_fields)
 
         self._moonraker_fields = QWidget()
@@ -164,6 +178,11 @@ class PrinterDialog(QDialog):
                 return self._fail("Для Bambu нужен серийный номер.")
             credentials["access_code"] = access_code
             credentials["serial"] = serial
+            prefix = self.print_url_prefix_edit.text().strip()
+            if prefix:
+                if not prefix.startswith("file:///"):
+                    return self._fail("Адрес файла должен начинаться с file:///.")
+                credentials["print_url_prefix"] = prefix
         else:
             api_key = self.api_key_edit.text().strip()
             if api_key:

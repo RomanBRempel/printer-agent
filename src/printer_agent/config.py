@@ -3,9 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import logging
 import os
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(ValueError):
@@ -271,6 +274,38 @@ def _parse_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+#: Everything a `printers[]` entry may say about itself. Anything else is a
+#: mistake worth naming rather than dropping.
+_PRINTER_KEYS = frozenset({"key", "brand", "host", "port", "credentials", "camera_snapshot_url"})
+
+#: Settings that belong one level down, under `credentials`. Written beside
+#: `host` they parse as valid YAML, vanish into nothing, and leave the printer
+#: running on defaults — which for `print_url_prefix` means a Bambu answering
+#: `0500-4002` while the operator looks at the line in the file that should have
+#: fixed it.
+_CREDENTIAL_KEYS = frozenset(
+    {"access_code", "serial", "api_key", "password", "print_url_prefix", "ftps_timeout_s"}
+)
+
+
+def _warn_about_stray_printer_keys(entry: dict[str, Any], key: str) -> None:
+    """Say what was ignored, and where it should have gone.
+
+    Unknown keys are not an error: refusing to start over one would make every
+    future field a breaking change for older agents. But silence is worse than
+    either — the setting is in the file, the operator can see it, and the agent
+    behaves as though it is not.
+    """
+    for name in entry:
+        if name in _PRINTER_KEYS:
+            continue
+        where = " (it belongs under credentials)" if name in _CREDENTIAL_KEYS else ""
+        logger.warning(
+            "ignored an unknown printer setting",
+            extra={"action": "config", "printer_key": key, "error": f"{name}{where}"},
+        )
+
+
 def config_from_dict(data: dict[str, Any]) -> AgentConfig:
     outbox_data = data.get("outbox") or {}
     print_files_data = data.get("print_files") or {}
@@ -281,6 +316,7 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
         if not isinstance(item, dict):
             continue
         key = _text(item.get("key"))
+        _warn_about_stray_printer_keys(item, key)
         printers.append(
             PrinterConfig(
                 key=key,
