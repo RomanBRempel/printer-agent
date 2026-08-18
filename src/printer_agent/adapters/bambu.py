@@ -59,6 +59,16 @@ BAMBU_UPLOAD_DIR = "/"
 #: a print that never starts can be diagnosed without guessing.
 BAMBU_PRINT_URL_PREFIX = "file:///sdcard/"
 
+#: How long the FTPS control channel waits for the printer to answer. The data
+#: channel inherits it, so it also bounds a single block of the transfer.
+FTPS_TIMEOUT_S = 30
+
+#: Deadline for the TLS `close_notify` handshake that ends a transfer, kept
+#: separate from — and far below — `FTPS_TIMEOUT_S`: the file is already on the
+#: printer by then, so a firmware that never answers should cost seconds, not
+#: the whole upload. See :meth:`_ImplicitFTPS.storbinary`.
+FTPS_TLS_SHUTDOWN_TIMEOUT_S = 5
+
 #: Plate inside a sliced `.3mf` project. Bambu Studio numbers plates from one
 #: and writes this path for the first of them; multi-plate projects are not a
 #: case the hub produces — it sends one part per program.
@@ -68,15 +78,16 @@ BAMBU_PROJECT_PLATE = "Metadata/plate_1.gcode"
 class _ImplicitFTPS(ftplib.FTP_TLS):
     """`ftplib` client for implicit FTPS.
 
-    Two departures from the standard class, and both are required by real
-    servers rather than by Bambu specifically:
+    Three departures from the standard class:
 
     * the control socket is wrapped in TLS as soon as it is created, because
       the server expects a handshake and not a plaintext greeting;
     * the data connection reuses the control connection's TLS session. Servers
       built on OpenSSL 1.1+ commonly require this to prove the data channel
       belongs to the authenticated session, and without it a transfer opens and
-      then dies — which reads as a network fault rather than a protocol one.
+      then dies — which reads as a network fault rather than a protocol one;
+    * the TLS shutdown at the end of a transfer is given its own short deadline
+      instead of the connection's. See :meth:`storbinary`.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -99,6 +110,46 @@ class _ImplicitFTPS(ftplib.FTP_TLS):
             session = getattr(self.sock, "session", None)
             conn = self.context.wrap_socket(conn, server_hostname=self.host, session=session)
         return conn, size
+
+    def storbinary(  # type: ignore[override]
+        self,
+        cmd: str,
+        fp: Any,
+        blocksize: int = 8192,
+        callback: Any = None,
+        rest: Any = None,
+    ) -> str:
+        """`FTP.storbinary`, but the TLS shutdown cannot hang the upload.
+
+        The standard implementation calls `unwrap()` on the data socket once the
+        file is sent, which writes a TLS `close_notify` and then *waits for the
+        peer to answer with its own*. Bambu firmware does not answer: it closes
+        the connection at the TCP level and moves on. So the wait runs to the
+        socket timeout and raises `TimeoutError("The read operation timed out")`
+        — for a file the printer has already received in full. The operator sees
+        a transfer that failed and a printer that holds the file.
+
+        Closing the data socket unannounced is what the transfer means anyway;
+        the receipt is the `226` the server sends on the control channel, which
+        is still read below. The shutdown is still *attempted*, on a deadline of
+        its own, because firmware that does answer should get a clean close.
+        """
+        self.voidcmd("TYPE I")
+        with self.transfercmd(cmd, rest) as conn:
+            while buf := fp.read(blocksize):
+                conn.sendall(buf)
+                if callback:
+                    callback(buf)
+            # Asked for by capability rather than by type: a data connection is
+            # either a TLS socket or a plain one, and only the first has an
+            # `unwrap`. It also lets the branch be tested without a TLS server.
+            unwrap = getattr(conn, "unwrap", None)
+            if unwrap is not None:
+                with suppress(OSError, ValueError):
+                    conn.settimeout(FTPS_TLS_SHUTDOWN_TIMEOUT_S)
+                    unwrap()
+        return self.voidresp()
+
 
 #: Trays per AMS unit, used to give the slots one flat numbering across units —
 #: the printer numbers trays 0..3 inside each unit and identifies the unit
@@ -480,19 +531,43 @@ class BambuAdapter(PrinterAdapter):
         return {"ok": True, "remote_name": name, "size_bytes": source.stat().st_size}
 
     def _ftps_upload(self, source: Path, name: str) -> None:
-        """Blocking half of :meth:`upload_file` — runs in a worker thread."""
+        """Blocking half of :meth:`upload_file` — runs in a worker thread.
+
+        Every failure is re-raised naming the step it happened in. A bare socket
+        error here reaches the operator as the hub's whole explanation of why a
+        job did not print, and "the read operation timed out" does not say
+        whether the printer refused the connection, refused the login, or took
+        the file — three faults with three different answers.
+        """
+        stage = "connect"
         client = _ImplicitFTPS(context=self._tls_context())
-        client.connect(host=self.printer.host, port=BAMBU_FTPS_PORT, timeout=30)
         try:
+            client.connect(
+                host=self.printer.host, port=BAMBU_FTPS_PORT, timeout=FTPS_TIMEOUT_S
+            )
+            stage = "login"
             client.login(user=BAMBU_FTPS_USER, passwd=self._access_code)
             # Encrypts the data channel too. Without it the printer accepts the
             # login and then refuses the transfer — an authentication that looks
             # like it worked, which is the confusing half of this protocol.
+            stage = "secure the data channel"
             client.prot_p()
             if BAMBU_UPLOAD_DIR not in ("", "/"):
+                stage = f"open {BAMBU_UPLOAD_DIR}"
                 client.cwd(BAMBU_UPLOAD_DIR)
+            stage = f"send {name}"
             with source.open("rb") as handle:
                 client.storbinary(f"STOR {name}", handle)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"FTPS upload to {self.printer.host}:{BAMBU_FTPS_PORT} timed out"
+                f" trying to {stage} ({exc})"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"FTPS upload to {self.printer.host}:{BAMBU_FTPS_PORT} failed"
+                f" trying to {stage}: {exc}"
+            ) from exc
         finally:
             # The printer keeps a small number of control connections and hands
             # out no more until they time out, so a leaked one costs the next

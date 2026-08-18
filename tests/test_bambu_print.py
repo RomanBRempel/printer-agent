@@ -248,7 +248,9 @@ async def test_control_connection_is_always_released(ftps, tmp_path) -> None:
 
     FakeFTPS.storbinary = explode  # type: ignore[assignment]
     try:
-        with pytest.raises(ftplib.error_perm):
+        # Отказ приходит обёрнутым: оператор читает эту строку целиком, и без
+        # шага и адреса «550 no space» не говорит, на чём именно всё встало.
+        with pytest.raises(RuntimeError, match="550 no space"):
             await adapter.upload_file(source, "part.gcode")
     finally:
         del FakeFTPS.storbinary
@@ -290,3 +292,110 @@ def test_upload_capability_follows_the_access_code() -> None:
     """
     assert make_adapter().capabilities().upload is True
     assert make_adapter(access_code="").capabilities().upload is False
+
+
+# ── Завершение передачи ─────────────────────────────────────────────────────
+
+
+class _SilentDataConnection:
+    """Сокет данных, который не отвечает на TLS `close_notify`.
+
+    Ровно поведение прошивки Bambu: она закрывает соединение на уровне TCP и
+    ничего больше не присылает.
+    """
+
+    def __init__(self) -> None:
+        self.sent = b""
+        self.timeouts: list[Any] = []
+        self.closed = False
+
+    def __enter__(self) -> "_SilentDataConnection":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.closed = True
+
+    def sendall(self, data: bytes) -> None:
+        self.sent += data
+
+    def settimeout(self, value: Any) -> None:
+        self.timeouts.append(value)
+
+    def unwrap(self) -> None:
+        raise TimeoutError("The read operation timed out")
+
+
+class _RecordingClient(bambu._ImplicitFTPS):
+    """`_ImplicitFTPS` без сети: подменены только команды управляющего канала."""
+
+    def __init__(self) -> None:  # noqa: D107 - ftplib.__init__ здесь только мешает
+        self.commands: list[str] = []
+        self.conn = _SilentDataConnection()
+
+    def voidcmd(self, cmd: str) -> str:
+        self.commands.append(cmd)
+        return "200 ok"
+
+    def transfercmd(self, cmd: str, rest: Any = None) -> Any:
+        self.commands.append(cmd)
+        return self.conn
+
+    def voidresp(self) -> str:
+        self.commands.append("<voidresp>")
+        return "226 Transfer complete"
+
+
+def test_a_printer_that_never_answers_close_notify_still_completes_the_upload(tmp_path) -> None:
+    """Файл уже на принтере — таймаут TLS-прощания не делает передачу неудачной.
+
+    Штатный `storbinary` ждёт ответного `close_notify` до таймаута сокета и
+    падает с `The read operation timed out` — про файл, который принтер принял
+    целиком. Оператор при этом видит несостоявшуюся передачу.
+    """
+    source = tmp_path / "part.gcode.3mf"
+    source.write_bytes(b"payload")
+    client = _RecordingClient()
+
+    with source.open("rb") as handle:
+        answer = client.storbinary("STOR part.gcode.3mf", handle)
+
+    assert answer == "226 Transfer complete"
+    assert client.conn.sent == b"payload"
+    assert client.conn.closed is True
+
+
+def test_the_tls_goodbye_gets_its_own_short_deadline(tmp_path) -> None:
+    """Не таймаут соединения: файл уже передан, ждать его столько незачем."""
+    source = tmp_path / "part.gcode"
+    source.write_bytes(b"x")
+    client = _RecordingClient()
+
+    with source.open("rb") as handle:
+        client.storbinary("STOR part.gcode", handle)
+
+    assert client.conn.timeouts == [bambu.FTPS_TLS_SHUTDOWN_TIMEOUT_S]
+    assert bambu.FTPS_TLS_SHUTDOWN_TIMEOUT_S < bambu.FTPS_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+async def test_a_failed_upload_names_the_step_it_died_in(ftps, tmp_path, monkeypatch) -> None:
+    """Хаб показывает оператору эту строку целиком — она должна что-то значить.
+
+    «The read operation timed out» не различает отказ в соединении, отказ в
+    логине и оборванную передачу, а лечатся они по-разному.
+    """
+    source = tmp_path / "part.gcode"
+    source.write_bytes(b"x")
+
+    def refuse(self: Any, user: str, passwd: str) -> None:
+        raise TimeoutError("The read operation timed out")
+
+    monkeypatch.setattr(FakeFTPS, "login", refuse, raising=False)
+    adapter = make_adapter()
+
+    with pytest.raises(TimeoutError) as raised:
+        await adapter.upload_file(source, "part.gcode")
+
+    message = str(raised.value)
+    assert "login" in message
+    assert "10.0.0.5:990" in message
