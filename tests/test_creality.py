@@ -7,7 +7,11 @@ K1 just finished, K2 Plus idle), trimmed to the fields the adapter reads.
 from __future__ import annotations
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
+from printer_agent.adapters import creality as creality_module
+from printer_agent.adapters.base import UnsupportedCommandError
 from printer_agent.adapters.creality import (
     CREALITY_WS_PORT,
     CrealityAdapter,
@@ -16,6 +20,8 @@ from printer_agent.adapters.creality import (
 )
 from printer_agent.config import PrinterConfig
 from printer_agent.contracts import JobStatus, PrinterStatus
+
+JPEG = b"\xff\xd8\xff\xe0" + b"snapshot" * 4
 
 PRINTING_FRAME = {
     "state": 1,
@@ -227,3 +233,94 @@ def test_discovery_record_falls_back_to_the_address() -> None:
 
     assert record["name"] == "10.0.0.5"
     assert record["model"] == ""
+
+
+class FakeStreamer:
+    """A stand-in for the printer's mjpg-streamer: one snapshot endpoint."""
+
+    def __init__(self, *, present: bool = True) -> None:
+        self.present = present
+        self.requests = 0
+        self._server: TestServer | None = None
+
+    async def start(self) -> None:
+        app = web.Application()
+        app.router.add_get("/", self._snapshot)
+        self._server = TestServer(app)
+        await self._server.start_server()
+
+    async def close(self) -> None:
+        if self._server is not None:
+            await self._server.close()
+
+    def snapshot_url(self) -> str:
+        assert self._server is not None
+        return str(self._server.make_url("/?action=snapshot"))
+
+    async def _snapshot(self, request: web.Request) -> web.Response:
+        self.requests += 1
+        if not self.present:
+            return web.Response(status=404)
+        return web.Response(body=JPEG, content_type="image/jpeg")
+
+
+def _adapter() -> CrealityAdapter:
+    return CrealityAdapter(PrinterConfig(key="k1c", brand="creality", host="10.0.0.5"))
+
+
+@pytest.mark.asyncio
+async def test_the_camera_capability_follows_a_probe(monkeypatch) -> None:
+    streamer = FakeStreamer()
+    await streamer.start()
+    adapter = _adapter()
+    monkeypatch.setattr(creality_module, "CAMERA_SNAPSHOT_CANDIDATES", (streamer.snapshot_url(),))
+    try:
+        assert adapter.capabilities().camera is False
+        await adapter._probe_camera()
+        found = adapter.capabilities().camera
+        frame = await adapter.get_camera_frame()
+    finally:
+        await adapter.disconnect()
+        await streamer.close()
+
+    assert found is True
+    assert frame == JPEG
+
+
+@pytest.mark.asyncio
+async def test_a_printer_without_a_streamer_keeps_the_flag_down(monkeypatch) -> None:
+    """The mjpg-streamer port is closed on stock firmware; the button stays off."""
+    streamer = FakeStreamer(present=False)
+    await streamer.start()
+    adapter = _adapter()
+    monkeypatch.setattr(creality_module, "CAMERA_SNAPSHOT_CANDIDATES", (streamer.snapshot_url(),))
+    try:
+        await adapter._probe_camera()
+        assert adapter.capabilities().camera is False
+        with pytest.raises(UnsupportedCommandError):
+            await adapter.get_camera_frame()
+    finally:
+        await adapter.disconnect()
+        await streamer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_configured_snapshot_url_is_trusted_without_probing(monkeypatch) -> None:
+    streamer = FakeStreamer()
+    await streamer.start()
+    printer = PrinterConfig(
+        key="k1c", brand="creality", host="10.0.0.5", camera_snapshot_url=streamer.snapshot_url()
+    )
+    adapter = CrealityAdapter(printer)
+    # A configured URL is taken as given: no candidate is ever tried.
+    monkeypatch.setattr(creality_module, "CAMERA_SNAPSHOT_CANDIDATES", ())
+    try:
+        assert adapter.capabilities().camera is True
+        await adapter._probe_camera()
+        frame = await adapter.get_camera_frame()
+    finally:
+        await adapter.disconnect()
+        await streamer.close()
+
+    assert frame == JPEG
+    assert streamer.requests == 1

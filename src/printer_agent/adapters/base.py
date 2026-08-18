@@ -40,6 +40,7 @@ class PrinterAdapter(ABC):
         file_ref: str,
         remote_name: str | None = None,
         ams_mapping: list[int] | None = None,
+        local_path: str | Path | None = None,
     ) -> dict[str, Any]:
         """Print a file already delivered to this printer.
 
@@ -47,6 +48,13 @@ class PrinterAdapter(ABC):
         what it was stored as on the printer. Adapters that address a print by
         the printer-side name need the second one, and the hub sends both rather
         than making every adapter reconstruct one from the other.
+
+        ``local_path`` is the agent's own copy, when it still has one. A printer
+        addressed only by a name cannot be asked what is inside the file, and
+        for some protocols the command depends on that — a Bambu project has to
+        name the plate to run, and the plate is a fact about the archive. Most
+        adapters ignore it; none may require it, because the copy is a cache and
+        the cache is prunable.
 
         ``ams_mapping`` is which loaded slot each filament of the program goes
         to. The hub works it out when it matches the program against the slots

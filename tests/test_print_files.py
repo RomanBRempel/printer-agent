@@ -39,6 +39,7 @@ class RecordingAdapter(PrinterAdapter):
         #: Slot mapping the hub worked out, kept separately so a test can assert
         #: it arrived — dropping it silently is the failure mode that matters.
         self.print_mappings: list[list[int] | None] = []
+        self.print_local_paths: list[Path | None] = []
 
     async def connect(self) -> None:
         return None
@@ -61,9 +62,13 @@ class RecordingAdapter(PrinterAdapter):
         file_ref: str,
         remote_name: str | None = None,
         ams_mapping: list[int] | None = None,
+        local_path: str | Path | None = None,
     ) -> dict[str, Any]:
         self.prints.append((file_ref, remote_name))
         self.print_mappings.append(ams_mapping)
+        #: Куда смотреть, чтобы прочитать содержимое файла. Принтер, к которому
+        #: обращаются по имени, о содержимом не расскажет.
+        self.print_local_paths.append(Path(local_path) if local_path else None)
         return {"ok": True}
 
 
@@ -359,3 +364,28 @@ async def test_an_unimplemented_action_is_unsupported_not_failed(processor) -> N
         adapter, {"command_id": "1045", "printer_key": "printer-1", "action": "pause"}
     )
     assert result["status"] == "unsupported"
+
+
+@pytest.mark.asyncio
+async def test_start_print_hands_the_adapter_the_local_copy(processor, adapter) -> None:
+    """Принтер, к которому обращаются по имени, о содержимом файла не расскажет.
+
+    Bambu-проект должен назвать плиту, а плита — факт про архив. Без локальной
+    копии её неоткуда взять: печать по кнопке «файл уже на принтере» не имеет за
+    собой загрузки в этой сессии.
+    """
+    command_processor, cache, _outbox = processor
+    cache.ensure_directory()
+    cache.path_for(FILE_REF).write_bytes(PAYLOAD)
+
+    await command_processor.dispatch(
+        adapter,
+        {
+            "command_id": "1055",
+            "printer_key": "printer-1",
+            "action": "start_print",
+            "args": {"file_ref": FILE_REF, "remote_name": "part.gcode.3mf"},
+        },
+    )
+
+    assert adapter.print_local_paths == [cache.path_for(FILE_REF)]

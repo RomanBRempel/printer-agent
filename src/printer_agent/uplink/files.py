@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -55,6 +56,10 @@ class PrintFileService:
 
     def has_cached(self, file_ref: str) -> bool:
         return self._cache.has(file_ref)
+
+    def cached_path(self, file_ref: str) -> Path | None:
+        """Where the delivered file sits, for an adapter that must look inside it."""
+        return self._cache.path_for(file_ref) if self._cache.has(file_ref) else None
 
     async def accept(self, adapter: PrinterAdapter, offer: dict[str, Any]) -> dict[str, Any]:
         """Fetch, verify, cache and upload one offered file.

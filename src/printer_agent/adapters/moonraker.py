@@ -226,6 +226,7 @@ class MoonrakerAdapter(PrinterAdapter):
         file_ref: str,
         remote_name: str | None = None,
         ams_mapping: list[int] | None = None,
+        local_path: str | Path | None = None,
     ) -> dict[str, Any]:
         # Klipper has no feeding system of its own, so `ams_mapping` has nothing
         # to address and is accepted only to keep one signature across adapters.

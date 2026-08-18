@@ -140,7 +140,14 @@ class CommandProcessor:
             raise RuntimeError(
                 f"print file {file_ref} is not in this agent's cache; send the file again"
             )
-        return await adapter.start_print(file_ref, remote_name, ams_mapping=ams_mapping)
+        return await adapter.start_print(
+            file_ref,
+            remote_name,
+            ams_mapping=ams_mapping,
+            # The agent's own copy, when the cache still holds it. Some protocols
+            # need what is inside the file and the printer cannot be asked.
+            local_path=self._files.cached_path(file_ref) if self._files is not None else None,
+        )
 
     async def _run(
         self,

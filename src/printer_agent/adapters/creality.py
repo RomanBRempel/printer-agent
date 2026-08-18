@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import suppress
+from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -41,6 +42,25 @@ from ..contracts import (
 from .base import PrinterAdapter, UnsupportedCommandError
 
 CREALITY_WS_PORT = 9999
+
+#: mjpg-streamer's port on a rooted K-series: the printer's own web UI loads its
+#: camera from `http://<host>:8080/?action=stream`, so the still is the same
+#: server's `?action=snapshot`. The vendor firmware does not open this port until
+#: the streamer service is running, which is why `camera` is a probe and not a
+#: brand rule — a raised flag on a printer whose streamer is off would show the
+#: operator a button that only ever answers `unsupported`.
+CREALITY_CAMERA_PORT = 8080
+
+#: Snapshot URLs tried when the printer entry names none. The first is
+#: mjpg-streamer's own; the second is the nginx-fronted layout some rooted images
+#: use. Anything else has to be configured explicitly via `camera_snapshot_url`.
+CAMERA_SNAPSHOT_CANDIDATES: tuple[str, ...] = (
+    "http://{host}:8080/?action=snapshot",
+    "http://{host}/webcam/?action=snapshot",
+)
+
+#: A snapshot request has to fail fast: it runs inside the hub's frame interval.
+CAMERA_TIMEOUT_S = 10.0
 
 #: The web UI's own cadence (`{time: 5e3}`); the firmware drops a silent client.
 HEARTBEAT_INTERVAL_S = 5.0
@@ -67,6 +87,13 @@ _CREALITY_STATE_MAP = {
 #: "print abort" — the job ended because someone stopped it, which is a finished
 #: printer with a cancelled job rather than a failure.
 CREALITY_ABORTED_STATE = 4
+
+
+def _looks_like_image(payload: bytes) -> bool:
+    """Judge a probe answer by its bytes: a captive portal also returns 200."""
+    return payload.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n")) or (
+        payload.startswith(b"RIFF") and payload[8:12] == b"WEBP"
+    )
 
 
 def normalize_creality_status(raw_state: Any) -> PrinterStatus:
@@ -153,6 +180,12 @@ class CrealityAdapter(PrinterAdapter):
         self._state: dict[str, Any] = {}
         self._connected = False
         self._last_error: str = ""
+        #: Snapshot URL, configured or found by probing. Empty means no camera,
+        #: and `capabilities.camera` says so. A separate HTTP session serves it:
+        #: the mjpg-streamer port is not the vendor WebSocket this adapter holds.
+        self._camera_url = printer.camera_snapshot_url.strip()
+        self._camera_probed = bool(self._camera_url)
+        self._http_session: aiohttp.ClientSession | None = None
 
     @property
     def _ws_url(self) -> str:
@@ -167,6 +200,9 @@ class CrealityAdapter(PrinterAdapter):
         # Wait for real state, not just a socket: callers poll immediately after.
         with suppress(TimeoutError, asyncio.TimeoutError):
             await asyncio.wait_for(self._ready_event.wait(), timeout=15)
+        # The camera rides its own HTTP port, independent of the vendor socket;
+        # probe it once here so the `hello` capabilities are already right.
+        await self._probe_camera()
 
     async def disconnect(self) -> None:
         self._stop_event.set()
@@ -177,6 +213,9 @@ class CrealityAdapter(PrinterAdapter):
         self._connection_task = None
         self._websocket = None
         self._connected = False
+        if self._http_session is not None:
+            await self._http_session.close()
+            self._http_session = None
 
     async def get_state(self) -> PrinterSnapshot:
         # The cache is only worth reporting while the session behind it is alive:
@@ -205,7 +244,9 @@ class CrealityAdapter(PrinterAdapter):
             cancel=True,
             upload=False,
             cfs=bool(self._safe_int(self._state.get("cfsConnect"))),
-            camera=False,
+            # Follows the probe, not the brand: the mjpg-streamer port is closed
+            # on stock firmware, so a raised flag would be a dead button.
+            camera=bool(self._camera_url),
         )
 
     async def start_print(
@@ -213,6 +254,7 @@ class CrealityAdapter(PrinterAdapter):
         file_ref: str,
         remote_name: str | None = None,
         ams_mapping: list[int] | None = None,
+        local_path: str | Path | None = None,
     ) -> dict[str, Any]:
         # Accepted for one signature across adapters; this printer has no
         # addressable feeding system to map filaments onto.
@@ -235,6 +277,48 @@ class CrealityAdapter(PrinterAdapter):
         if websocket is None or websocket.closed:
             raise RuntimeError(f"Creality printer {self.printer.host} is not connected")
         await websocket.send_str(json.dumps({"method": "set", "params": params}))
+
+    async def get_camera_frame(self) -> bytes:
+        if not self._camera_url:
+            raise UnsupportedCommandError(
+                f"no camera snapshot URL for {self.printer.key}; set camera_snapshot_url"
+            )
+        session = self._ensure_http_session()
+        async with session.get(
+            self._camera_url, timeout=aiohttp.ClientTimeout(total=CAMERA_TIMEOUT_S)
+        ) as response:
+            response.raise_for_status()
+            frame = await response.read()
+        if not frame:
+            raise RuntimeError(f"camera at {self._camera_url} returned an empty frame")
+        return frame
+
+    async def _probe_camera(self) -> None:
+        """Find a snapshot endpoint once, or leave the capability switched off."""
+        if self._camera_probed:
+            return
+        self._camera_probed = True
+        session = self._ensure_http_session()
+        for template in CAMERA_SNAPSHOT_CANDIDATES:
+            url = template.format(host=self.printer.host)
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=CAMERA_TIMEOUT_S)
+                ) as response:
+                    if response.status != 200:
+                        continue
+                    content_type = response.headers.get("Content-Type", "")
+                    frame = await response.read()
+            except Exception:
+                continue
+            if frame and (content_type.startswith("image/") or _looks_like_image(frame)):
+                self._camera_url = url
+                return
+
+    def _ensure_http_session(self) -> aiohttp.ClientSession:
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
 
     async def _run_connection_loop(self) -> None:
         loop = asyncio.get_running_loop()

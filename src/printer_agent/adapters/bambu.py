@@ -530,6 +530,7 @@ class BambuAdapter(PrinterAdapter):
         file_ref: str,
         remote_name: str | None = None,
         ams_mapping: list[int] | None = None,
+        local_path: str | Path | None = None,
     ) -> dict[str, Any]:
         """Start a print of a file already uploaded to the printer's storage.
 
@@ -570,7 +571,7 @@ class BambuAdapter(PrinterAdapter):
         }
         if name.lower().endswith(".3mf"):
             payload["command"] = "project_file"
-            payload["param"] = self._plate_by_name.get(name, BAMBU_PROJECT_PLATE)
+            payload["param"] = await self._plate_for(name, local_path)
             # Zeroes, not the hub's identifiers: these name a task in Bambu's
             # own cloud, and a foreign number here has been known to make the
             # printer look for a project it cannot fetch.
@@ -616,6 +617,22 @@ class BambuAdapter(PrinterAdapter):
         except ValueError:
             return float(FTPS_TIMEOUT_S)
         return configured if configured > 0 else float(FTPS_TIMEOUT_S)
+
+    async def _plate_for(self, name: str, local_path: str | Path | None) -> str:
+        """Which plate to run, preferring the copy on disk over what we recall.
+
+        The disk answers for the file as it is now; the mapping only for a file
+        this process uploaded. Both matter: a print started without a fresh
+        offer — the hub's "file is already on the printer" button — has no
+        upload behind it in this session, and a cache pruned since the upload
+        has no file. Neither is an error, and neither may be required.
+        """
+        if local_path is not None:
+            plate = await asyncio.to_thread(plate_in_project, local_path)
+            if plate:
+                self._plate_by_name[name] = plate
+                return plate
+        return self._plate_by_name.get(name, BAMBU_PROJECT_PLATE)
 
     def _print_url_prefix(self) -> str:
         """Where the printer expects to find the uploaded file.

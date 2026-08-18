@@ -520,3 +520,31 @@ async def test_a_start_without_the_upload_falls_back_to_the_first_plate(publishe
     # Возвращается наверх, потому что MQTT ничего не подтверждает: печать,
     # которая не началась, диагностируется только по тому, что было послано.
     assert result["param"] == bambu.BAMBU_PROJECT_PLATE
+
+
+@pytest.mark.asyncio
+async def test_a_start_reads_the_plate_from_the_copy_on_disk(published, tmp_path) -> None:
+    """Печать по кнопке «файл уже на принтере» не имеет за собой загрузки.
+
+    Это обычный путь в очереди хаба, и именно на нём память адаптера пуста.
+    """
+    source = make_project(tmp_path / "part.gcode.3mf", 2)
+    adapter = make_adapter()
+
+    await adapter.start_print("f00d", "part.gcode.3mf", local_path=source)
+
+    assert published.messages[0]["print"]["param"] == "Metadata/plate_2.gcode"
+
+
+@pytest.mark.asyncio
+async def test_a_pruned_cache_falls_back_instead_of_failing(published, tmp_path) -> None:
+    """Кэш доставленных файлов чистится по возрасту и размеру.
+
+    Требовать локальную копию значило бы, что через трое суток печать того же
+    файла перестаёт запускаться.
+    """
+    adapter = make_adapter()
+
+    await adapter.start_print("f00d", "part.gcode.3mf", local_path=tmp_path / "gone.3mf")
+
+    assert published.messages[0]["print"]["param"] == bambu.BAMBU_PROJECT_PLATE
