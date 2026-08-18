@@ -60,8 +60,15 @@ BAMBU_UPLOAD_DIR = "/"
 BAMBU_PRINT_URL_PREFIX = "file:///sdcard/"
 
 #: How long the FTPS control channel waits for the printer to answer. The data
-#: channel inherits it, so it also bounds a single block of the transfer.
-FTPS_TIMEOUT_S = 30
+#: channel inherits it, so it also bounds a single block of the transfer — which
+#: is why the default is generous rather than snappy: on shop-floor Wi-Fi a
+#: printer routinely stops reading for tens of seconds in the middle of a
+#: multi-megabyte file, and a timeout there is reported as "the read operation
+#: timed out" — a message that reads like a broken printer, not like a slow link.
+#: Overridable per printer (`credentials.ftps_timeout_s` in `agent.yaml`) for a
+#: link that needs even more; a value that is not a positive number is ignored
+#: rather than obeyed, because a zero here would mean "never wait".
+FTPS_TIMEOUT_S = 120
 
 #: Deadline for the TLS `close_notify` handshake that ends a transfer, kept
 #: separate from — and far below — `FTPS_TIMEOUT_S`: the file is already on the
@@ -480,6 +487,22 @@ class BambuAdapter(PrinterAdapter):
             "use_ams": payload["use_ams"],
         }
 
+    def _ftps_timeout(self) -> float:
+        """How long one FTPS operation may stall before the upload is given up.
+
+        Same shape as :meth:`_print_url_prefix`: a per-printer override with a
+        documented default, because the answer depends on the link rather than
+        on the model. Anything that is not a positive number falls back to the
+        default — a zero or a typo would otherwise mean "wait forever" or "give
+        up at once", and both fail in a way the operator cannot read.
+        """
+        raw = str(self.printer.credentials.get("ftps_timeout_s", "")).strip()
+        try:
+            configured = float(raw)
+        except ValueError:
+            return float(FTPS_TIMEOUT_S)
+        return configured if configured > 0 else float(FTPS_TIMEOUT_S)
+
     def _print_url_prefix(self) -> str:
         """Where the printer expects to find the uploaded file.
 
@@ -543,7 +566,7 @@ class BambuAdapter(PrinterAdapter):
         client = _ImplicitFTPS(context=self._tls_context())
         try:
             client.connect(
-                host=self.printer.host, port=BAMBU_FTPS_PORT, timeout=FTPS_TIMEOUT_S
+                host=self.printer.host, port=BAMBU_FTPS_PORT, timeout=self._ftps_timeout()
             )
             stage = "login"
             client.login(user=BAMBU_FTPS_USER, passwd=self._access_code)

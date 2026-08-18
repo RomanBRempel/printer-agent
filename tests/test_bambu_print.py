@@ -399,3 +399,41 @@ async def test_a_failed_upload_names_the_step_it_died_in(ftps, tmp_path, monkeyp
     message = str(raised.value)
     assert "login" in message
     assert "10.0.0.5:990" in message
+
+
+# ─── FTPS timeout is a link property, not a model property ──────────────────
+#
+# 30 s bounded a single block of the transfer, and on shop-floor Wi-Fi a printer
+# routinely stops reading for longer in the middle of a multi-megabyte file. The
+# failure surfaces as "the read operation timed out", which reads like a broken
+# printer rather than a slow link — so the default is generous and the value is
+# overridable per printer.
+
+
+def _adapter_with(credentials: dict) -> object:
+    from printer_agent.adapters.bambu import BambuAdapter
+    from printer_agent.config import PrinterConfig
+
+    return BambuAdapter(
+        PrinterConfig(
+            key="printer-1", brand="bambu", host="10.0.0.5", credentials=credentials
+        )
+    )
+
+
+def test_ftps_timeout_defaults_to_the_documented_value():
+    from printer_agent.adapters.bambu import FTPS_TIMEOUT_S
+
+    assert _adapter_with({})._ftps_timeout() == float(FTPS_TIMEOUT_S)
+
+
+def test_ftps_timeout_can_be_raised_per_printer():
+    assert _adapter_with({"ftps_timeout_s": "300"})._ftps_timeout() == 300.0
+
+
+def test_unusable_ftps_timeout_falls_back_instead_of_meaning_never():
+    """A zero or a typo must not become "wait forever" or "give up at once"."""
+    from printer_agent.adapters.bambu import FTPS_TIMEOUT_S
+
+    for bad in ("0", "-5", "soon", ""):
+        assert _adapter_with({"ftps_timeout_s": bad})._ftps_timeout() == float(FTPS_TIMEOUT_S)
