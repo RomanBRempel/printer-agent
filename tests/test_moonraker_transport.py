@@ -151,3 +151,23 @@ def test_every_method_the_adapter_calls_has_a_rest_route():
             "printer.print.resume", "printer.print.cancel"}
 
     assert used <= set(REST_ROUTES)
+
+
+def test_filament_used_travels_as_millimetres():
+    adapter = make_adapter(_FakeSession())
+
+    snapshot = adapter._build_snapshot_from_response(
+        {"status": {"print_stats": {"state": "printing", "filament_used": 4123.5}}}
+    )
+
+    assert snapshot.job.filament_used_mm == pytest.approx(4123.5)
+
+
+def test_firmware_without_the_counter_omits_the_field():
+    """`0` is a print that just started; "not reported" has to look different."""
+    adapter = make_adapter(_FakeSession())
+
+    snapshot = adapter._build_snapshot_from_response({"status": {"print_stats": {"state": "printing"}}})
+
+    assert snapshot.job.filament_used_mm is None
+    assert "filament_used_mm" not in snapshot.to_dict()["job"]

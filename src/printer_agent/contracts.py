@@ -150,6 +150,17 @@ class JobSnapshot:
     time_elapsed_s: int | None = None
     time_remaining_s: int | None = None
     status: JobStatus | None = None
+    #: Filament extruded since this print started, in millimetres. A running
+    #: counter, not a total: it only grows while the print runs, and the hub
+    #: keeps the largest value it has seen so a firmware restart cannot subtract
+    #: material already spent. Left unset by adapters whose firmware does not
+    #: expose it — `None` means "not reported", while `0.0` is a real value for
+    #: a print that has just started.
+    filament_used_mm: float | None = None
+    #: Mass, for firmware that reports it directly. Nothing computes it here:
+    #: length-to-mass needs the filament diameter and the material density, and
+    #: the printer knows neither. The hub prefers this over its own estimate.
+    filament_used_g: float | None = None
 
 
 @dataclass(slots=True)

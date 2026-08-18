@@ -421,6 +421,11 @@ class MoonrakerAdapter(PrinterAdapter):
             time_elapsed_s=self._safe_int(print_duration),
             time_remaining_s=time_remaining,
             status=job_status_for(PrinterStatus.printing if is_active else printer_status),
+            # Klipper counts extruded filament per print and resets it with the
+            # next one, which is exactly the contract's semantics. Absent on
+            # very old builds: leave the field unset rather than send 0, since
+            # zero is what a print that just started legitimately reports.
+            filament_used_mm=self._safe_float(print_stats.get("filament_used")),
         )
         temps = TemperatureSnapshot(
             nozzle=self._safe_float(extruder.get("temperature")),

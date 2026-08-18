@@ -135,7 +135,7 @@ Batch snapshots, lossy delivery.
       "printer_key": "printer-1",
       "status": "printing",
       "status_raw": "printing",
-      "job": { "name": "benchy", "progress_pct": 42.5 },
+      "job": { "name": "benchy", "progress_pct": 42.5, "filament_used_mm": 4123.5 },
       "temps": { "nozzle": 215.0, "bed": 60.0 },
       "error": {},
       "capabilities": { "pause": true },
@@ -219,6 +219,18 @@ number; no adapter sends it yet, and it is optional when one does.
 snapshot can wait in the outbox for the whole length of an outage. A receiver
 that reads the value as relative to processing time overstates the remaining
 time by the age of the message.
+
+**`job.filament_used_mm` is a running counter of the current print, not a
+total.** It reports how much filament the machine has extruded since this print
+started, and it only grows while the print runs. It is optional: an adapter whose
+firmware does not expose the figure omits the key rather than sending `0`, since
+zero is a real value — a print that has just started. The hub keeps the largest
+value it has seen for a job, so a firmware restart that resets the counter
+mid-print cannot subtract material that was already spent. Grams are not part of
+this field: converting length to mass needs the filament diameter and the
+material density, and the printer reports neither. An adapter that gets a mass
+straight from the firmware sends `job.filament_used_g` instead, and the hub
+prefers it over its own estimate.
 
 **`job.status` and `status` are separate vocabularies.** `idle`, `offline` and
 `maintenance` describe a machine and have no job counterpart, so the agent omits
