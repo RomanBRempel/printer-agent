@@ -148,6 +148,20 @@ async def _probe_moonraker_host(
     return None
 
 
+def _safe_upload_name(name: str) -> str:
+    """Strip what would break an unquoted `Content-Disposition` filename.
+
+    Sending the name raw is what keeps non-ASCII intact (see
+    :meth:`MoonrakerAdapter.upload_file`), and the price is that a double quote
+    or a line break in it would end the header early — a malformed request, or
+    worse, a header the file's own name got to write. Neither belongs in a
+    print file name, so they are replaced rather than refused: the hub named
+    this file and the operator is waiting for it, and an underscore is a better
+    answer than a job that cannot be delivered at all.
+    """
+    return "".join("_" if ch in '"\r\n' else ch for ch in name)
+
+
 class MoonrakerAdapter(PrinterAdapter):
     def __init__(self, printer: PrinterConfig):
         super().__init__(printer)
@@ -248,15 +262,26 @@ class MoonrakerAdapter(PrinterAdapter):
         build has, including Creality's fork — unlike `/server/jsonrpc`, which
         is why this one does not go through :meth:`_call`. The file is streamed
         from disk: the caller's copy is the only one that exists.
+
+        `quote_fields=False` is the load-bearing argument. aiohttp defaults to
+        percent-encoding a non-ASCII `filename` in the `Content-Disposition`
+        header, and Moonraker stores that header verbatim — so a Cyrillic name
+        arrives on the printer as the literal 90-character string
+        `%D0%B7%D0%B0%D0%BA...`, and the later `printer.print.start`, which asks
+        for the *real* name, fails with `Internal error on command:
+        SDCARD_PRINT_FILE`. The operator sees an unreadable file on the printer
+        and a print that will not start, with nothing connecting the two.
+        Browsers send the raw UTF-8 bytes, which is what Moonraker's own web UI
+        does and what this now does.
         """
         source = Path(local_path)
         if not source.is_file():
             raise RuntimeError(f"{source} is not a file")
-        name = (remote_name or source.name).strip() or source.name
+        name = _safe_upload_name((remote_name or source.name).strip() or source.name)
 
         session = self._ensure_session()
         with source.open("rb") as handle:
-            form = aiohttp.FormData()
+            form = aiohttp.FormData(quote_fields=False)
             form.add_field("root", UPLOAD_ROOT)
             # The print is started by its own command, with its own command_id
             # and its own result; starting it here would leave that print with

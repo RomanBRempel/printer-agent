@@ -280,3 +280,49 @@ async def test_start_without_a_preceding_upload_uses_the_offered_name() -> None:
 
     assert hub.starts == ["job.gcode"]
 
+
+
+@pytest.mark.asyncio
+async def test_a_cyrillic_name_reaches_the_printer_unencoded(tmp_path) -> None:
+    """Имя уходит сырым UTF-8, а не percent-encoded.
+
+    aiohttp по умолчанию кодирует не-ASCII `filename` в заголовке
+    `Content-Disposition`, а Moonraker сохраняет заголовок как есть — файл на
+    принтере называется `%D0%B7%D0%B0%D0%BA...`, и следующий за загрузкой старт,
+    который просит настоящее имя, падает с `Internal error on
+    command:SDCARD_PRINT_FILE`. Оператор видит на принтере нечитаемое имя и
+    печать, которая не начинается, и ничто не связывает одно с другим.
+    """
+    hub = FakeMoonraker()
+    adapter = await make_adapter(hub)
+    source = tmp_path / "pf_7f3a"
+    source.write_bytes(GCODE)
+    name = "законцовка левая^TRK_rev1_PETG_1h12m.gcode"
+    try:
+        await adapter.upload_file(source, name)
+    finally:
+        await adapter.disconnect()
+        await hub.close()
+
+    assert hub.uploads[0]["filename"] == name
+    assert "%D0" not in hub.uploads[0]["filename"]
+
+
+@pytest.mark.asyncio
+async def test_a_quote_in_the_name_cannot_close_the_header(tmp_path) -> None:
+    """Имя больше не экранируется, значит кавычкой заголовок можно оборвать.
+
+    Отказать нельзя: имя дал хаб, оператор ждёт файл. Подчёркивание — лучший
+    ответ, чем недоставленная работа.
+    """
+    hub = FakeMoonraker()
+    adapter = await make_adapter(hub)
+    source = tmp_path / "pf_7f3a"
+    source.write_bytes(GCODE)
+    try:
+        await adapter.upload_file(source, 'bad"name.gcode')
+    finally:
+        await adapter.disconnect()
+        await hub.close()
+
+    assert hub.uploads[0]["filename"] == "bad_name.gcode"
