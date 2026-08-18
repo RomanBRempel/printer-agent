@@ -50,6 +50,12 @@ BAMBU_USER_CANCELLED = 50348044
 #: in here is reported as its code, which is now a code that can be looked up.
 BAMBU_PRINT_ERRORS = {
     "0300-400C": "Print cancelled by user",
+    # Read off an H2D screen on 18.08.2026, in the printer's own words: the
+    # `url` the print command carried names a location this model does not
+    # serve. The default `file:///sdcard/` addresses the X-series SD card;
+    # other series expect the FTP root, which is where the upload puts the
+    # file. Set `print_url_prefix` for the printer — see `_print_url_prefix`.
+    "0500-4002": "Unsupported file path or name — check print_url_prefix",
     "0500-4003": "The printer could not parse the print file",
 }
 
@@ -83,6 +89,14 @@ BAMBU_UPLOAD_DIR = "/"
 #: fact for the camera). Overridden per printer by `credentials.print_url_prefix`
 #: in `agent.yaml`; the value actually used is returned in the command result so
 #: a print that never starts can be diagnosed without guessing.
+#:
+#: Measured on two machines on 18.08.2026, both holding their uploads in the FTP
+#: root: an A1 mini *accepts* `file:///sdcard/` and resolves it to that root — it
+#: failed the same print on the plate instead, `0500-4003` — while an H2D refuses
+#: the identical address with `0500-4002`, "unsupported file path", and needs
+#: `file:///`. So the FTP layout does not predict the answer and neither does the
+#: brand; only the printer does, which is why this is a setting and why a wrong
+#: one now names itself in the error rather than failing mute.
 BAMBU_PRINT_URL_PREFIX = "file:///sdcard/"
 
 #: How long the FTPS control channel waits for the printer to answer. The data

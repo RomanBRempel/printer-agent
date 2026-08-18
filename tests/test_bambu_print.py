@@ -548,3 +548,20 @@ async def test_a_pruned_cache_falls_back_instead_of_failing(published, tmp_path)
     await adapter.start_print("f00d", "part.gcode.3mf", local_path=tmp_path / "gone.3mf")
 
     assert published.messages[0]["print"]["param"] == bambu.BAMBU_PROJECT_PLATE
+
+
+def test_known_codes_are_translated_not_echoed():
+    """Подтверждённый код читается словами, неизвестный — остаётся кодом.
+
+    `0500-4002` прочитан с экрана H2D 18.08.2026: «неподдерживаемый путь или
+    имя файла». Догадка здесь была бы хуже голого кода — она отправляет
+    оператора искать не ту неисправность, — поэтому в таблицу попадает только
+    то, что кто-то видел своими глазами.
+    """
+    from printer_agent.adapters.bambu import BambuAdapter
+
+    assert "Unsupported file path" in BambuAdapter._bambu_error_message(0x05004002)
+    assert "print_url_prefix" in BambuAdapter._bambu_error_message(0x05004002)
+    assert "could not parse" in BambuAdapter._bambu_error_message(0x05004003)
+    # Неизвестный код не выдумывается: печатается в той форме, что на экране.
+    assert BambuAdapter._bambu_error_message(0x05009999) == "Bambu error 0500-9999"

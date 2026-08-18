@@ -144,9 +144,17 @@ def test_an_error_code_is_printed_the_way_the_printer_prints_it(raw: int, printe
 
 
 def test_a_confirmed_code_is_explained_and_an_unknown_one_is_not_invented() -> None:
-    """Выдуманный перевод хуже голого кода: он отправляет искать не ту поломку."""
+    """Выдуманный перевод хуже голого кода: он отправляет искать не ту поломку.
+
+    `0500-4002` служил здесь примером неизвестного кода, пока 18.08.2026 его не
+    прочитали с экрана H2D — «неподдерживаемый путь или имя файла». Пример
+    заменён на код, которого никто не видел: в таблицу попадает только
+    подтверждённое, и тест обязан сторожить именно это правило, а не конкретное
+    число.
+    """
     assert "parse" in BambuAdapter._bambu_error_message(83902467)
-    assert BambuAdapter._bambu_error_message(83902466) == "Bambu error 0500-4002"
+    assert "Unsupported file path" in BambuAdapter._bambu_error_message(83902466)
+    assert BambuAdapter._bambu_error_message(0x05009999) == "Bambu error 0500-9999"
 
 
 def test_cancelling_a_print_still_reads_as_a_cancellation() -> None:
