@@ -25,9 +25,12 @@ JPEG = b"\xff\xd8\xff\xe0" + b"snapshot" * 4
 class FakeMoonraker:
     """Enough of Moonraker to check what the adapter sends it."""
 
-    def __init__(self, *, jsonrpc: bool = False, webcam: bool = True):
+    def __init__(self, *, jsonrpc: bool = False, webcam: bool = True, stored_as: str | None = None):
         self.jsonrpc = jsonrpc
         self.webcam = webcam
+        #: What the upload reports as the stored path. Real Moonraker is free to
+        #: normalise the offered name, and a print is addressed by what it made.
+        self.stored_as = stored_as
         self.uploads: list[dict[str, Any]] = []
         self.starts: list[str] = []
         self.jsonrpc_calls: list[dict[str, Any]] = []
@@ -77,7 +80,13 @@ class FakeMoonraker:
                 fields[str(part.name)] = (await part.read()).decode()
         self.uploads.append(fields)
         return web.json_response(
-            {"item": {"path": fields.get("filename", ""), "root": "gcodes"}, "print_started": False},
+            {
+                "item": {
+                    "path": self.stored_as or fields.get("filename", ""),
+                    "root": "gcodes",
+                },
+                "print_started": False,
+            },
             status=201,
         )
 
@@ -223,3 +232,51 @@ async def test_a_configured_snapshot_url_is_trusted_without_probing(monkeypatch)
     finally:
         await adapter.disconnect()
         await hub.close()
+
+
+@pytest.mark.asyncio
+async def test_start_uses_the_path_the_upload_made(tmp_path) -> None:
+    """A print is addressed by what Moonraker stored, not by what it was offered.
+
+    Moonraker normalises the offered name, and Klipper answers a request for a
+    file it does not have with "Internal error on command:SDCARD_PRINT_FILE" —
+    an error that names neither the file nor the reason, so the operator reads
+    it as a broken printer rather than a renamed file.
+    """
+    hub = FakeMoonraker(stored_as="PQ-000011.gcode")
+    adapter = await make_adapter(hub)
+    source = tmp_path / "pf_7f3a"
+    source.write_bytes(GCODE)
+    try:
+        upload = await adapter.upload_file(source, "законцовка левая^TRK.gcode")
+        result = await adapter.start_print("pf_7f3a", "законцовка левая^TRK.gcode")
+    finally:
+        await adapter.disconnect()
+        await hub.close()
+
+    assert upload["path"] == "PQ-000011.gcode"
+    assert hub.starts == ["PQ-000011.gcode"]
+    # Обе величины остаются в ответе: по одной ищут файл на принтере, по другой
+    # — заявку в хабе.
+    assert result["filename"] == "PQ-000011.gcode"
+    assert result["requested_name"] == "законцовка левая^TRK.gcode"
+
+
+@pytest.mark.asyncio
+async def test_start_without_a_preceding_upload_uses_the_offered_name() -> None:
+    """Перезапуск агента между загрузкой и стартом — прежнее поведение.
+
+    Соответствие «имя → путь» живёт в памяти адаптера: после перезапуска его
+    нет, и обращаться остаётся по имени от хаба. Это не регрессия, а то, как
+    работало всегда; выдумывать путь агент не станет.
+    """
+    hub = FakeMoonraker(stored_as="normalised.gcode")
+    adapter = await make_adapter(hub)
+    try:
+        await adapter.start_print("pf_7f3a", "job.gcode")
+    finally:
+        await adapter.disconnect()
+        await hub.close()
+
+    assert hub.starts == ["job.gcode"]
+

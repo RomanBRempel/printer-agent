@@ -160,6 +160,12 @@ class MoonrakerAdapter(PrinterAdapter):
         #: and `capabilities.camera` says so.
         self._camera_url = printer.camera_snapshot_url.strip()
         self._camera_probed = bool(self._camera_url)
+        #: Requested upload name -> the path Moonraker actually stored it under.
+        #: Moonraker is free to normalise what it is given, and a print is
+        #: addressed by the stored path, not by the name we asked for. Empty
+        #: after a restart, which is the pre-existing behaviour rather than a
+        #: regression: the start then falls back to the hub's name.
+        self._stored_paths: dict[str, str] = {}
 
     async def connect(self) -> None:
         self._ensure_session()
@@ -209,14 +215,19 @@ class MoonrakerAdapter(PrinterAdapter):
     ) -> dict[str, Any]:
         # Klipper has no feeding system of its own, so `ams_mapping` has nothing
         # to address and is accepted only to keep one signature across adapters.
-        # Moonraker addresses a print by the name the file has on the printer,
-        # which is what the upload put there — the cache's file_ref never
-        # reaches the machine.
-        filename = (remote_name or file_ref or "").strip()
-        if not filename:
+        # Moonraker addresses a print by the path the file HAS on the printer,
+        # and that is not always the name it was offered: the upload reply names
+        # the stored path, and Moonraker is free to normalise what it was given.
+        # Asking for the name we sent instead of the path it made is how a print
+        # fails with "Internal error on command:SDCARD_PRINT_FILE" — an error
+        # that names neither the file nor the reason, so the operator reads it
+        # as a broken printer.
+        requested = (remote_name or file_ref or "").strip()
+        if not requested:
             raise RuntimeError("start_print needs a file name")
+        filename = self._stored_paths.get(requested, requested)
         await self._call("printer.print.start", {"filename": filename})
-        return {"ok": True, "filename": filename}
+        return {"ok": True, "filename": filename, "requested_name": requested}
 
     async def pause(self) -> dict[str, Any]:
         await self._call("printer.print.pause")
@@ -262,7 +273,11 @@ class MoonrakerAdapter(PrinterAdapter):
 
         item = body.get("item") if isinstance(body, dict) else None
         stored = item.get("path") if isinstance(item, dict) else None
-        return {"ok": True, "remote_name": name, "path": str(stored or name), "root": UPLOAD_ROOT}
+        path = str(stored or name)
+        # Remembered so the follow-up `start_print` addresses the file by what
+        # Moonraker made of the name, not by what it was offered.
+        self._stored_paths[name] = path
+        return {"ok": True, "remote_name": name, "path": path, "root": UPLOAD_ROOT}
 
     async def get_camera_frame(self) -> bytes:
         if not self._camera_url:
