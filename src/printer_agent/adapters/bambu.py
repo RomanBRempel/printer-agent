@@ -4,6 +4,7 @@ import asyncio
 import ftplib
 import json
 import ssl
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,26 @@ def normalize_bambu_status(raw_status: str) -> PrinterStatus:
     return _BAMBU_STATUS_MAP.get(raw_status.lower(), PrinterStatus.maintenance)
 
 BAMBU_USER_CANCELLED = 50348044
+
+#: `print_error` values whose meaning we have actually confirmed, keyed by the
+#: printed form. Deliberately short: a guessed translation is worse than the
+#: bare code, because it sends the operator after the wrong fault. Anything not
+#: in here is reported as its code, which is now a code that can be looked up.
+BAMBU_PRINT_ERRORS = {
+    "0300-400C": "Print cancelled by user",
+    "0500-4003": "The printer could not parse the print file",
+}
+
+#: How long the MQTT session may be down before the printer is called offline.
+#: Not zero: the session drops and comes back on its own — a Wi-Fi hiccup, the
+#: broker evicting a duplicate client id — and a printer that flipped to offline
+#: and back on every one of those would write two durable outbox rows each time.
+#: Long enough to cover a reconnect, short enough that a machine someone
+#: unplugged does not keep reporting the temperature it had when it died.
+#:
+#: paho notices a dead link about 1.5 keepalives in (45 s at `keepalive=30`), so
+#: the honest end-to-end figure is that plus this.
+BAMBU_OFFLINE_GRACE_S = 30.0
 
 #: Implicit FTPS port. Bambu wraps the control channel in TLS from the first
 #: byte instead of upgrading a plain session with `AUTH TLS` on 21, which is why
@@ -312,6 +333,10 @@ class BambuAdapter(PrinterAdapter):
         self._latest_error: dict[str, Any] | None = None
         self._latest_snapshot: PrinterSnapshot | None = None
         self._connected = False
+        #: When the MQTT session was last known to be down, on the monotonic
+        #: clock. Set from the start: an adapter that has never connected has
+        #: been offline for its whole life, which is the truth about it.
+        self._offline_since: float | None = time.monotonic()
         self._message_count = 0
         #: Why the subscription is not delivering, kept so an empty cache can say
         #: what went wrong instead of only that it is empty.
@@ -371,22 +396,58 @@ class BambuAdapter(PrinterAdapter):
         # Studio when the agent started answers nothing at all. Retrying on the
         # poll is what lets the camera appear once that client goes away.
         self._schedule_camera_probe()
+        # The cache is the whole state of a Bambu here, and it does not expire on
+        # its own: the printer pushes on change, so a machine someone unplugged
+        # simply stops saying anything. Without this the adapter went on serving
+        # the last report forever — the hub showed an idle printer at 24 °C, and
+        # the only sign anything was wrong was that nothing ever changed.
+        if self._offline_for() >= BAMBU_OFFLINE_GRACE_S:
+            return self._offline_snapshot()
         if self._latest_snapshot is not None and self._connected:
             return self._latest_snapshot
         if self._latest_print is None:
-            return PrinterSnapshot(
-                printer_key=self.printer.key,
-                status=PrinterStatus.offline,
-                status_raw="offline",
-                job=JobSnapshot(),
-                temps=TemperatureSnapshot(),
-                error=ErrorSnapshot(code="offline", message=self._empty_cache_message()),
-                capabilities=self.capabilities(),
-                ts=utc_now_iso(),
-            )
+            return self._offline_snapshot()
         snapshot = self._snapshot_from_state(self._latest_print, self._latest_info, self._latest_error)
         self._latest_snapshot = snapshot
         return snapshot
+
+    def _set_connected(self, connected: bool) -> None:
+        """One place that owns the flag, so the clock cannot drift from it."""
+        if connected:
+            self._offline_since = None
+        elif self._offline_since is None:
+            self._offline_since = time.monotonic()
+        self._connected = connected
+
+    def _offline_for(self) -> float:
+        """Seconds the MQTT session has been down; `0.0` while it is up."""
+        if self._connected or self._offline_since is None:
+            return 0.0
+        return time.monotonic() - self._offline_since
+
+    def _offline_snapshot(self) -> PrinterSnapshot:
+        return PrinterSnapshot(
+            printer_key=self.printer.key,
+            status=PrinterStatus.offline,
+            status_raw="offline",
+            job=JobSnapshot(),
+            temps=TemperatureSnapshot(),
+            error=ErrorSnapshot(code="offline", message=self._offline_message()),
+            capabilities=self.capabilities(),
+            ts=utc_now_iso(),
+        )
+
+    def _offline_message(self) -> str:
+        """Why, in the words the operator needs: never connected, or lost when.
+
+        The two are different jobs. One says the printer was never configured
+        reachably; the other says a machine that was working stopped answering,
+        and how long ago — which is what tells someone to go and look at it.
+        """
+        if self._latest_print is None:
+            return self._empty_cache_message()
+        detail = f": {self._last_error}" if self._last_error else ""
+        return f"Bambu stopped answering {int(self._offline_for())}s ago{detail}"
 
     def _empty_cache_message(self) -> str:
         if not self._serial_number:
@@ -632,7 +693,7 @@ class BambuAdapter(PrinterAdapter):
     async def _run_connection_loop(self) -> None:
         serial = self._serial_number
         if not serial:
-            self._connected = False
+            self._set_connected(False)
             self._connected_event.set()
             return
 
@@ -650,7 +711,7 @@ class BambuAdapter(PrinterAdapter):
                     tls_insecure=True,
                     timeout=10,
                 ) as client:
-                    self._connected = True
+                    self._set_connected(True)
                     self._last_error = ""
                     self._connected_event.set()
                     await client.subscribe(f"device/{serial}/report")
@@ -674,7 +735,7 @@ class BambuAdapter(PrinterAdapter):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._connected = False
+                self._set_connected(False)
                 self._last_error = str(exc) or exc.__class__.__name__
                 if not self._connected_event.is_set():
                     self._connected_event.set()
@@ -790,7 +851,12 @@ class BambuAdapter(PrinterAdapter):
             error_message = self._bambu_error_message(error_code)
         if status == PrinterStatus.error and error_code == 0:
             error_message = "Print stopped by user"
-        error = ErrorSnapshot(code=str(error_code) if error_code is not None else None, message=error_message)
+        error = ErrorSnapshot(
+            # The printed form, not the raw integer: this is the string the
+            # operator reads off the printer and types into a search box.
+            code=BambuAdapter._bambu_error_code(error_code) if error_code else None,
+            message=error_message,
+        )
         capabilities = self.capabilities()
         return PrinterSnapshot(
             printer_key=self.printer.key,
@@ -840,7 +906,19 @@ class BambuAdapter(PrinterAdapter):
         return None
 
     @staticmethod
+    def _bambu_error_code(code: int) -> str:
+        """`print_error` in the form the printer's own screen shows.
+
+        The MQTT report carries a 32-bit integer; the machine, the wiki and
+        every forum thread use the two hex halves with a dash. `83902467` finds
+        nothing anywhere — `0500-4003` finds the answer — and the operator
+        standing at the printer has the second one in front of them, so the two
+        surfaces have to agree before anyone can connect them.
+        """
+        return f"{code:08X}"[:4] + "-" + f"{code:08X}"[4:]
+
+    @staticmethod
     def _bambu_error_message(code: int) -> str:
-        if code == BAMBU_USER_CANCELLED:
-            return "Print cancelled by user"
-        return f"Bambu error code {code}"
+        printed = BambuAdapter._bambu_error_code(code)
+        known = BAMBU_PRINT_ERRORS.get(printed)
+        return f"{printed}: {known}" if known else f"Bambu error {printed}"
