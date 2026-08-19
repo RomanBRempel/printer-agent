@@ -173,6 +173,49 @@ editor that does not silently blank a working credential.
 `inventory`, this message is never sent unsolicited: settings change because
 someone changed them, and whoever did already knows.
 
+### `log`
+
+A tail of the agent's own log file, in answer to a `log_request`.
+
+```json
+{
+  "location_key": "loc-001",
+  "agent_version": "0.1.0a26",
+  "request_msg_id": "uuid-of-the-log-request-envelope",
+  "file": "agent.log",
+  "files": [
+    { "name": "agent.log", "size_bytes": 725011, "modified": "2026-08-19T12:04:11Z" },
+    { "name": "agent.log.2026-08-18", "size_bytes": 2097081, "modified": "2026-08-19T00:00:02Z" }
+  ],
+  "lines": [
+    "ts=2026-08-19 12:03:58,441 level=WARNING logger=printer_agent.uplink.commands message=command did not succeed action=command command_id=61 printer_key=jekson-h2d status=failed"
+  ],
+  "truncated": true
+}
+```
+
+`lines` is the **end** of the file, oldest first, so the hub can print them in
+order. `truncated` says something was left out — either older lines beyond the
+count asked for, or lines dropped to fit the size ceiling. It is not an error and
+does not mean the answer is unusable; it means "there is more behind this".
+
+`files` lists what this agent has, newest first, so the hub can offer yesterday's
+roll without guessing its name.
+
+**Bounded on purpose.** The answer carries at most 2000 lines and 256 KB,
+whichever comes first, and the agent will not send more however much is asked
+for. This message shares a session with telemetry and commands, and a log is
+megabytes.
+
+**Secrets are removed from the text.** The agent does not log credentials, and
+scrubs any that appear anyway — by value, so a field name nobody anticipated
+cannot carry one through. A removed value reads as `***`, which is deliberately
+distinguishable from an empty field.
+
+A request the agent cannot serve — an unknown file name, an unreadable directory
+— is answered with the same message carrying `error` and no `lines`. It is not a
+`command_result`: nothing was done to a printer.
+
 ### `telemetry`
 
 Batch snapshots, lossy delivery.
@@ -445,6 +488,32 @@ picks it up within one `telemetry_interval_s`, rebuilding the adapters for
 printers that were added, removed or edited and sending an unsolicited
 `inventory`. The `command_result` therefore says the change was *accepted*, and
 the `inventory` that follows says it took effect.
+
+### `log_request`
+
+Asks for a tail of the agent's log.
+
+```json
+{ "file": "agent.log", "lines": 500, "level": "WARNING" }
+```
+
+Every field is optional. `file` defaults to the live log; it must be the plain
+name of a file this agent reported in `log.files`, and anything with a path
+separator in it is refused — the hub is naming a path on someone else's machine.
+`lines` defaults to 200 and is capped by the agent. `level` keeps that level and
+worse (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`); lines that carry no
+level, such as the body of a traceback, are always kept, because an exception
+without its body is not worth sending.
+
+Filtering happens **before** the count is applied, so `lines: 200` with
+`level: "WARNING"` returns up to 200 warnings rather than the warnings among the
+last 200 lines. That is the difference between a useful answer and a mostly
+empty one on a busy agent.
+
+Answered with `log`. Like `inventory_request` and `settings_request` it carries
+no `command_id` and gets no `command_result`: it is a request for state, and it
+touches no printer. An agent too old to know the type ignores it, so a missing
+answer means "this agent predates the message".
 
 ### `command`
 

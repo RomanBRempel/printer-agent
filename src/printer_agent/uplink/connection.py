@@ -35,8 +35,18 @@ from ..contracts import (
     utc_now_iso,
 )
 from ..core.filecache import PrintFileCache
+from ..core.logtail import (
+    UnknownLogFile,
+    clip_to_budget,
+    filter_by_level,
+    list_log_files,
+    resolve_log_file,
+    scrub,
+    tail_lines,
+)
 from ..core.outbox import EventOutbox
 from ..core.registry import build_adapter
+from ..logsetup import active_log_path
 from ..core.state import PrinterStateStore
 from .camera import CameraService
 from .commands import CommandProcessor
@@ -375,6 +385,9 @@ class HubConnection:
         if message_type == MessageType.inventory_request.value:
             await self._send_inventory(ws, str(payload.get("msg_id", "")))
             return
+        if message_type == MessageType.log_request.value:
+            await self._send_log(ws, str(payload.get("msg_id", "")), message_payload)
+            return
         if message_type == MessageType.settings_request.value:
             await self._send_settings(ws, str(payload.get("msg_id", "")))
             return
@@ -498,6 +511,73 @@ class HubConnection:
         )
         await self._send(ws, build_envelope(MessageType.inventory.value, payload))
         self._roster_stamp = roster_stamp(payload["printers"])
+
+    async def _send_log(
+        self, ws: aiohttp.ClientWebSocketResponse, request_msg_id: str, request: dict[str, Any]
+    ) -> None:
+        """Answer a `log_request` with a bounded, scrubbed tail.
+
+        Reading the file happens in a worker thread: the live log is the one
+        worth reading and also the largest, and the receive loop must not stop
+        for it.
+        """
+        payload: dict[str, Any] = {
+            "location_key": self.config.location_key,
+            "agent_version": self._agent_version(),
+        }
+        if request_msg_id:
+            payload["request_msg_id"] = request_msg_id
+        try:
+            payload.update(await asyncio.to_thread(self._read_log_tail, request))
+        except UnknownLogFile as exc:
+            payload["error"] = str(exc)
+        except OSError as exc:
+            payload["error"] = f"could not read the log: {exc}"
+        logger.info(
+            "sent a slice of the log",
+            extra={
+                "action": "hub_log",
+                "file": str(payload.get("file", "")),
+                "lines": str(len(payload.get("lines", []))),
+                "error": str(payload.get("error", "")),
+            },
+        )
+        await self._send(ws, build_envelope(MessageType.log.value, payload))
+
+    def _read_log_tail(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Blocking half of :meth:`_send_log`."""
+        live = active_log_path()
+        folder = live.parent
+        name = str(request.get("file") or "").strip() or live.name
+        target = resolve_log_file(folder, name)
+
+        try:
+            wanted = int(request.get("lines") or 200)
+        except (TypeError, ValueError):
+            wanted = 200
+
+        lines, truncated = tail_lines(target, wanted)
+        lines = filter_by_level(lines, request.get("level"))
+        lines = scrub(lines, self._log_secrets())
+        lines, clipped = clip_to_budget(lines)
+        return {
+            "file": target.name,
+            "files": [asdict(item) for item in list_log_files(folder)],
+            "lines": lines,
+            "truncated": truncated or clipped,
+        }
+
+    def _log_secrets(self) -> list[str]:
+        """Every value that must never leave this machine in a log line.
+
+        Collected from the running config rather than from a list of field
+        names: the point is to catch a credential that reached the log through a
+        field nobody thought to guard.
+        """
+        secrets = [self.config.agent_token]
+        for printer in self.config.printers:
+            secrets.extend(str(value) for value in (printer.credentials or {}).values())
+        return secrets
 
     async def _send_settings(self, ws: aiohttp.ClientWebSocketResponse, request_msg_id: str) -> None:
         """Answer a `settings_request` with the config, secrets redacted."""

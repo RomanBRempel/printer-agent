@@ -112,6 +112,19 @@ class DailyLogFile(TimedRotatingFileHandler):
         return [str(path) for path in doomed]
 
 
+def active_log_path() -> Path:
+    """The file logging is actually writing to, not the default location.
+
+    `configure_logging` accepts a path, and the CLI can be pointed elsewhere. A
+    reader that assumed the default would serve yesterday's file from a folder
+    nobody is writing to, and say nothing about it.
+    """
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, DailyLogFile):
+            return Path(handler.baseFilename)
+    return agent_log_path()
+
+
 def configure_logging(level: int = logging.INFO, log_file: str | Path | None = None) -> None:
     """Log to stdout when there is one, and always try the rotating log file.
 

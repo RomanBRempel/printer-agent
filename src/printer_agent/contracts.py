@@ -14,6 +14,7 @@ class MessageType(StrEnum):
     hello = "hello"
     inventory = "inventory"
     settings = "settings"
+    log = "log"
     telemetry = "telemetry"
     event = "event"
     command_result = "command_result"
@@ -23,6 +24,7 @@ class MessageType(StrEnum):
     inventory_request = "inventory_request"
     settings_request = "settings_request"
     settings_update = "settings_update"
+    log_request = "log_request"
     command = "command"
     file_offer = "file_offer"
     camera_request = "camera_request"
@@ -36,6 +38,7 @@ AGENT_TO_HUB_TYPES = frozenset(
         MessageType.hello.value,
         MessageType.inventory.value,
         MessageType.settings.value,
+        MessageType.log.value,
         MessageType.telemetry.value,
         MessageType.event.value,
         MessageType.command_result.value,
@@ -50,6 +53,7 @@ HUB_TO_AGENT_TYPES = frozenset(
         MessageType.inventory_request.value,
         MessageType.settings_request.value,
         MessageType.settings_update.value,
+        MessageType.log_request.value,
         MessageType.command.value,
         MessageType.file_offer.value,
         MessageType.camera_request.value,
