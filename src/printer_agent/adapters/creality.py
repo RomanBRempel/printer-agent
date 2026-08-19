@@ -400,6 +400,7 @@ class CrealityAdapter(PrinterAdapter):
             time_elapsed_s=self._safe_int(state.get("printJobTime")),
             time_remaining_s=self._safe_int(state.get("printLeftTime")),
             status=self._job_status(status, raw_state),
+            filament_used_mm=self._filament_used_mm(state, status),
         )
         temps = TemperatureSnapshot(
             nozzle=self._safe_float(state.get("nozzleTemp")),
@@ -417,6 +418,27 @@ class CrealityAdapter(PrinterAdapter):
             error=error,
             capabilities=self.capabilities(),
         )
+
+    @staticmethod
+    def _filament_used_mm(state: dict[str, Any], status: PrinterStatus) -> float | None:
+        """Extruded filament of the current print, in millimetres.
+
+        `usedMaterialLength` is a running counter that the firmware resets with
+        each print — watched growing on two K-series machines mid-job, in step
+        with progress. The unit is not a guess either: the printer's own web UI
+        renders the field as `usedMaterialLength + "mm"`
+        (`http://<printer>/static/js/app.*.js`, the only documentation this
+        protocol has). Metres would have understated the shop by a thousand,
+        which reads as plausible in a report rather than as a fault.
+
+        Reported only while a print is running. The field keeps the last job's
+        total when the machine is idle, and the hub remembers the largest value
+        it has seen for a job — so a stale total arriving with the first
+        snapshot of the next print would be recorded as that print's spend.
+        """
+        if status not in (PrinterStatus.printing, PrinterStatus.paused):
+            return None
+        return CrealityAdapter._safe_float(state.get("usedMaterialLength"))
 
     @staticmethod
     def _job_status(printer_status: PrinterStatus, raw_state: Any) -> JobStatus | None:

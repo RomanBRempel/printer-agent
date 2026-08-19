@@ -324,3 +324,53 @@ async def test_a_configured_snapshot_url_is_trusted_without_probing(monkeypatch)
 
     assert frame == JPEG
     assert streamer.requests == 1
+
+
+# ── Расход филамента ────────────────────────────────────────────────────────
+#
+# По этой величине закупают пластик. Принтер, который её не отдаёт, выглядит в
+# отчёте по цеху потратившим меньше, а виноватым — тот, кто отдаёт честно.
+
+
+def test_the_firmware_counter_is_reported_in_millimetres() -> None:
+    """Единицы — не догадка: интерфейс самого принтера печатает `+ "mm"`.
+
+    Принять миллиметры за метры значило бы занизить расход в тысячу раз, и в
+    отчёте это выглядит правдоподобно — десятки граммов вместо десятков
+    килограммов.
+    """
+    state = {"state": 1, "printFileName": "part.gcode", "usedMaterialLength": 22628}
+    snapshot = build(state)._snapshot_from_state(state)
+
+    assert snapshot.job.filament_used_mm == 22628.0
+
+
+def test_an_idle_printer_does_not_report_the_last_job_total() -> None:
+    """Поле хранит итог прошлой печати, а хаб запоминает максимум за задание.
+
+    Устаревший итог, приехавший с первым снимком следующей печати, был бы
+    записан как её расход.
+    """
+    state = {"state": 0, "usedMaterialLength": 22628}
+    snapshot = build(state)._snapshot_from_state(state)
+
+    assert snapshot.job.filament_used_mm is None
+
+
+def test_a_paused_print_still_reports_what_it_has_spent() -> None:
+    """Пауза — это та же печать; расход при ней не исчезает."""
+    from printer_agent.contracts import PrinterStatus
+
+    assert CrealityAdapter._filament_used_mm({"usedMaterialLength": 100}, PrinterStatus.paused) == 100.0
+
+
+def test_firmware_without_the_counter_omits_the_key() -> None:
+    """Ноль — реальное значение только что начатой печати.
+
+    Подставленный вместо «неизвестно», он тихо занижает свод по цеху.
+    """
+    state = {"state": 1, "printFileName": "part.gcode"}
+    snapshot = build(state)._snapshot_from_state(state)
+
+    assert snapshot.job.filament_used_mm is None
+    assert "filament_used_mm" not in snapshot.to_dict()["job"]
