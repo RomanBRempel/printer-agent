@@ -297,7 +297,43 @@ def _report_sections(print_state: dict[str, Any]) -> list[dict[str, Any]]:
     nested = print_state.get("device")
     if isinstance(nested, dict):
         sections.append(nested)
+    # And inside the `ams` block itself: some firmwares keep the holder next to
+    # the units it is not one of, rather than beside them. Looking in a place
+    # that does not exist costs a dictionary lookup; not looking costs a printer
+    # nobody can print on from its own spool.
+    for parent in list(sections):
+        ams = parent.get("ams")
+        if isinstance(ams, dict):
+            sections.append(ams)
     return sections
+
+
+#: Keys worth naming when the feeding system is nowhere to be found. A report
+#: that carries none of the shapes we know is not a printer without a spool —
+#: it is a layout we have not seen, and the only way to tell the two apart is
+#: to look at what the report does carry.
+_FEED_KEY_HINTS = ("tray", "ams", "slot", "filament", "spool", "extruder")
+
+
+def describe_report_shape(print_state: dict[str, Any]) -> str:
+    """Which keys a report carries, for the log — names only, never values.
+
+    Printed once per connection and only when no feeding system was found, so
+    the answer to "where did the spool holder go" can be read off the agent's
+    log through the hub instead of guessed at from another repository. Values
+    stay out of it: they are the printer's own data, and the question here is
+    layout.
+    """
+    def _names(source: Any) -> list[str]:
+        return sorted(source.keys()) if isinstance(source, dict) else []
+
+    parts = [f"print: {', '.join(_names(print_state)) or '—'}"]
+    for key, value in sorted(print_state.items()):
+        if not isinstance(value, dict):
+            continue
+        if key == "device" or any(hint in key.lower() for hint in _FEED_KEY_HINTS):
+            parts.append(f"{key}: {', '.join(_names(value)) or '—'}")
+    return "; ".join(parts)
 
 
 def _ams_units(print_state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -521,6 +557,9 @@ class BambuAdapter(PrinterAdapter):
         self._connected_event = asyncio.Event()
         self._connection_task: asyncio.Task[None] | None = None
         self._latest_print: dict[str, Any] | None = None
+        #: Уже сообщали ли в журнал, что состава подающей системы в отчёте нет.
+        #: Раз на подключение: сообщение диагностическое, а отчёты идут секундами.
+        self._feed_shape_logged = False
         self._latest_info: dict[str, Any] | None = None
         self._latest_error: dict[str, Any] | None = None
         self._latest_snapshot: PrinterSnapshot | None = None
@@ -998,6 +1037,7 @@ class BambuAdapter(PrinterAdapter):
                     self._set_connected(True)
                     self._last_error = ""
                     self._connected_event.set()
+                    self._feed_shape_logged = False
                     await client.subscribe(f"device/{serial}/report")
                     await self._request_full_report(client, serial)
                     pushall = asyncio.create_task(
@@ -1098,7 +1138,39 @@ class BambuAdapter(PrinterAdapter):
                 self._latest_error = {"message": error_message}
         if self._latest_print is not None:
             self._latest_snapshot = self._snapshot_from_state(self._latest_print, self._latest_info, self._latest_error)
+            self._log_missing_feeding_system()
         self._message_count += 1
+
+    def _log_missing_feeding_system(self) -> None:
+        """Сказать в журнал, чего в отчёте нет, и чем он вместо этого заполнен.
+
+        Молчание здесь и есть та неисправность, которую труднее всего чинить:
+        снимок без держателя выглядит как обычный принтер без него, и разница
+        видна только тому, кто стоит у станка. Одна строка на подключение — и
+        вопрос «куда делся держатель» читается в журнале агента через хаб, а не
+        гадается по чужому репозиторию.
+
+        Условие — именно ОТСУТСТВИЕ ДЕРЖАТЕЛЯ, а не отсутствие слотов вообще:
+        H2D отдал четыре лотка AMS и ни одного держателя, то есть проверка «нет
+        состава» на нём не сработала бы ни разу — молчала бы ровно там, где
+        нужна.
+        """
+        if self._feed_shape_logged or self._latest_print is None:
+            return
+        self._feed_shape_logged = True
+        if _external_trays(self._latest_print):
+            return
+        missing = (
+            "no feeding system at all"
+            if not bambu_ams_slots(self._latest_print)
+            else "no external spool holder"
+        )
+        logger.info(
+            "%s in the printer's report; keys are %s",
+            missing,
+            describe_report_shape(self._latest_print),
+            extra={"action": "state", "printer_key": self.printer.key},
+        )
 
     async def _publish_json(self, message: dict[str, Any]) -> None:
         serial = self._serial_number

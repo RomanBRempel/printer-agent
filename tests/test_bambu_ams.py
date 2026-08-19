@@ -7,7 +7,7 @@ so an empty slot reported as absent, or a colour reported as the printer's raw
 
 from __future__ import annotations
 
-from printer_agent.adapters.bambu import BambuAdapter, bambu_ams_slots
+from printer_agent.adapters.bambu import BambuAdapter, bambu_ams_slots, describe_report_shape
 from printer_agent.config import PrinterConfig
 
 #: Shape of a pushall `print` report, trimmed to what is read here.
@@ -209,3 +209,75 @@ def test_the_same_slot_reported_twice_is_reported_once() -> None:
     )
 
     assert [s.index for s in slots] == [254]
+
+
+def test_the_holder_is_found_inside_the_ams_block_too() -> None:
+    """Держатель — не юнит AMS, но лежать рядом с ними он тоже может.
+
+    H2D на 0.1.0a27 не отдал держателя ни сверху, ни из `device`, при том что
+    четыре лотка AMS приехали как обычно. Смотреть в известные места дёшево;
+    не смотреть — значит оставить принтер, с собственной катушки которого
+    напечатать нельзя.
+    """
+    slots = bambu_ams_slots(
+        {
+            "ams": {
+                "ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "PETG"}]}],
+                "vt_tray": {"id": "254", "tray_type": ""},
+            }
+        }
+    )
+
+    assert [(s.index, s.material) for s in slots] == [(0, "PETG"), (254, None)]
+
+
+def test_a_report_without_a_feeding_system_names_what_it_does_carry() -> None:
+    """Молчание — та самая неисправность: снимок без состава выглядит нормально.
+
+    Строка уходит в журнал агента, который хаб умеет читать, и отвечает на
+    вопрос «куда делся держатель» без похода в чужой репозиторий. Значений в
+    ней нет — вопрос про раскладку отчёта, а не про данные принтера.
+    """
+    shape = describe_report_shape(
+        {"gcode_state": "RUNNING", "mc_percent": 42, "device": {"extruder": {}, "vt_slot": {}}}
+    )
+
+    assert "print: device, gcode_state, mc_percent" in shape
+    assert "device: extruder, vt_slot" in shape
+    # Значения не печатаются — только имена ключей.
+    assert "42" not in shape
+
+
+def test_the_missing_holder_is_what_gets_reported(caplog) -> None:
+    """Условие — нет ДЕРЖАТЕЛЯ, а не «нет состава вовсе».
+
+    У H2D четыре лотка AMS приехали как обычно, поэтому проверка «состава нет»
+    молчала бы ровно на том принтере, ради которого заведена.
+    """
+    adapter = make_adapter()
+    adapter._latest_print = {"ams": {"ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "PETG"}]}]}}
+
+    with caplog.at_level("INFO"):
+        adapter._log_missing_feeding_system()
+
+    assert "no external spool holder" in caplog.text
+
+    # А у принтера, который держателя прислал, спрашивать нечего.
+    quiet = make_adapter()
+    quiet._latest_print = {"vt_tray": {"id": "254", "tray_type": ""}}
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        quiet._log_missing_feeding_system()
+    assert caplog.text == ""
+
+
+def test_the_shape_is_reported_once_per_connection() -> None:
+    """Отчёты идут секундами: строка на каждый сделала бы журнал нечитаемым."""
+    adapter = make_adapter()
+    adapter._latest_print = {"gcode_state": "IDLE"}
+
+    adapter._log_missing_feeding_system()
+    assert adapter._feed_shape_logged is True
+
+    # Второй раз — уже молча; сбрасывается только новым подключением.
+    adapter._log_missing_feeding_system()

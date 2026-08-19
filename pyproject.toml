@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "printer-agent"
-version = "0.1.0a27"
+version = "0.1.0a28"
 description = "Edge agent for a distributed 3D printer fleet"
 readme = "README.md"
 requires-python = ">=3.11"
