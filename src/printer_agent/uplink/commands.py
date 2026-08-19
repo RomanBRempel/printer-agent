@@ -125,12 +125,7 @@ class CommandProcessor:
         # which knows less about the program than the hub does. Anything that is
         # not a list of slot numbers is ignored rather than passed on: a bad
         # mapping prints in the wrong material, which is scrap, not a warning.
-        ams_mapping = args.get("ams_mapping")
-        if isinstance(ams_mapping, list):
-            slots = [int(slot) for slot in ams_mapping if isinstance(slot, int)]
-            ams_mapping = slots if len(slots) == len(ams_mapping) else None
-        else:
-            ams_mapping = None
+        ams_mapping = _ams_mapping(args.get("ams_mapping"))
         if not file_ref:
             raise RuntimeError("start_print without file_ref")
         if self._files is not None and not self._files.has_cached(file_ref):
@@ -201,3 +196,55 @@ class CommandProcessor:
         }
         self._outbox.record_command_result(command_id, printer_key, status, error_text, response)
         return payload
+
+
+def _ams_mapping(value: Any) -> dict[int, int] | None:
+    """The hub's slot mapping as `{filament index: slot index}`.
+
+    Two shapes are accepted, and both mean the same thing. `[{"filament": 0,
+    "slot": 1}]` is what the hub sends and is the one to write new code against:
+    it can leave a filament out, which a program with an unnamed material
+    genuinely does. `[1, 0]` is the positional form the contract carried first —
+    still read, because an older hub is still allowed to send it.
+
+    Anything unreadable returns `None` **and says so in the log**. The previous
+    version dropped a mapping it could not parse without a word, and the print
+    went out as `use_ams: false` — a two-colour plate came off the bed in one
+    colour, hours later, reported to the hub as done.
+    """
+    if value in (None, [], {}):
+        return None
+    mapping: dict[int, int] = {}
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        for item in value:
+            try:
+                mapping[int(item["filament"])] = int(item["slot"])
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "unreadable ams_mapping entry; the feeder will not be used",
+                    extra={"action": "command", "error": repr(item)},
+                )
+                return None
+        return mapping or None
+    if isinstance(value, list):
+        for index, slot in enumerate(value):
+            if isinstance(slot, bool) or not isinstance(slot, (int, str)):
+                logger.warning(
+                    "unreadable ams_mapping entry; the feeder will not be used",
+                    extra={"action": "command", "error": repr(slot)},
+                )
+                return None
+            try:
+                mapping[index] = int(slot)
+            except ValueError:
+                logger.warning(
+                    "unreadable ams_mapping entry; the feeder will not be used",
+                    extra={"action": "command", "error": repr(slot)},
+                )
+                return None
+        return mapping or None
+    logger.warning(
+        "ams_mapping is not a list; the feeder will not be used",
+        extra={"action": "command", "error": repr(value)},
+    )
+    return None

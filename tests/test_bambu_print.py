@@ -127,7 +127,9 @@ async def test_slot_mapping_from_the_hub_reaches_the_printer(published) -> None:
     """
     adapter = make_adapter()
 
-    await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping=[2, 0])
+    # Пары «филамент → слот»: хаб называет их именно так, а принтеру нужен
+    # позиционный массив.
+    await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping={0: 2, 1: 0})
 
     payload = published.messages[0]["print"]
     assert payload["ams_mapping"] == [2, 0]
@@ -565,3 +567,64 @@ def test_known_codes_are_translated_not_echoed():
     assert "could not parse" in BambuAdapter._bambu_error_message(0x05004003)
     # Неизвестный код не выдумывается: печатается в той форме, что на экране.
     assert BambuAdapter._bambu_error_message(0x05009999) == "Bambu error 0500-9999"
+
+
+@pytest.mark.asyncio
+async def test_a_gap_in_the_mapping_is_refused_not_padded(published, tmp_path) -> None:
+    """Принтер берёт по слоту на филамент и пропустить один не умеет.
+
+    Заполнить дырку наугад — значит напечатать деталь тем, что заряжено, и
+    узнать об этом через несколько часов.
+    """
+    source = make_two_colour_project(tmp_path / "part.gcode.3mf", plate=2, filaments=2)
+    adapter = make_adapter()
+
+    with pytest.raises(RuntimeError, match="unassigned"):
+        await adapter.start_print(
+            "f00d", "part.gcode.3mf", ams_mapping={0: 1}, local_path=source
+        )
+    assert published.messages == []
+
+
+@pytest.mark.asyncio
+async def test_a_two_colour_plate_without_a_mapping_is_refused(published, tmp_path) -> None:
+    """Иначе принтер не отказывает, а печатает всё одним цветом.
+
+    Ровно это и произошло на A1 19.08.2026: хаб прислал сопоставление в форме,
+    которую агент не разобрал, оно потерялось, ушло `use_ams: false`, и деталь
+    вышла в один цвет.
+    """
+    source = make_two_colour_project(tmp_path / "part.gcode.3mf", plate=2, filaments=2)
+    adapter = make_adapter()
+
+    with pytest.raises(RuntimeError, match="one colour"):
+        await adapter.start_print("f00d", "part.gcode.3mf", local_path=source)
+    assert published.messages == []
+
+
+@pytest.mark.asyncio
+async def test_a_single_colour_plate_still_prints_without_a_mapping(published, tmp_path) -> None:
+    """Обычная одноцветная печать не должна пострадать от этой проверки."""
+    source = make_two_colour_project(tmp_path / "part.gcode.3mf", plate=2, filaments=1)
+    adapter = make_adapter()
+
+    await adapter.start_print("f00d", "part.gcode.3mf", local_path=source)
+
+    assert published.messages[0]["print"]["use_ams"] is False
+
+
+def make_two_colour_project(path: Path, *, plate: int, filaments: int) -> Path:
+    """Архив со `slice_info.config`, по которому считается число филаментов."""
+    import zipfile
+
+    entries = "".join(
+        f'<filament id="{i + 1}" type="PLA" color="#00000{i}" used_g="1"/>' for i in range(filaments)
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(f"Metadata/plate_{plate}.gcode", "G1 X0\n")
+        archive.writestr(
+            "Metadata/slice_info.config",
+            f'<?xml version="1.0"?><config><plate>'
+            f'<metadata key="index" value="{plate}"/>{entries}</plate></config>',
+        )
+    return path

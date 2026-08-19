@@ -389,3 +389,65 @@ async def test_start_print_hands_the_adapter_the_local_copy(processor, adapter) 
     )
 
     assert adapter.print_local_paths == [cache.path_for(FILE_REF)]
+
+
+# ── Форма сопоставления слотов ──────────────────────────────────────────────
+#
+# Хаб шлёт `[{"filament": 0, "slot": 1}]`, контракт изначально описывал `[1, 0]`.
+# Агент понимал только вторую форму и первую молча выбрасывал: печать уходила с
+# `use_ams: false`, и двухцветная плита выходила в один цвет через несколько
+# часов, с ответом `done` в хаб.
+
+
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [
+        ([{"filament": 0, "slot": 1}, {"filament": 1, "slot": 3}], {0: 1, 1: 3}),
+        ([1, 3], {0: 1, 1: 3}),
+        ([{"filament": 1, "slot": 254}], {1: 254}),
+        ([], None),
+        (None, None),
+    ],
+)
+def test_both_mapping_shapes_mean_the_same_thing(sent, expected) -> None:
+    from printer_agent.uplink.commands import _ams_mapping
+
+    assert _ams_mapping(sent) == expected
+
+
+def test_an_unreadable_mapping_is_logged_before_it_is_dropped(caplog) -> None:
+    """Молча потерянное сопоставление — это брак, замеченный через часы."""
+    import logging
+
+    from printer_agent.uplink.commands import _ams_mapping
+
+    with caplog.at_level(logging.WARNING):
+        assert _ams_mapping([{"filament": 0}]) is None
+        assert _ams_mapping("0,1") is None
+
+    assert len([r for r in caplog.records if "ams_mapping" in r.message]) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_hub_shape_reaches_the_adapter(processor, adapter) -> None:
+    """Сквозь диспетчер: то, что реально шлёт хаб, доезжает до адаптера."""
+    command_processor, cache, _outbox = processor
+    cache.ensure_directory()
+    cache.path_for(FILE_REF).write_bytes(PAYLOAD)
+
+    result = await command_processor.dispatch(
+        adapter,
+        {
+            "command_id": "1060",
+            "printer_key": "printer-1",
+            "action": "start_print",
+            "args": {
+                "file_ref": FILE_REF,
+                "remote_name": "part.gcode.3mf",
+                "ams_mapping": [{"filament": 0, "slot": 2}, {"filament": 1, "slot": 0}],
+            },
+        },
+    )
+
+    assert result["status"] == "done"
+    assert adapter.print_mappings == [{0: 2, 1: 0}]

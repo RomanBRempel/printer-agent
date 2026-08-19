@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 from ..config import PrinterConfig
@@ -39,7 +40,7 @@ class PrinterAdapter(ABC):
         self,
         file_ref: str,
         remote_name: str | None = None,
-        ams_mapping: list[int] | None = None,
+        ams_mapping: Mapping[int, int] | None = None,
         local_path: str | Path | None = None,
     ) -> dict[str, Any]:
         """Print a file already delivered to this printer.

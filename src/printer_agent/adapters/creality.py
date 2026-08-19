@@ -23,6 +23,7 @@ import json
 from contextlib import suppress
 from pathlib import Path
 from pathlib import PurePosixPath
+from collections.abc import Mapping
 from typing import Any
 
 import aiohttp
@@ -253,7 +254,7 @@ class CrealityAdapter(PrinterAdapter):
         self,
         file_ref: str,
         remote_name: str | None = None,
-        ams_mapping: list[int] | None = None,
+        ams_mapping: Mapping[int, int] | None = None,
         local_path: str | Path | None = None,
     ) -> dict[str, Any]:
         # Accepted for one signature across adapters; this printer has no

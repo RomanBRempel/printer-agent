@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import quote
 
@@ -225,7 +226,7 @@ class MoonrakerAdapter(PrinterAdapter):
         self,
         file_ref: str,
         remote_name: str | None = None,
-        ams_mapping: list[int] | None = None,
+        ams_mapping: Mapping[int, int] | None = None,
         local_path: str | Path | None = None,
     ) -> dict[str, Any]:
         # Klipper has no feeding system of its own, so `ams_mapping` has nothing

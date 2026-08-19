@@ -209,7 +209,7 @@ print file's header before sending a job, which is the only reason it exists.
 
 | Field | Meaning |
 | --- | --- |
-| `index` | Slot number, flat across units (unit 1 tray 0 is index 4 on a four-tray system) |
+| `index` | Slot number **as the printer numbers it**, flat across units (unit 1 tray 0 is index 4 on a four-tray system) |
 | `material` | Filament type as the printer reports it (`PLA`, `PETG`). `type` is accepted as a synonym |
 | `color` | `#RRGGBB`. `colour` is accepted as a synonym |
 | `remaining_pct` | Remaining share of the spool, when the printer can tell |
@@ -218,6 +218,15 @@ Only `index` is mandatory: a slot whose material the printer cannot name is
 reported as present and empty rather than left out, because a missing slot and an
 unreadable one mean different things to a material check. A printer with no
 feeding system sends no `ams` block at all, and `capabilities.ams` / `cfs` say so.
+
+**`index` is the printer's own number, not a position in the array.** It is not
+dense and it is not always small: a Bambu external spool holder is slot **254**,
+which is the id the printer itself reports for it. The hub must key on the value
+rather than on the order, because the same number goes back in `ams_mapping` and
+the printer will not recognise one the hub renumbered. A filament on the spool
+holder is an ordinary choice — a two-colour job with one colour there is normal —
+so a hub that ignored the entry would fail to match a job that the printer can
+run perfectly well.
 
 ### `event`
 
@@ -466,7 +475,8 @@ for it and must not guess one. The hub answers that outcome by offering the file
 again.
 
 `ams_mapping` (optional) is which loaded slot each filament of the program goes
-to, in the program's own filament order. The hub works it out by matching the
+to, in the program's own filament order, using the same `index` values that
+`state.ams.slots[]` reported — including `254` for an external spool holder. The hub works it out by matching the
 program against the slots the printer itself reported, so it is better informed
 than the printer's own pick — an adapter that drops it hands the choice back to
 the machine, and a job in the wrong material is scrap rather than a warning.

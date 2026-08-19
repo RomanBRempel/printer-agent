@@ -103,3 +103,49 @@ def test_capabilities_report_what_this_adapter_actually_does() -> None:
     assert capabilities.upload is True
     assert capabilities.camera is False
     assert capabilities.pause is True
+
+
+# ── Внешняя катушка ─────────────────────────────────────────────────────────
+
+
+def test_the_external_spool_is_a_slot_like_any_other() -> None:
+    """Печать в два цвета с одним из них на держателе — обычное дело.
+
+    `vt_tray` не входит в `ams.ams[]`, поэтому в цикле по юнитам его не видно.
+    Хаб сверяет материалы задания с тем, что мы прислали, и без этой записи
+    отказывается отправлять файл — печать не начинается, а причина выглядит как
+    «не удалось отправить».
+    """
+    slots = bambu_ams_slots(
+        {
+            "ams": {"ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "PLA",
+                                                  "tray_color": "FF6910FF", "remain": 100}]}]},
+            "vt_tray": {"id": "254", "tray_type": "PLA", "tray_color": "C12E1EFF", "remain": 0},
+        }
+    )
+
+    assert [s.index for s in slots] == [0, 254]
+    assert slots[-1].material == "PLA"
+    assert slots[-1].color == "#C12E1E"
+
+
+def test_the_spool_holder_reports_no_remaining_share() -> None:
+    """У держателя нет RFID, а принтер шлёт `remain: 0`.
+
+    Как процент это читается «пусто» — для катушки, которая может быть полной.
+    """
+    slots = bambu_ams_slots({"vt_tray": {"id": "254", "tray_type": "PLA", "remain": 0}})
+
+    assert slots[0].remaining_pct is None
+
+
+def test_a_printer_without_an_ams_still_reports_its_spool() -> None:
+    """A1 без AMS Lite печатает с держателя, и это единственный его материал."""
+    slots = bambu_ams_slots({"vt_tray": {"id": "254", "tray_type": "PETG", "tray_color": "A4AAACFF"}})
+
+    assert [(s.index, s.material) for s in slots] == [(254, "PETG")]
+
+
+def test_an_empty_spool_holder_is_not_a_slot() -> None:
+    """Пустой держатель — не «слот без материала», а отсутствие катушки."""
+    assert bambu_ams_slots({"vt_tray": {"id": "254", "tray_type": ""}}) == []

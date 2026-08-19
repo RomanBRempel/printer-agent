@@ -7,9 +7,11 @@ import logging
 import re
 import ssl
 import time
+import xml.etree.ElementTree as ElementTree
 import zipfile
 from contextlib import suppress
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 from aiomqtt import Client
@@ -130,6 +132,36 @@ BAMBU_PROJECT_PLATE = "Metadata/plate_1.gcode"
 _PLATE_ENTRY = re.compile(r"^Metadata/plate_(\d+)\.gcode$")
 
 
+def plate_filament_count(path: str | Path, plate_entry: str) -> int | None:
+    """How many filaments the sliced plate uses, or `None` if it cannot be told.
+
+    Studio records them in `Metadata/slice_info.config`, one `<filament>` per
+    colour, under the `<plate>` whose `index` matches. `None` is not "one": a
+    file we cannot read must not be treated as a single-colour job, because the
+    caller uses this to decide whether printing without a slot mapping is safe.
+    """
+    plate_number = "".join(ch for ch in Path(plate_entry).stem if ch.isdigit())
+    if not plate_number:
+        return None
+    try:
+        with zipfile.ZipFile(path) as archive:
+            raw = archive.read("Metadata/slice_info.config")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return None
+    try:
+        root = ElementTree.fromstring(raw)
+    except ElementTree.ParseError:
+        return None
+    for plate in root.iter("plate"):
+        index = next(
+            (item.get("value") for item in plate.iter("metadata") if item.get("key") == "index"),
+            None,
+        )
+        if index == plate_number:
+            return len(list(plate.iter("filament")))
+    return None
+
+
 def plate_in_project(path: str | Path) -> str | None:
     """Which plate of a sliced `.3mf` the printer should be told to run.
 
@@ -237,6 +269,14 @@ class _ImplicitFTPS(ftplib.FTP_TLS):
         return self.voidresp()
 
 
+#: The external spool holder, in the printer's own numbering — `vt_tray.id` is
+#: literally "254". It is a slot like any other as far as a material check goes:
+#: a two-colour job with one filament on the spool holder is ordinary, and a hub
+#: that never hears about it cannot match the job and will not send the file.
+#: The number travels back in `ams_mapping`, which is why it has to be the
+#: printer's and not one we invented.
+BAMBU_EXTERNAL_SPOOL_SLOT = 254
+
 #: Trays per AMS unit, used to give the slots one flat numbering across units —
 #: the printer numbers trays 0..3 inside each unit and identifies the unit
 #: separately, but the hub compares against a single list of loaded filaments.
@@ -250,13 +290,18 @@ def bambu_ams_slots(print_state: dict[str, Any]) -> list[AmsSlot]:
     of units, each with a `tray[]` of loaded spools. `tray_color` is RGBA hex
     without a marker, and `remain` is -1 when the printer cannot tell — both are
     dropped rather than reported as a value the hub would trust.
+
+    `vt_tray`, the external spool holder, is a slot too and is reported last. It
+    is not part of `ams.ams[]`, so leaving it to that loop hides a filament that
+    is genuinely loaded: a two-colour job with one colour on the holder is
+    ordinary, and a hub that cannot see it cannot match the job. A printer with
+    no AMS at all but a spool on the holder therefore still reports one slot.
     """
     ams = print_state.get("ams")
     units = ams.get("ams") if isinstance(ams, dict) else None
-    if not isinstance(units, list):
-        return []
-
     slots: list[AmsSlot] = []
+    if not isinstance(units, list):
+        units = []
     for ordinal, unit in enumerate(units):
         if not isinstance(unit, dict):
             continue
@@ -280,6 +325,20 @@ def bambu_ams_slots(print_state: dict[str, Any]) -> list[AmsSlot]:
                     remaining_pct=remaining if remaining is not None and remaining >= 0 else None,
                 )
             )
+
+    external = print_state.get("vt_tray")
+    if isinstance(external, dict) and str(external.get("tray_type") or "").strip():
+        slots.append(
+            AmsSlot(
+                index=BambuAdapter._safe_int(external.get("id")) or BAMBU_EXTERNAL_SPOOL_SLOT,
+                material=str(external.get("tray_type")).strip(),
+                color=_tray_color(external.get("tray_color")),
+                # No `remain` worth reporting: the spool holder has no RFID, and
+                # the printer fills the field with 0 — which as a percentage
+                # reads "empty" for a spool that may be full.
+                remaining_pct=None,
+            )
+        )
     return slots
 
 
@@ -543,7 +602,7 @@ class BambuAdapter(PrinterAdapter):
         self,
         file_ref: str,
         remote_name: str | None = None,
-        ams_mapping: list[int] | None = None,
+        ams_mapping: Mapping[int, int] | None = None,
         local_path: str | Path | None = None,
     ) -> dict[str, Any]:
         """Start a print of a file already uploaded to the printer's storage.
@@ -586,6 +645,7 @@ class BambuAdapter(PrinterAdapter):
         if name.lower().endswith(".3mf"):
             payload["command"] = "project_file"
             payload["param"] = await self._plate_for(name, local_path)
+            await self._refuse_a_silent_single_colour(payload["param"], local_path, ams_mapping)
             # Zeroes, not the hub's identifiers: these name a task in Bambu's
             # own cloud, and a foreign number here has been known to make the
             # printer look for a project it cannot fetch.
@@ -601,7 +661,9 @@ class BambuAdapter(PrinterAdapter):
             # the printer choose a slot it was not told about is how a job comes
             # out in the wrong material.
             payload["use_ams"] = True
-            payload["ams_mapping"] = list(ams_mapping)
+            payload["ams_mapping"] = await self._positional_mapping(
+                ams_mapping, payload.get("param"), local_path
+            )
 
         await self._publish_json({"print": payload})
         return {
@@ -631,6 +693,57 @@ class BambuAdapter(PrinterAdapter):
         except ValueError:
             return float(FTPS_TIMEOUT_S)
         return configured if configured > 0 else float(FTPS_TIMEOUT_S)
+
+    async def _positional_mapping(
+        self, mapping: Mapping[int, int], plate: str | None, local_path: str | Path | None
+    ) -> list[int]:
+        """The hub's mapping as Bambu wants it: one slot per filament, in order.
+
+        The hub names the pairs (`filament` → `slot`) and may leave a filament
+        out, which a program whose slicer did not name a material genuinely
+        does. Bambu takes a positional array instead, where a gap cannot be
+        expressed — so a mapping that does not cover every filament of the plate
+        is refused rather than padded. Guessing what goes in the hole prints the
+        part in whatever happens to be loaded, which is scrap discovered hours
+        later.
+        """
+        count = None
+        if plate and local_path is not None:
+            count = await asyncio.to_thread(plate_filament_count, local_path, plate)
+        if count is None:
+            count = max(mapping) + 1
+        missing = [index for index in range(count) if index not in mapping]
+        if missing:
+            named = ", ".join(str(index + 1) for index in missing)
+            raise RuntimeError(
+                f"the hub's ams_mapping leaves filament {named} of {count} unassigned;"
+                " the printer takes one slot per filament and cannot be told to skip one"
+            )
+        return [int(mapping[index]) for index in range(count)]
+
+    async def _refuse_a_silent_single_colour(
+        self, plate: str, local_path: str | Path | None, ams_mapping: list[int] | None
+    ) -> None:
+        """Stop a multi-colour plate from printing in one colour without a word.
+
+        Without `ams_mapping` the command goes out as `use_ams: false`, and the
+        printer does not refuse it — it prints every filament of the plate from
+        whatever is loaded. The result is a finished part in one colour, hours
+        of machine time, and scrap, with `done` reported to the hub because MQTT
+        acknowledged nothing to the contrary.
+
+        Only a plate we can *prove* needs more than one filament is refused. An
+        unreadable file, or a plate the archive does not describe, goes out as
+        before: the printer refusing with its own reason beats us inventing one.
+        """
+        if ams_mapping or local_path is None:
+            return
+        count = await asyncio.to_thread(plate_filament_count, local_path, plate)
+        if count is not None and count > 1:
+            raise RuntimeError(
+                f"{plate} is sliced for {count} filaments and the hub sent no ams_mapping;"
+                " printing it now would come out in one colour"
+            )
 
     async def _plate_for(self, name: str, local_path: str | Path | None) -> str:
         """Which plate to run, preferring the copy on disk over what we recall.
