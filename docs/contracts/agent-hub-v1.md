@@ -475,13 +475,37 @@ for it and must not guess one. The hub answers that outcome by offering the file
 again.
 
 `ams_mapping` (optional) is which loaded slot each filament of the program goes
-to, in the program's own filament order, using the same `index` values that
-`state.ams.slots[]` reported — including `254` for an external spool holder. The hub works it out by matching the
+to, using the same `index` values that `state.ams.slots[]` reported — including
+`254` for an external spool holder.
+
+**Two shapes are accepted and mean the same thing.** The pairs are canonical:
+
+```
+"ams_mapping": [ { "filament": 0, "slot": 2 }, { "filament": 1, "slot": 0 } ]
+```
+
+`filament` is the program's own filament index, counted from zero. The older
+positional form, `[2, 0]`, says the same for a program whose filaments are all
+mapped, and is still read — it may be dropped once no deployed hub sends it, and
+until then neither side may assume the other prefers one. New work uses the
+pairs, because they can **leave a filament out**, which a program whose slicer
+did not name a material genuinely does, and an array of slots cannot say that.
+
+An adapter whose printer wants a positional array builds one from the pairs and
+**refuses a mapping that does not cover every filament of the plate** rather
+than filling the hole: the printer takes one slot per filament and cannot be
+told to skip one, so a guess prints the part in whatever happens to be loaded. The hub works it out by matching the
 program against the slots the printer itself reported, so it is better informed
 than the printer's own pick — an adapter that drops it hands the choice back to
 the machine, and a job in the wrong material is scrap rather than a warning.
 Adapters whose printers have no addressable feeding system ignore the field; its
 absence means "do not involve the feeder", not "choose freely".
+
+Absence has one more consequence worth stating, because the printer will not
+state it: a **multi-filament** plate started without a mapping does not fail. It
+prints every filament from whatever is loaded and comes off the bed in one
+colour, hours later, with `done` already reported. An adapter that can read the
+file therefore refuses that combination outright.
 
 ### `file_offer`
 
