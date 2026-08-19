@@ -271,6 +271,17 @@ holder is an ordinary choice — a two-colour job with one colour there is norma
 so a hub that ignored the entry would fail to match a job that the printer can
 run perfectly well.
 
+**The spool holder is reported whether or not the printer can name what is on
+it**, for the same reason an AMS tray is: it has no RFID, so `material` is
+whatever a human typed on the printer's screen and is usually absent. Reading
+that absence as "no spool here" removed the holder from the snapshot entirely,
+and with it the operator's only way to print from it — the hub offers a choice
+between the places it was told about. A holder with no `material` therefore
+arrives as `{"index": 254}`, which claims nothing: the hub will not auto-match
+it to a filament, and an operator picks it deliberately. A machine may report
+more than one holder (one per extruder on a dual-nozzle printer); each keeps its
+own number.
+
 ### `event`
 
 Reliable event delivery. Events stay in the local outbox until hub ack.

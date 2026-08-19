@@ -283,6 +283,49 @@ BAMBU_EXTERNAL_SPOOL_SLOT = 254
 BAMBU_TRAYS_PER_UNIT = 4
 
 
+def _report_sections(print_state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Where to look for the feeding system inside one `print` report.
+
+    Top level first, then `device` — the H-series firmware carries part of the
+    report one level deeper, and the two shapes otherwise look identical. The
+    cost of guessing wrong is silent in exactly the way that matters: a feeding
+    place that is simply absent from the snapshot, with nothing logged and
+    nothing refused, so the hub shows a printer that cannot be printed on from
+    the spool it actually has.
+    """
+    sections = [print_state]
+    nested = print_state.get("device")
+    if isinstance(nested, dict):
+        sections.append(nested)
+    return sections
+
+
+def _ams_units(print_state: dict[str, Any]) -> list[dict[str, Any]]:
+    """The AMS units of a report, from whichever section carries them."""
+    for section in _report_sections(print_state):
+        ams = section.get("ams")
+        units = ams.get("ams") if isinstance(ams, dict) else None
+        if isinstance(units, list):
+            return units
+    return []
+
+
+def _external_trays(print_state: dict[str, Any]) -> list[dict[str, Any]]:
+    """The external spool holders of a report — there may be more than one.
+
+    A dual-nozzle machine has a holder per extruder, and the printer numbers
+    them itself. Both shapes are accepted (one holder as a mapping, several as
+    a list) and neither is renumbered here: the number travels back in
+    `ams_mapping`, and one we invented is one the printer will not recognise.
+    """
+    trays: list[dict[str, Any]] = []
+    for section in _report_sections(print_state):
+        raw = section.get("vt_tray")
+        candidates = raw if isinstance(raw, list) else [raw]
+        trays.extend(tray for tray in candidates if isinstance(tray, dict))
+    return trays
+
+
 def bambu_ams_slots(print_state: dict[str, Any]) -> list[AmsSlot]:
     """Read the feeding system out of a `print` report.
 
@@ -296,13 +339,20 @@ def bambu_ams_slots(print_state: dict[str, Any]) -> list[AmsSlot]:
     is genuinely loaded: a two-colour job with one colour on the holder is
     ordinary, and a hub that cannot see it cannot match the job. A printer with
     no AMS at all but a spool on the holder therefore still reports one slot.
+
+    **The holder is reported whether or not the printer can name what is on
+    it.** It has no RFID, so `tray_type` is typed in by a human on the screen
+    and is blank most of the time. Reading blank as "no spool" hid the holder
+    from the hub entirely, and with it the only way to print from it: the hub
+    offers the operator a choice between the slots it was told about, and it was
+    never told about this one. Blank is the same fact the AMS trays already
+    report — present, unnamed — and it is a different fact from absent. Nothing
+    is claimed about the material, so the hub never auto-matches such a slot;
+    an operator picks it deliberately.
     """
-    ams = print_state.get("ams")
-    units = ams.get("ams") if isinstance(ams, dict) else None
     slots: list[AmsSlot] = []
-    if not isinstance(units, list):
-        units = []
-    for ordinal, unit in enumerate(units):
+    seen: set[int] = set()
+    for ordinal, unit in enumerate(_ams_units(print_state)):
         if not isinstance(unit, dict):
             continue
         unit_index = BambuAdapter._safe_int(unit.get("id"))
@@ -317,21 +367,31 @@ def bambu_ams_slots(print_state: dict[str, Any]) -> list[AmsSlot]:
             tray_index = tray_ordinal if tray_index is None else tray_index
             material = str(tray.get("tray_type") or "").strip() or None
             remaining = BambuAdapter._safe_float(tray.get("remain"))
+            index = unit_index * BAMBU_TRAYS_PER_UNIT + tray_index
+            if index in seen:
+                continue
+            seen.add(index)
             slots.append(
                 AmsSlot(
-                    index=unit_index * BAMBU_TRAYS_PER_UNIT + tray_index,
+                    index=index,
                     material=material,
                     color=_tray_color(tray.get("tray_color")),
                     remaining_pct=remaining if remaining is not None and remaining >= 0 else None,
                 )
             )
 
-    external = print_state.get("vt_tray")
-    if isinstance(external, dict) and str(external.get("tray_type") or "").strip():
+    for external in _external_trays(print_state):
+        # `or` on the parsed id would turn a reported 0 into 254; the printer's
+        # own number is the one that has to come back in `ams_mapping`.
+        index = BambuAdapter._safe_int(external.get("id"))
+        index = BAMBU_EXTERNAL_SPOOL_SLOT if index is None else index
+        if index in seen:
+            continue
+        seen.add(index)
         slots.append(
             AmsSlot(
-                index=BambuAdapter._safe_int(external.get("id")) or BAMBU_EXTERNAL_SPOOL_SLOT,
-                material=str(external.get("tray_type")).strip(),
+                index=index,
+                material=str(external.get("tray_type") or "").strip() or None,
                 color=_tray_color(external.get("tray_color")),
                 # No `remain` worth reporting: the spool holder has no RFID, and
                 # the printer fills the field with 0 — which as a percentage
@@ -351,6 +411,21 @@ def _tray_color(value: Any) -> str | None:
     except ValueError:
         return None
     return f"#{text[:6].upper()}"
+
+#: How soon to ask again while the report still carries no feeding system.
+#: `pushall` goes out at qos 0 and is never acknowledged: the printer answers it
+#: with a full report and sends only deltas afterwards, and a delta never
+#: repeats the slots. One request per connection is therefore not enough — a
+#: lost publish, or a printer busy with another client, means the composition
+#: never appears until the service is restarted. Seen on the floor: an A1 that
+#: had shown five feeding places an hour earlier answered "the printer does not
+#: report what is loaded", on a live session with telemetry flowing.
+BAMBU_PUSHALL_RETRY_S = 20.0
+
+#: And how often to refresh once we have one. A full report is a few kilobytes;
+#: every five minutes is cheaper than the composition on screen drifting from
+#: the composition in the machine after a single delta went missing.
+BAMBU_PUSHALL_RESYNC_S = 300.0
 
 BAMBU_SSDP_PORT = 2021
 BAMBU_SSDP_GROUP = "239.255.255.250"
@@ -924,23 +999,18 @@ class BambuAdapter(PrinterAdapter):
                     self._last_error = ""
                     self._connected_event.set()
                     await client.subscribe(f"device/{serial}/report")
-                    # The printer answers a pushall with a full report but never
-                    # sends a PUBACK for it, so anything above qos 0 waits out the
-                    # client timeout and tears down the subscription we just made.
-                    await client.publish(
-                        f"device/{serial}/request",
-                        json.dumps({"pushing": {"sequence_id": "0", "command": "pushall", "push_target": 1}}),
-                        qos=0,
+                    await self._request_full_report(client, serial)
+                    pushall = asyncio.create_task(
+                        self._keep_report_full(client, serial),
+                        name=f"printer-agent-bambu-pushall-{self.printer.key}",
                     )
                     backoff = 1.0
-                    async for message in client.messages:
-                        if self._stop_event.is_set():
-                            break
-                        try:
-                            payload = json.loads(message.payload)
-                        except json.JSONDecodeError:
-                            continue
-                        await self._handle_payload(payload)
+                    try:
+                        await self._consume(client)
+                    finally:
+                        pushall.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await pushall
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -950,6 +1020,72 @@ class BambuAdapter(PrinterAdapter):
                     self._connected_event.set()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, 60.0)
+
+    async def _consume(self, client: Any) -> None:
+        """Read the report stream until the connection ends or we are stopped."""
+        async for message in client.messages:
+            if self._stop_event.is_set():
+                break
+            try:
+                payload = json.loads(message.payload)
+            except json.JSONDecodeError:
+                continue
+            await self._handle_payload(payload)
+
+    async def _request_full_report(self, client: Any, serial: str) -> None:
+        """Ask the printer for a full report.
+
+        The printer answers a `pushall` with everything it knows and never sends
+        a PUBACK for it, so anything above qos 0 waits out the client timeout and
+        tears down the subscription we just made.
+        """
+        await client.publish(
+            f"device/{serial}/request",
+            json.dumps({"pushing": {"sequence_id": "0", "command": "pushall", "push_target": 1}}),
+            qos=0,
+        )
+
+    def _needs_full_report(self) -> bool:
+        """Have we ever seen a report that carried the feeding system?
+
+        Only the full report does. Everything after it is a delta, and a delta
+        never repeats the slots — so a lost `pushall`, or one the printer chose
+        not to answer because another client was talking to it, leaves the agent
+        running normally on partial reports with no feeding system at all. The
+        hub then says "the printer does not report what is loaded", which is
+        true of the snapshot and false of the printer.
+
+        Every Bambu has at least the external spool holder, so "no slots at all"
+        is a report we have not received rather than a machine without one.
+        """
+        return not bambu_ams_slots(self._latest_print or {})
+
+    async def _keep_report_full(self, client: Any, serial: str) -> None:
+        """Re-ask for the full report until we have one, then keep it fresh.
+
+        Two intervals, because the two cases are different: the report has not
+        arrived (retry soon — the printer is unusable to the hub until it does)
+        and the report is old (resync rarely — a lost delta silently ages the
+        composition, and a full report costs a few kilobytes).
+        """
+        while not self._stop_event.is_set():
+            delay = BAMBU_PUSHALL_RETRY_S if self._needs_full_report() else BAMBU_PUSHALL_RESYNC_S
+            await asyncio.sleep(delay)
+            if self._stop_event.is_set():
+                return
+            try:
+                await self._request_full_report(client, serial)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Asking again is a nicety; reading reports is the job. The
+                # connection is almost certainly on its way out, and the
+                # reconnect starts this task over.
+                logger.debug(
+                    "could not ask for a full report",
+                    extra={"action": "printer", "printer_key": self.printer.key, "error": str(exc)},
+                )
+                return
 
     async def _handle_payload(self, payload: dict[str, Any]) -> None:
         if payload.get("info"):

@@ -146,6 +146,66 @@ def test_a_printer_without_an_ams_still_reports_its_spool() -> None:
     assert [(s.index, s.material) for s in slots] == [(254, "PETG")]
 
 
-def test_an_empty_spool_holder_is_not_a_slot() -> None:
-    """Пустой держатель — не «слот без материала», а отсутствие катушки."""
-    assert bambu_ams_slots({"vt_tray": {"id": "254", "tray_type": ""}}) == []
+def test_an_unnamed_spool_holder_is_still_a_slot() -> None:
+    """Незаполненный `tray_type` у держателя — «состав не назван», а не «пусто».
+
+    У держателя нет RFID: материал на экране принтера задаёт человек, и обычно
+    не задаёт вовсе. Пока пустое значение читалось как «катушки нет», держатель
+    не попадал в снапшот, а вместе с ним пропадала и возможность печатать с
+    него: хаб предлагает выбрать из тех мест заправки, о которых ему сказали.
+    Ровно так вёл себя H2D — четыре слота AMS в списке и ни одного держателя.
+
+    Ничего о материале при этом не утверждается (`material=None`), поэтому
+    автоматика такой слот не выберет — его выбирает человек.
+    """
+    slots = bambu_ams_slots({"vt_tray": {"id": "254", "tray_type": ""}})
+
+    assert [(s.index, s.material) for s in slots] == [(254, None)]
+
+
+def test_the_holder_keeps_the_number_the_printer_gave_it() -> None:
+    """Ноль — тоже номер, и подменять его на 254 нельзя.
+
+    Номер уезжает обратно в `ams_mapping`, и принтер не узнает тот, который мы
+    придумали за него. Отсутствие номера — другое дело: там 254 это известный
+    номер держателя, а не догадка.
+    """
+    assert bambu_ams_slots({"vt_tray": {"id": "0", "tray_type": "PLA"}})[0].index == 0
+    assert bambu_ams_slots({"vt_tray": {"tray_type": "PLA"}})[0].index == 254
+
+
+def test_the_holder_is_found_one_level_deeper_too() -> None:
+    """H-серия несёт часть отчёта в `device`, и форма там та же.
+
+    Промах здесь молчит: держателя просто нет в снапшоте — ни ошибки, ни
+    записи в журнале, только принтер, с катушки которого нельзя напечатать.
+    """
+    slots = bambu_ams_slots({"device": {"vt_tray": {"id": "254", "tray_type": "PETG"}}})
+
+    assert [(s.index, s.material) for s in slots] == [(254, "PETG")]
+
+    nested_ams = bambu_ams_slots(
+        {"device": {"ams": {"ams": [{"id": "0", "tray": [{"id": "1", "tray_type": "PLA"}]}]}}}
+    )
+    assert [(s.index, s.material) for s in nested_ams] == [(1, "PLA")]
+
+
+def test_two_holders_are_two_slots_and_neither_is_renumbered() -> None:
+    """У двухсопловой машины держатель на каждый экструдер."""
+    slots = bambu_ams_slots(
+        {"vt_tray": [{"id": "254", "tray_type": "PLA"}, {"id": "255", "tray_type": "PETG"}]}
+    )
+
+    assert [(s.index, s.material) for s in slots] == [(254, "PLA"), (255, "PETG")]
+
+
+def test_the_same_slot_reported_twice_is_reported_once() -> None:
+    """Отчёт может нести обе формы сразу — дубль слота хаб принял бы за второй."""
+    slots = bambu_ams_slots(
+        {
+            "vt_tray": {"id": "254", "tray_type": "PLA"},
+            "device": {"vt_tray": {"id": "254", "tray_type": "PLA"}},
+        }
+    )
+
+    assert [s.index for s in slots] == [254]
