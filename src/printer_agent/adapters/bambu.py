@@ -346,6 +346,14 @@ def _ams_units(print_state: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+#: What the external spool holder is called in a report. Two names, because the
+#: firmware families use two: `vt_tray` on X/P/A, `vir_slot` on the H-series.
+#: The second one was not a guess — an H2D on 0.1.0a28 logged the keys its report
+#: does carry (19.08.2026), and `vt_tray` was not among them while `vir_slot`
+#: was. Both hold the same fields, so only the name differs.
+_EXTERNAL_TRAY_KEYS: tuple[str, ...] = ("vt_tray", "vir_slot")
+
+
 def _external_trays(print_state: dict[str, Any]) -> list[dict[str, Any]]:
     """The external spool holders of a report — there may be more than one.
 
@@ -356,9 +364,10 @@ def _external_trays(print_state: dict[str, Any]) -> list[dict[str, Any]]:
     """
     trays: list[dict[str, Any]] = []
     for section in _report_sections(print_state):
-        raw = section.get("vt_tray")
-        candidates = raw if isinstance(raw, list) else [raw]
-        trays.extend(tray for tray in candidates if isinstance(tray, dict))
+        for key in _EXTERNAL_TRAY_KEYS:
+            raw = section.get(key)
+            candidates = raw if isinstance(raw, list) else [raw]
+            trays.extend(tray for tray in candidates if isinstance(tray, dict))
     return trays
 
 

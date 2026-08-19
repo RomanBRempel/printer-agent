@@ -281,3 +281,23 @@ def test_the_shape_is_reported_once_per_connection() -> None:
 
     # Второй раз — уже молча; сбрасывается только новым подключением.
     adapter._log_missing_feeding_system()
+
+
+def test_the_h_series_calls_its_holder_vir_slot() -> None:
+    """H2D шлёт `vir_slot`, а `vt_tray` у него в отчёте нет вовсе.
+
+    Это не догадка: 0.1.0a28 записал в журнал ключи отчёта H2D (19.08.2026), и
+    среди сотни имён был `vir_slot` — при четырёх нормально приехавших лотках
+    AMS. Поля внутри те же, отличается только имя.
+    """
+    slots = bambu_ams_slots(
+        {
+            "ams": {"ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "PETG"}]}]},
+            "vir_slot": [
+                {"id": "254", "tray_type": "PLA", "tray_color": "C12E1EFF"},
+                {"id": "255", "tray_type": ""},
+            ],
+        }
+    )
+
+    assert [(s.index, s.material) for s in slots] == [(0, "PETG"), (254, "PLA"), (255, None)]
