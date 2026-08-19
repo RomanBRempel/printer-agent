@@ -31,7 +31,7 @@
 | **`inventory` (по своей инициативе)** | да | **нет** — отвечает `unknown_message_type` | нет |
 | **`settings_request` → `settings`** | да (a19) | **нет** | нет |
 | **`settings_update`** | да (a19) | **нет** | нет |
-| **`log_request` → `log`** | да (a26) | **нет** | нет |
+| **`log_request` → `log`** | да (a26) | **нет** | нет — задание [rd-control-agent-log.md](rd-control-agent-log.md) |
 
 ## Что блокирует что
 
