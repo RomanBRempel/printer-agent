@@ -55,7 +55,19 @@ FRAME_WAIT_TIMEOUT_S = 10.0
 #: How long the stream stays open with nobody asking for frames...
 IDLE_CLOSE_S = 15.0
 #: ...and how long a failed probe is believed before the port is tried again.
+#:
+#: The first interval only. A model that does not serve this port never starts
+#: serving it, so a fixed retry writes the same line forever: an H2D produced
+#: about seventy identical "not answering" records in six hours on 25.08.2026,
+#: and the handful of lines that mattered that day drowned under them. The
+#: interval doubles up to :data:`PROBE_RETRY_MAX_S`, which turns a permanent
+#: absence into a few checks a day without ever giving up on a streamer that is
+#: switched on later.
 PROBE_RETRY_S = 300.0
+#: Ceiling for the doubling above. An hour: long enough to keep the journal
+#: readable, short enough that a camera enabled during a shift is noticed within
+#: it.
+PROBE_RETRY_MAX_S = 3600.0
 
 
 class BambuCameraError(RuntimeError):
@@ -114,6 +126,12 @@ class BambuChamberCamera:
         self._available = False
         self._probed = False
         self._last_probe = 0.0
+        #: Сколько проб подряд не ответили и чем именно. Первое задаёт интервал
+        #: следующей, второе — писать ли о ней в журнал: повтор той же причины
+        #: ничего не добавляет, а смена причины (порт открылся, сменилась
+        #: прошивка) добавляет и обязана быть видна.
+        self._probe_failures = 0
+        self._probe_error = ""
         self._last_request = 0.0
         #: Why the last attempt produced nothing, for the log and the probe.
         self.last_error = ""
@@ -134,7 +152,20 @@ class BambuChamberCamera:
             return False
         if not self._probed:
             return True
-        return (time.monotonic() - self._last_probe) >= PROBE_RETRY_S
+        return (time.monotonic() - self._last_probe) >= self._probe_interval()
+
+    def _probe_interval(self) -> float:
+        """Через сколько пробовать снова — вдвое дольше после каждой неудачи.
+
+        Ошибка тут тихая в обе стороны: слишком часто — журнал забивается
+        одинаковыми строками и в нём тонет всё остальное; слишком редко —
+        включённый в цеху стример замечается через сутки. Отсюда удвоение с
+        потолком в час.
+        """
+        if self._probe_failures <= 1:
+            return PROBE_RETRY_S
+        grown = PROBE_RETRY_S * (2.0 ** (self._probe_failures - 1))
+        return min(grown, PROBE_RETRY_MAX_S)
 
     async def probe(self) -> bool:
         """Ask for one frame, to learn whether this model serves this port at all."""
@@ -145,15 +176,27 @@ class BambuChamberCamera:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.info(
+            reason = str(exc) or exc.__class__.__name__
+            first_time = self._probe_failures == 0 or reason != self._probe_error
+            self._probe_failures += 1
+            self._probe_error = reason
+            # О первой неудаче и о СМЕНЕ причины говорим в полный голос, повтор
+            # той же причины уводим в debug: одна и та же строка, повторённая
+            # семьдесят раз за смену, не сообщает ничего и прячет всё остальное.
+            logger.log(
+                logging.INFO if first_time else logging.DEBUG,
                 "bambu chamber camera is not answering",
                 extra={
                     "action": "camera_probe",
                     "printer_key": self._printer_key,
-                    "error": str(exc) or exc.__class__.__name__,
+                    "error": reason,
+                    "attempt": self._probe_failures,
+                    "next_in_s": int(self._probe_interval()),
                 },
             )
             return False
+        self._probe_failures = 0
+        self._probe_error = ""
         logger.info(
             "bambu chamber camera answered",
             extra={"action": "camera_probe", "printer_key": self._printer_key},

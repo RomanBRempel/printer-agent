@@ -200,3 +200,62 @@ def test_the_capability_follows_the_probe_and_not_the_brand():
     adapter._camera._available = True
 
     assert adapter.capabilities().camera is True
+
+
+def _dead_camera() -> BambuChamberCamera:
+    return BambuChamberCamera(printer_key="jekson-h2d", host="10.0.0.5", access_code="1234")
+
+
+@pytest.mark.asyncio
+async def test_a_port_that_never_answers_is_asked_ever_more_rarely(monkeypatch, caplog):
+    """Иначе одна и та же строка пишется вечно и прячет под собой всё остальное.
+
+    Измерено 25.08.2026: H2D за шесть часов дал около семидесяти одинаковых
+    записей «not answering», и полезные строки того же дня — доставки файлов,
+    разрыв сессии, смена настроек — читались между ними по одной.
+    """
+    camera = _dead_camera()
+
+    async def refuse() -> bytes:
+        raise BambuCameraError("chamber stream sent a frame that is not a JPEG")
+
+    monkeypatch.setattr(camera, "frame", refuse)
+
+    intervals = []
+    for _ in range(5):
+        assert await camera.probe() is False
+        intervals.append(camera._probe_interval())
+
+    assert intervals[0] == bambu_camera.PROBE_RETRY_S
+    assert intervals == sorted(intervals), "интервал обязан расти, а не скакать"
+    assert intervals[-1] <= bambu_camera.PROBE_RETRY_MAX_S, "потолок обязан держать"
+    assert intervals[-1] > intervals[0], "затухания не произошло"
+
+
+@pytest.mark.asyncio
+async def test_the_same_reason_is_not_shouted_twice(monkeypatch, caplog):
+    """Первая неудача — в полный голос, повтор той же причины — в debug.
+
+    Смена причины (порт открылся, сменилась прошивка) снова становится видной:
+    подавлять её нельзя, это уже новость.
+    """
+    camera = _dead_camera()
+    reason = {"text": "not a JPEG"}
+
+    async def refuse() -> bytes:
+        raise BambuCameraError(reason["text"])
+
+    monkeypatch.setattr(camera, "frame", refuse)
+
+    with caplog.at_level("INFO"):
+        await camera.probe()
+        await camera.probe()
+        await camera.probe()
+    assert len([r for r in caplog.records if r.levelname == "INFO"]) == 1
+
+    caplog.clear()
+    reason["text"] = "connection refused"
+    with caplog.at_level("INFO"):
+        await camera.probe()
+    assert len([r for r in caplog.records if r.levelname == "INFO"]) == 1
+

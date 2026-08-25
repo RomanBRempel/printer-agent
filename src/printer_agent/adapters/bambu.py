@@ -1243,6 +1243,11 @@ class BambuAdapter(PrinterAdapter):
         time_remaining = self._safe_int(print_state.get("mc_remaining_time"))
         if time_remaining is not None:
             time_remaining *= 60
+        # Сырой путь сохраняем ДО обрезки: по нему и только по нему видно, какой
+        # адрес эта модель считает своим (`print_url_prefix`). `name` ниже режется
+        # для человека и на этот вопрос уже не отвечает.
+        reported_path = print_state.get("gcode_file")
+        reported_path = reported_path.strip() if isinstance(reported_path, str) else None
         current_file = print_state.get("subtask_name") or print_state.get("gcode_file")
         if isinstance(current_file, str) and current_file:
             current_file = current_file.removeprefix("/mnt/sdcard/")
@@ -1262,6 +1267,7 @@ class BambuAdapter(PrinterAdapter):
             time_elapsed_s=self._safe_int(print_state.get("gcode_start_time")),
             time_remaining_s=time_remaining,
             status=job_status,
+            path=reported_path or None,
         )
         temps = TemperatureSnapshot(
             nozzle=self._safe_float(print_state.get("nozzle_temper")),

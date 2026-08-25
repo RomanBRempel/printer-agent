@@ -301,3 +301,32 @@ def test_the_h_series_calls_its_holder_vir_slot() -> None:
     )
 
     assert [(s.index, s.material) for s in slots] == [(0, "PETG"), (254, "PLA"), (255, None)]
+
+
+def test_the_reported_file_path_survives_whole():
+    """Путь из отчёта — это ответ на вопрос «какой адрес ждёт эта модель».
+
+    `name` режется для человека (`/sdcard/` и прочие приставки снимаются), и на
+    этот вопрос уже не отвечает. 25.08.2026 подбор `print_url_prefix` вслепую
+    против H2D стоил половины дня, при том что принтер называл адрес в каждом
+    отчёте, а агент его выбрасывал.
+    """
+    adapter = make_adapter()
+    payload = adapter._snapshot_from_state(
+        {"gcode_state": "RUNNING", "gcode_file": "/sdcard/PQ-000031.gcode.3mf"}, None, None
+    ).to_dict()
+
+    assert payload["job"]["path"] == "/sdcard/PQ-000031.gcode.3mf"
+    # А имя по-прежнему человеческое, без приставки.
+    assert payload["job"]["name"] == "PQ-000031.gcode.3mf"
+
+
+def test_a_firmware_that_names_no_path_reports_none():
+    """Отсутствие пути — норма, а не пустая строка: их нельзя путать."""
+    adapter = make_adapter()
+    payload = adapter._snapshot_from_state({"gcode_state": "IDLE"}, None, None).to_dict()
+
+    # `to_dict()` пустые поля не кладёт вовсе — «нет пути» и «путь пустой»
+    # различаются именно так, и читатель обязан это переживать.
+    assert payload["job"].get("path") is None
+

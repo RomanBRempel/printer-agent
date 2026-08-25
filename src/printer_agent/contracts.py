@@ -174,6 +174,15 @@ class JobSnapshot:
     #: expose it — `None` means "not reported", while `0.0` is a real value for
     #: a print that has just started.
     filament_used_mm: float | None = None
+    #: Where the printer says the running file lives, exactly as reported and
+    #: with no prefix stripped — unlike `name`, which is trimmed for people.
+    #:
+    #: This is the answer to "which address does this model expect", and until
+    #: now the agent threw it away: `name` is built from the same field with
+    #: `/sdcard/` and friends removed. On 25.08.2026 that cost half a day of
+    #: guessing `print_url_prefix` against an H2D while the printer was stating
+    #: the answer in every report. `None` when the firmware does not name a path.
+    path: str | None = None
     #: Mass, for firmware that reports it directly. Nothing computes it here:
     #: length-to-mass needs the filament diameter and the material density, and
     #: the printer knows neither. The hub prefers this over its own estimate.
