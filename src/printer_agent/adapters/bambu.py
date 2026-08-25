@@ -59,6 +59,16 @@ BAMBU_PRINT_ERRORS = {
     # file. Set `print_url_prefix` for the printer — see `_print_url_prefix`.
     "0500-4002": "Unsupported file path or name — check print_url_prefix",
     "0500-4003": "The printer could not parse the print file",
+    # Read off Bambu's own published table on 25.08.2026, together with the
+    # three AMS codes next to it. The wording matters: it names the *mapping*,
+    # not the filament, so the fault is in what the print command carried and
+    # not in what is loaded — which is why it followed a print that had already
+    # cleared the address, the file and the model.
+    "0500-4037": "The sliced file does not match this printer model",
+    "0700-8012": "The printer could not take the AMS mapping — check ams_mapping",
+    "0700-8011": "The AMS ran out of filament in the slot the print asked for",
+    "0700-8001": "The filament cutter failed",
+    "0700-8013": "Purging the previous filament timed out",
 }
 
 #: How long the MQTT session may be down before the printer is called offline.
