@@ -132,8 +132,14 @@ async def test_slot_mapping_from_the_hub_reaches_the_printer(published) -> None:
     await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping={0: 2, 1: 0})
 
     payload = published.messages[0]["print"]
-    assert payload["ams_mapping"] == [2, 0]
+    # Дополнено до четырёх мест: Studio шлёт таблицу фиксированной длины, а
+    # неиспользованные места помечает `-1`. Короткая таблица — не меньшая
+    # таблица, и что прошивка делает с усечённой, она не сообщает.
+    assert payload["ams_mapping"] == [2, 0, -1, -1]
     assert payload["use_ams"] is True
+    # Вторая половина — для второго сопла. Стоковый плагин шлёт её всегда, а мы
+    # не слали вовсе: H2D отвечал `0700-8012` и вставал на паузу на нулевом слое.
+    assert payload["ams_mapping2"] == []
 
 
 @pytest.mark.asyncio
@@ -628,3 +634,49 @@ def make_two_colour_project(path: Path, *, plate: int, filaments: int) -> Path:
             f'<metadata key="index" value="{plate}"/>{entries}</plate></config>',
         )
     return path
+
+
+@pytest.mark.asyncio
+async def test_a_single_filament_plate_still_fills_the_whole_table(published) -> None:
+    """Плита на один филамент уезжает как `[0,-1,-1,-1]`, а не как `[0]`.
+
+    Отличие не обнаруживается по поведению односопловых машин — они печатают и
+    с коротким массивом, поэтому два независимых открытых клиента шлют `[0]` и
+    выглядят исправными. Двухсопловая H2D на нём вставала на паузу.
+    """
+    adapter = make_adapter()
+
+    await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping={0: 3})
+
+    payload = published.messages[0]["print"]
+    assert payload["ams_mapping"] == [3, -1, -1, -1]
+
+
+@pytest.mark.asyncio
+async def test_a_plate_wider_than_the_table_is_not_truncated(published) -> None:
+    """Пять филаментов — пять мест: дополнение не имеет права ничего срезать."""
+    adapter = make_adapter()
+
+    await adapter.start_print(
+        "f00d", "part.gcode.3mf", ams_mapping={0: 0, 1: 1, 2: 2, 3: 3, 4: 254}
+    )
+
+    payload = published.messages[0]["print"]
+    assert payload["ams_mapping"] == [0, 1, 2, 3, 254]
+
+
+@pytest.mark.asyncio
+async def test_no_mapping_means_no_table_at_all(published) -> None:
+    """Без сопоставления подающая система не задействуется — и таблицы нет.
+
+    Пустая таблица рядом с `use_ams: false` означала бы «раскладка есть, и она
+    пустая», а это другое утверждение.
+    """
+    adapter = make_adapter()
+
+    await adapter.start_print("f00d", "part.gcode.3mf")
+
+    payload = published.messages[0]["print"]
+    assert payload["use_ams"] is False
+    assert "ams_mapping2" not in payload
+

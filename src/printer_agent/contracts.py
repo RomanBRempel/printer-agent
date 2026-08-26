@@ -25,6 +25,7 @@ class MessageType(StrEnum):
     settings_request = "settings_request"
     settings_update = "settings_update"
     log_request = "log_request"
+    update_request = "update_request"
     command = "command"
     file_offer = "file_offer"
     camera_request = "camera_request"
@@ -54,6 +55,7 @@ HUB_TO_AGENT_TYPES = frozenset(
         MessageType.settings_request.value,
         MessageType.settings_update.value,
         MessageType.log_request.value,
+        MessageType.update_request.value,
         MessageType.command.value,
         MessageType.file_offer.value,
         MessageType.camera_request.value,
