@@ -468,6 +468,16 @@ may since have been fixed, and the alternative is an agent that can never be
 repaired from the hub. `status` is `failed` when there is no update feed
 configured or an install requested earlier is still running.
 
+**An agent older than `0.1.0a33` does not know the type and never answers it.**
+Like every hub message, an unrecognised one is logged and dropped, so the command
+stays pending until the hub gives up on it — there is no refusal to read. The
+version is in `hello.agent_version` and in every `inventory`, so the hub can tell
+before it sends: below `0.1.0a33` the control belongs greyed out, naming the
+version it needs, rather than posting a command whose only possible outcome is
+silence. This is also why the *first* agent on a fleet cannot be brought to
+`0.1.0a33` with this command — that one takes the scheduled check or a restart of
+the service, and every release after it is a button.
+
 ### `settings_update`
 
 Changes the agent's configuration from the hub.
