@@ -219,3 +219,99 @@ def test_the_service_restarts_itself_through_a_detached_child() -> None:
     assert recovery[:3] == ["sc.exe", "failure", SERVICE_NAME]
     assert "restart/5000" in recovery[-1]
     assert not any("failureflag" in part for part in recovery)
+
+
+# ─── Обновление по команде хаба ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_nothing_is_claimed_about_a_feed_never_checked() -> None:
+    """«Не проверяли» и «обновлений нет» — разные утверждения.
+
+    Хаб показывает это рядом с агентом. Отдай мы здесь «актуален», интерфейс
+    объявил бы агента свежим, ничего об этом не зная, — то же молчание, что и у
+    ошибки принтера без отметки времени.
+    """
+    updater = AutoUpdater(make_config(), is_busy=lambda: False, restart=lambda: None)
+
+    assert updater.known_status() is None
+
+
+@pytest.mark.asyncio
+async def test_a_check_leaves_a_dated_answer(hub_release) -> None:
+    """У снимка обязана быть отметка времени: без неё он не стареет на вид."""
+    updater = AutoUpdater(
+        make_config(auto_update=False), is_busy=lambda: False, restart=lambda: None
+    )
+
+    await updater.run()
+    status = updater.known_status()
+
+    assert status is not None
+    assert status["update_available"] is True
+    assert status["latest_version"] == MANIFEST.version
+    assert status["checked_at"], "снимок без времени читается как свежий всегда"
+    # Копия, а не внутреннее состояние: снимок уезжает в сообщение.
+    status["latest_version"] = "подменили"
+    assert updater.known_status()["latest_version"] == MANIFEST.version
+
+
+@pytest.mark.asyncio
+async def test_the_hub_can_install_even_when_the_schedule_is_off(hub_release) -> None:
+    """`auto_update` тут не спрашивается: это оператор ставит обновление сам."""
+    restarts: list[int] = []
+    updater = AutoUpdater(
+        make_config(auto_update=False, check_on_startup=False),
+        is_busy=lambda: False,
+        restart=lambda: restarts.append(1),
+        restarts_itself=True,
+    )
+
+    answer = await updater.update_now()
+
+    assert answer["scheduled"] is True
+    assert answer["latest_version"] == MANIFEST.version
+    assert answer["waiting_for_idle"] is False
+    assert answer["restarts_itself"] is True
+    await asyncio.sleep(0.05)
+    assert hub_release["applied"] == 1
+
+
+@pytest.mark.asyncio
+async def test_being_up_to_date_is_an_answer_not_a_failure(monkeypatch) -> None:
+    """Кнопку жмут, не зная наверняка, — «уже последняя» это ответ."""
+    monkeypatch.setattr(
+        updater_module,
+        "check_for_update",
+        lambda feed_url: UpdateStatus(
+            current_version="9.9.9", latest_version="9.9.9", update_available=False
+        ),
+    )
+    updater = AutoUpdater(make_config(), is_busy=lambda: False, restart=lambda: None)
+
+    answer = await updater.update_now()
+
+    assert answer["scheduled"] is False
+    assert answer["reason"] == "already_latest"
+
+
+@pytest.mark.asyncio
+async def test_a_version_nobody_asked_for_is_not_installed(hub_release) -> None:
+    """Оператор ждёт одно конкретное число; «примерно то же» здесь неверно."""
+    updater = AutoUpdater(make_config(), is_busy=lambda: False, restart=lambda: None)
+
+    with pytest.raises(updater_module.UpdateUnavailable):
+        await updater.update_now(target_version="1.2.3")
+    assert hub_release["applied"] == 0
+
+
+@pytest.mark.asyncio
+async def test_without_a_feed_the_refusal_names_the_reason() -> None:
+    """Иначе в ленте команд это читается как поломка агента."""
+    config = make_config()
+    config.updates.feed_url = ""
+    updater = AutoUpdater(config, is_busy=lambda: False, restart=lambda: None)
+
+    with pytest.raises(updater_module.UpdateUnavailable):
+        await updater.update_now()
+

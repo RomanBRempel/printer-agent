@@ -209,7 +209,12 @@ if _IMPORT_ERROR is None:
                 config,
                 is_busy=connection.is_busy,
                 restart=self._restart_for_update,
+                # Служба — необслуживаемый хост, она себя перезапускает. Хаб
+                # обязан это знать: иначе он будет ждать `hello` новой версии
+                # там, где его никто не пришлёт.
+                restarts_itself=True,
             )
+            connection.attach_updater(updater)
             connection_task = asyncio.create_task(connection.run())
             updater_task = asyncio.create_task(updater.run(), name="printer-agent-updater")
             try:

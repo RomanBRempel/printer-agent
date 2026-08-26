@@ -88,6 +88,31 @@ class CommandProcessor:
 
         return await self._run(command_id, "", "settings_update", run)
 
+    async def dispatch_update(
+        self,
+        payload: dict[str, Any],
+        run_update: Callable[[str], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Команда про самого агента: поставить обновление, потому что попросили.
+
+        Идёт через :meth:`_run` по той же причине, что и `settings_update`:
+        сохранённый результат читается первым, поэтому команда, доставленная
+        повторно из-за оборвавшегося сокета, не запускает вторую установку.
+        `printer_key` пуст — принтера в ней нет.
+
+        Ответ говорит, что ЗАПЛАНИРОВАНО, а не что новая версия уже работает:
+        установка ждёт простоя и перезапускает процесс, и ответ, посланный
+        после, до хаба не дойдёт. Подтверждает факт `hello` перезапустившегося
+        агента — он несёт `agent_version`.
+        """
+        command_id = str(payload["command_id"])
+        target = str(payload.get("target_version", "") or "")
+
+        async def run() -> dict[str, Any]:
+            return await run_update(target)
+
+        return await self._run(command_id, "", "update_request", run)
+
     async def dispatch_camera_request(
         self, adapter: PrinterAdapter, payload: dict[str, Any]
     ) -> dict[str, Any]:

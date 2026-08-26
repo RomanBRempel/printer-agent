@@ -309,8 +309,8 @@ state to compare against.
 protocol does not implement is `unsupported`, not `failed`.
 
 `printer_key` is the empty string for a command that is about the agent rather
-than about one printer — currently only `settings_update`. It is present and
-empty rather than omitted, so a hub can read the field unconditionally.
+than about one printer — `settings_update` and `update_request`. It is present
+and empty rather than omitted, so a hub can read the field unconditionally.
 
 ### `heartbeat`
 
@@ -420,6 +420,53 @@ Answered with `settings`. Like `inventory_request` it carries no `command_id`
 and gets no `command_result`: it is a request for state, not an action. An agent
 too old to know the type ignores it and logs the unknown type, so a missing
 answer means "this agent predates the message", not a failure.
+
+### `update_request`
+
+Installs an agent update because a person asked, instead of waiting for the
+scheduled check.
+
+```json
+{ "command_id": "cmd-12", "target_version": "0.1.0a32" }
+```
+
+`target_version` is optional. When it is given and the feed offers a different
+version the command fails rather than installing something nobody asked for — on
+a fleet where the operator is watching for one specific number, "close enough"
+is wrong.
+
+Answered with a `command_result` whose `result` says what was **scheduled**, not
+what is running:
+
+```json
+{
+  "scheduled": true,
+  "current_version": "0.1.0a31",
+  "latest_version": "0.1.0a32",
+  "waiting_for_idle": false,
+  "restarts_itself": true
+}
+```
+
+Installing waits for a moment when nothing is lost by restarting — no print file
+mid-transfer, no open camera session — and then restarts the process, so an
+answer sent afterwards would never reach the hub. What confirms the new version
+is the `hello` of the restarted agent, which carries `agent_version`. Same shape
+and same reason as `settings_update`.
+
+`waiting_for_idle` true means the install is queued behind a transfer or a
+camera session: minutes away, not seconds. `restarts_itself` false means nobody
+will restart this process — a console run, where the package is installed and
+the old code keeps running until someone starts it again; the hub must not wait
+for a `hello` that is not coming. `scheduled` false with `reason:
+"already_latest"` is an answer, not a failure.
+
+Two rules differ from the scheduled cycle, both because a person asked: the
+agent's own `updates.auto_update` flag is not consulted, and a version this
+process refused to install earlier is retried once — whatever broke the install
+may since have been fixed, and the alternative is an agent that can never be
+repaired from the hub. `status` is `failed` when there is no update feed
+configured or an install requested earlier is still running.
 
 ### `settings_update`
 

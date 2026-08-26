@@ -10,7 +10,7 @@ from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
-from ..adapters.base import PrinterAdapter
+from ..adapters.base import PrinterAdapter, UnsupportedCommandError
 from ..config import (
     AgentConfig,
     config_from_dict,
@@ -122,18 +122,36 @@ def roster_stamp(printers: list[dict[str, Any]]) -> str:
     return json.dumps(printers, sort_keys=True)
 
 
-def hello_payload(config: AgentConfig, adapters: list[PrinterAdapter], agent_version: str) -> dict[str, Any]:
-    """The handshake payload, shared with the connectivity check."""
-    return {
+def hello_payload(
+    config: AgentConfig,
+    adapters: list[PrinterAdapter],
+    agent_version: str,
+    update: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The handshake payload, shared with the connectivity check.
+
+    `update` — что известно про доступную версию. Ключ ОТСУТСТВУЕТ, когда фид
+    ещё не проверялся: «не знаем» и «обновлений нет» — разные утверждения, и
+    хаб, показавший второе вместо первого, объявит агента актуальным, ничего об
+    этом не зная.
+    """
+    payload: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "agent_version": agent_version,
         "location_key": config.location_key,
         "printers": printer_roster(adapters),
     }
+    if update:
+        payload["update"] = update
+    return payload
 
 
 def inventory_payload(
-    config: AgentConfig, adapters: list[PrinterAdapter], agent_version: str, request_msg_id: str = ""
+    config: AgentConfig,
+    adapters: list[PrinterAdapter],
+    agent_version: str,
+    request_msg_id: str = "",
+    update: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The printer roster: who this agent is configured for.
 
@@ -148,6 +166,8 @@ def inventory_payload(
     }
     if request_msg_id:
         payload["request_msg_id"] = request_msg_id
+    if update:
+        payload["update"] = update
     return payload
 
 
@@ -394,6 +414,9 @@ class HubConnection:
         if message_type == MessageType.settings_update.value:
             await self._handle_settings_update(ws, message_payload)
             return
+        if message_type == MessageType.update_request.value:
+            await self._handle_update_request(ws, message_payload)
+            return
         if message_type in COMMAND_BEARING_TYPES:
             await self._handle_command(ws, str(message_type), message_payload)
             return
@@ -488,14 +511,23 @@ class HubConnection:
         await self._send(ws, build_envelope(MessageType.command_result.value, result))
 
     async def _send_hello(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        payload = hello_payload(self.config, list(self._adapters.values()), self._agent_version())
+        payload = hello_payload(
+            self.config,
+            list(self._adapters.values()),
+            self._agent_version(),
+            self._update_status(),
+        )
         await self._send(ws, build_envelope(MessageType.hello.value, payload))
         self._roster_stamp = roster_stamp(payload["printers"])
         self.state.last_hello_at = utc_now_iso()
 
     async def _send_inventory(self, ws: aiohttp.ClientWebSocketResponse, request_msg_id: str) -> None:
         payload = inventory_payload(
-            self.config, list(self._adapters.values()), self._agent_version(), request_msg_id
+            self.config,
+            list(self._adapters.values()),
+            self._agent_version(),
+            request_msg_id,
+            self._update_status(),
         )
         # Which of the two cases this is has to be readable in the log. Both
         # send the same message, and reading an unsolicited announcement as an
@@ -599,6 +631,46 @@ class HubConnection:
             },
         )
         await self._send(ws, build_envelope(MessageType.settings.value, payload))
+
+    def attach_updater(self, updater: Any) -> None:
+        """Подключить апдейтер после создания соединения.
+
+        Порядок вынужденный и не случайный: апдейтер берёт у соединения
+        `is_busy`, поэтому создаётся вторым и в конструктор попасть не может.
+        Соединение о его типе ничего не знает — ему нужны ровно два метода,
+        `update_now()` и `known_status()`.
+        """
+        self._updater = updater
+
+    def _update_status(self) -> dict[str, Any] | None:
+        """Что известно про обновление — молча, если апдейтера нет вовсе."""
+        updater = getattr(self, "_updater", None)
+        if updater is None:
+            return None
+        try:
+            return updater.known_status()
+        except Exception:  # noqa: BLE001 — рукопожатие важнее сведений о версии
+            logger.exception("could not read the update status")
+            return None
+
+    async def _run_update(self, target_version: str) -> dict[str, Any]:
+        updater = getattr(self, "_updater", None)
+        if updater is None:
+            raise UnsupportedCommandError("this agent runs without an updater")
+        return await updater.update_now(target_version=target_version)
+
+    async def _handle_update_request(
+        self, ws: aiohttp.ClientWebSocketResponse, payload: dict[str, Any]
+    ) -> None:
+        command_id = str(payload.get("command_id", ""))
+        if not command_id:
+            logger.warning(
+                "hub message without command_id",
+                extra={"action": "hub_command", "message_type": MessageType.update_request.value},
+            )
+            return
+        result = await self._command_processor.dispatch_update(payload, self._run_update)
+        await self._send(ws, build_envelope(MessageType.command_result.value, result))
 
     async def _handle_settings_update(
         self, ws: aiohttp.ClientWebSocketResponse, payload: dict[str, Any]

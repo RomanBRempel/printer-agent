@@ -20,8 +20,10 @@ import asyncio
 import logging
 from collections.abc import Callable
 from contextlib import suppress
+from typing import Any
 
 from .config import AgentConfig
+from .contracts import utc_now_iso
 from .updates import UpdateManifest, apply_update, check_for_update
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,15 @@ IDLE_POLL_S = 60.0
 IDLE_WAIT_LIMIT_S = 6 * 3600.0
 
 
+class UpdateUnavailable(RuntimeError):
+    """Обновить по просьбе хаба нельзя, и причина человеку понятна.
+
+    Отдельный класс, а не общий сбой: «фид не настроен» и «предыдущая установка
+    ещё идёт» — состояния, а не аварии, и в ленте команд они обязаны читаться
+    как ответ, а не как поломка агента.
+    """
+
+
 class AutoUpdater:
     """Polls the update feed and installs, on the schedule the config sets."""
 
@@ -45,11 +56,28 @@ class AutoUpdater:
         *,
         is_busy: Callable[[], bool],
         restart: Callable[[], None],
+        restarts_itself: bool = False,
     ):
         self.config = config
         self._is_busy = is_busy
         self._restart = restart
+        #: Перезапустит ли себя этот процесс после установки. У службы — да, у
+        #: консольного запуска — нет: там за клавиатурой сидит человек, и убить
+        #: его сессию ради смены версии было бы неожиданностью. Хаб обязан это
+        #: знать, иначе он будет ждать `hello` новой версии, который не придёт.
+        self._restarts_itself = restarts_itself
         self._stop_event = asyncio.Event()
+        #: Установка, запрошенная хабом. Держится, чтобы вторая просьба не
+        #: запустила вторую установку поверх идущей.
+        self._requested_task: asyncio.Task[None] | None = None
+        #: Чем кончилась последняя проверка фида и КОГДА она была. Хаб
+        #: показывает это рядом с агентом, поэтому отметка времени обязательна:
+        #: «доступна 0.1.0a32» без неё выглядит свежим фактом и через трое суток
+        #: — тот же класс молчания, что у ошибки принтера без времени.
+        #: `None` означает «ещё не проверяли», и это НЕ то же самое, что
+        #: «обновлений нет»: показать второе вместо первого значит объявить
+        #: агента актуальным, ничего об этом не зная.
+        self._last_status: dict[str, Any] | None = None
         #: Versions this process already failed to install. Retrying the same
         #: broken package every cycle only fills the log and the link.
         self._refused: set[str] = set()
@@ -75,6 +103,92 @@ class AutoUpdater:
                 return
             await self._cycle()
 
+    def _remember(self, status: Any) -> None:
+        """Запомнить исход проверки фида — единственная точка записи."""
+        self._last_status = {
+            "current_version": str(getattr(status, "current_version", "") or ""),
+            "latest_version": str(getattr(status, "latest_version", "") or ""),
+            "update_available": bool(getattr(status, "update_available", False)),
+            "checked_at": utc_now_iso(),
+        }
+
+    def known_status(self) -> dict[str, Any] | None:
+        """Что известно про обновление — для `hello` и `inventory`.
+
+        Возвращает КОПИЮ: снимок уезжает в сообщение, и вызывающий не должен
+        мочь испортить состояние апдейтера, дописав в него поле.
+        """
+        return dict(self._last_status) if self._last_status else None
+
+    async def update_now(self, *, target_version: str = "") -> dict[str, Any]:
+        """Проверить и установить, потому что попросил человек, а не часы.
+
+        Возвращает управление, как только принято РЕШЕНИЕ, а не когда новая
+        версия поднялась: установка ждёт простоя и перезапускает процесс, и
+        ответ, посланный после этого, до хаба уже не дойдёт. Поэтому
+        `command_result` сообщает, что запланировано, а факт подтверждает
+        `hello` перезапустившегося агента — он несёт `agent_version`. Та же
+        форма и та же причина, что у `settings_update`.
+
+        Два правила отличаются от планового цикла, и оба потому, что попросил
+        человек: `updates.auto_update` не спрашивается вовсе (тот флаг управляет
+        необслуживаемым путём, а здесь оператор ставит обновление сам, только из
+        хаба, а не из десктопного приложения), и версия, которую этот процесс
+        раньше отказался ставить, пробуется ещё раз — сломавшее установку могло
+        с тех пор почини́ться, а иначе агента нельзя починить из хаба вообще.
+        """
+        if not self.config.updates.feed_url:
+            raise UpdateUnavailable("у этого агента не настроен адрес обновлений")
+        if self._requested_task is not None and not self._requested_task.done():
+            raise UpdateUnavailable("установка, запрошенная раньше, ещё идёт")
+
+        status = await asyncio.to_thread(check_for_update, self.config.updates.feed_url)
+        self._remember(status)
+        if not status.update_available or status.manifest is None:
+            logger.info(
+                "hub asked for an update; already on the latest version",
+                extra={"action": "hub_update", "version": status.current_version},
+            )
+            return {
+                "scheduled": False,
+                "reason": "already_latest",
+                "current_version": status.current_version,
+                "latest_version": status.latest_version,
+            }
+
+        manifest = status.manifest
+        if target_version and target_version != manifest.version:
+            # Хаб назвал версию, а фид предлагает другую. Поставить всё равно
+            # значит установить то, чего никто не просил, на парк, где оператор
+            # ждёт одно конкретное число.
+            raise UpdateUnavailable(
+                f"фид предлагает {manifest.version}, а запрошена {target_version}"
+            )
+
+        self._refused.discard(manifest.version)
+        self._requested_task = asyncio.create_task(
+            self._apply_when_idle(manifest), name="printer-agent-update-request"
+        )
+        busy = self._is_busy()
+        logger.info(
+            "hub asked for an update",
+            extra={
+                "action": "hub_update",
+                "version": status.current_version,
+                "latest": manifest.version,
+                "busy": str(busy),
+            },
+        )
+        return {
+            "scheduled": True,
+            "current_version": status.current_version,
+            "latest_version": manifest.version,
+            # True означает, что установка стоит за передачей файла либо за
+            # открытой камерой, то есть перезапуск в минутах, а не в секундах.
+            "waiting_for_idle": busy,
+            "restarts_itself": self._restarts_itself,
+        }
+
     async def _cycle(self) -> None:
         try:
             status = await asyncio.to_thread(check_for_update, self.config.updates.feed_url)
@@ -87,6 +201,7 @@ class AutoUpdater:
             )
             return
 
+        self._remember(status)
         if not status.update_available or status.manifest is None:
             logger.info(
                 "agent is on the latest version",

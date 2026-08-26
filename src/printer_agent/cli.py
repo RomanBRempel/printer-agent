@@ -225,6 +225,9 @@ def run_agent(config: AgentConfig) -> int:
                 extra={"action": "auto_update"},
             ),
         )
+        # Кнопка «Обновить» в хабе ведёт сюда. Подключается после создания:
+        # апдейтер берёт у соединения `is_busy` и раньше него существовать не может.
+        connection.attach_updater(updater)
         updater_task = asyncio.create_task(updater.run(), name="printer-agent-updater")
         try:
             await connection.run()
