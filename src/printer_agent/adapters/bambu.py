@@ -480,6 +480,78 @@ def _ams_unit_nozzle(unit: Mapping[str, Any]) -> int | None:
     return extruder
 
 
+#: Разрядка поля `device.extruder.state` (BambuStudio, `DevExtruderSystem.cpp`):
+#: биты 0-3 — сколько сопел у машины, биты 4-7 — какое из них работает СЕЙЧАС.
+#: Нумерация та же, что у `info[].id` и у держателей катушек: 0 — основное
+#: (правое), 1 — вспомогательное (левое).
+BAMBU_EXTRUDER_STATE_ACTIVE_SHIFT = 4
+BAMBU_EXTRUDER_STATE_ACTIVE_MASK = 0xF
+#: `info[].temp` упаковывает ДВЕ величины в одно число: младшие 16 бит —
+#: текущая температура, старшие — заданная.
+BAMBU_EXTRUDER_TEMP_MASK = 0xFFFF
+BAMBU_EXTRUDER_TARGET_SHIFT = 16
+
+
+def _extruder_bits(value: Any) -> int | None:
+    """Число из поля, которое прошивка шлёт то числом, то шестнадцатеричной строкой."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return int(value.strip(), 16)
+        except ValueError:
+            return None
+    return None
+
+
+def active_nozzle_temps(print_state: Mapping[str, Any]) -> tuple[float, float] | None:
+    """Температура ТОГО сопла, которое сейчас печатает, и его уставка.
+
+    У двухсопловой машины плоское `nozzle_temper` отвечает не на тот вопрос:
+    оно называет одно фиксированное сопло, а печатать может второе. В цехе это
+    выглядело так — H2D печатает PETG, а система показывает 140°, то есть
+    температуру простаивающего сопла. Ошибка молчаливая и опасная в обе
+    стороны: остывшее сопло по такому показанию тоже не отличить от рабочего.
+
+    ``None`` означает «машина про сопла порознь не рассказывает» (односопловые
+    P1/X1/A1, прошивка постарше) — вызывающий берёт плоские поля, как раньше.
+    Догадок здесь нет: если активное сопло не названо, а описание одно, берётся
+    оно; при нескольких — отказ, потому что выбранное наугад сопло хуже, чем
+    честный откат к прежнему поведению.
+    """
+    for section in (print_state.get("device"), print_state):
+        if not isinstance(section, Mapping):
+            continue
+        extruder = section.get("extruder")
+        if not isinstance(extruder, Mapping):
+            continue
+        entries = [item for item in (extruder.get("info") or []) if isinstance(item, Mapping)]
+        if not entries:
+            continue
+        state = _extruder_bits(extruder.get("state"))
+        active = None
+        if state is not None:
+            active = (state >> BAMBU_EXTRUDER_STATE_ACTIVE_SHIFT) & BAMBU_EXTRUDER_STATE_ACTIVE_MASK
+        chosen = None
+        for item in entries:
+            if active is not None and _extruder_bits(item.get("id")) == active:
+                chosen = item
+                break
+        if chosen is None and len(entries) == 1:
+            chosen = entries[0]
+        if chosen is None:
+            continue
+        packed = _extruder_bits(chosen.get("temp"))
+        if packed is None:
+            continue
+        current = packed & BAMBU_EXTRUDER_TEMP_MASK
+        target = (packed >> BAMBU_EXTRUDER_TARGET_SHIFT) & BAMBU_EXTRUDER_TEMP_MASK
+        return float(current), float(target)
+    return None
+
+
 #: Trays per AMS unit, used to give the slots one flat numbering across units —
 #: the printer numbers trays 0..3 inside each unit and identifies the unit
 #: separately, but the hub compares against a single list of loaded filaments.
@@ -1630,9 +1702,18 @@ class BambuAdapter(PrinterAdapter):
             status=job_status,
             path=reported_path or None,
         )
+        # Двухсопловая машина называет сопла порознь, и печатает не обязательно
+        # то, которое стоит в плоском поле, — см. `active_nozzle_temps`.
+        per_nozzle = active_nozzle_temps(print_state)
         temps = TemperatureSnapshot(
-            nozzle=self._safe_float(print_state.get("nozzle_temper")),
-            nozzle_target=self._safe_float(print_state.get("nozzle_target_temper")),
+            nozzle=(
+                per_nozzle[0] if per_nozzle
+                else self._safe_float(print_state.get("nozzle_temper"))
+            ),
+            nozzle_target=(
+                per_nozzle[1] if per_nozzle
+                else self._safe_float(print_state.get("nozzle_target_temper"))
+            ),
             bed=self._safe_float(print_state.get("bed_temper")),
             bed_target=self._safe_float(print_state.get("bed_target_temper")),
             chamber=self._safe_float(print_state.get("chamber_temper")),

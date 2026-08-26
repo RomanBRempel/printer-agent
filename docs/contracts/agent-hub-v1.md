@@ -271,6 +271,13 @@ holder is an ordinary choice — a two-colour job with one colour there is norma
 so a hub that ignored the entry would fail to match a job that the printer can
 run perfectly well.
 
+**`temps.nozzle` is the nozzle that is printing.** On a machine with more than
+one nozzle the agent reports the *active* one — the printer names them separately
+and prints with one at a time, so a fixed choice answers a different question than
+the operator is asking. An H2D printing PETG on its left nozzle reported 140°, the
+idle right one; the mistake is silent in both directions, because a cold nozzle
+reads the same way. Single-nozzle machines are unaffected.
+
 **`nozzle` says which nozzle this slot can feed** — `0` right, `1` left, in the
 same numbering the print command uses for nozzles. It is absent when there is
 nothing to say: a single-nozzle machine, a feeding system bound to both nozzles
