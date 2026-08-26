@@ -330,3 +330,73 @@ def test_a_firmware_that_names_no_path_reports_none():
     # различаются именно так, и читатель обязан это переживать.
     assert payload["job"].get("path") is None
 
+
+# ─── Какое сопло кормит место заправки ───────────────────────────────────────
+
+
+def test_the_unit_reports_which_nozzle_it_feeds():
+    """Биты 8–11 поля `info` — номер экструдера, и нумерация та же, что у сопел.
+
+    `0` — правое, `1` — левое: одна и та же нумерация прошивки в отчёте
+    подающей системы и в команде печати, переводить между ними нечего.
+    """
+    adapter = make_adapter()
+    state = {
+        "gcode_state": "IDLE",
+        "ams": {"ams": [{"id": "0", "info": "0100", "tray": [{"id": "0", "tray_type": "PETG"}]}]},
+    }
+
+    payload = adapter._snapshot_from_state(state, None, None).to_dict()
+    assert payload["state"]["ams"]["slots"][0]["nozzle"] == 1
+
+    # Значение из живого отчёта: `1041` — те же биты, но экструдер основной.
+    state["ams"]["ams"][0]["info"] = "1041"
+    payload = adapter._snapshot_from_state(state, None, None).to_dict()
+    assert payload["state"]["ams"]["slots"][0]["nozzle"] == 0
+
+
+def test_a_unit_bound_to_both_nozzles_is_no_restriction():
+    """`0xE` означает «привязки к одному соплу нет» — а не «никакому».
+
+    Прочитать это как запрет значило бы запретить печать на исправной машине с
+    переключателем филамента.
+    """
+    adapter = make_adapter()
+    state = {
+        "gcode_state": "IDLE",
+        "ams": {"ams": [{"id": "0", "info": "0E00", "tray": [{"id": "0", "tray_type": "PLA"}]}]},
+    }
+
+    payload = adapter._snapshot_from_state(state, None, None).to_dict()
+    # Ключа нет вовсе: `None` из снимка вычищается, и это то же «ограничения нет».
+    assert "nozzle" not in payload["state"]["ams"]["slots"][0]
+
+
+def test_a_report_without_info_says_nothing_about_nozzles():
+    """Односопловая машина и прошивка постарше поля не присылают — это норма."""
+    adapter = make_adapter()
+    state = {
+        "gcode_state": "IDLE",
+        "ams": {"ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "PLA"}]}]},
+    }
+
+    payload = adapter._snapshot_from_state(state, None, None).to_dict()
+    assert "nozzle" not in payload["state"]["ams"]["slots"][0]
+
+
+def test_the_two_spool_holders_belong_to_different_nozzles():
+    """Номера держателей обратны номерам сопел: `255` — правое, `254` — левое."""
+    adapter = make_adapter()
+    state = {
+        "gcode_state": "IDLE",
+        "vir_slot": [
+            {"id": "254", "tray_type": "PLA"},
+            {"id": "255", "tray_type": "PETG"},
+        ],
+    }
+
+    payload = adapter._snapshot_from_state(state, None, None).to_dict()
+    by_index = {s["index"]: s for s in payload["state"]["ams"]["slots"]}
+    assert by_index[254]["nozzle"] == 1
+    assert by_index[255]["nozzle"] == 0
+

@@ -271,6 +271,18 @@ holder is an ordinary choice — a two-colour job with one colour there is norma
 so a hub that ignored the entry would fail to match a job that the printer can
 run perfectly well.
 
+**`nozzle` says which nozzle this slot can feed** — `0` right, `1` left, in the
+same numbering the print command uses for nozzles. It is absent when there is
+nothing to say: a single-nozzle machine, a feeding system bound to both nozzles
+through a filament switcher, or firmware that does not report the binding. Absent
+means "no restriction" and never "no nozzle": reading it the other way would
+forbid printing on a healthy machine.
+
+A hub that ignores it will, on a two-nozzle printer, offer a slot that cannot
+feed the nozzle the plate was sliced for. The printer then refuses the whole
+print with `0700-8012` — "could not get the AMS mapping" — and stops on layer
+zero, which is a long way from the choice that caused it.
+
 **The spool holder is reported whether or not the printer can name what is on
 it**, for the same reason an AMS tray is: it has no RFID, so `material` is
 whatever a human typed on the printer's screen and is usually absent. Reading

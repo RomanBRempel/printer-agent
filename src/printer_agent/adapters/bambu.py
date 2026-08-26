@@ -406,6 +406,53 @@ class _ImplicitFTPS(ftplib.FTP_TLS):
 #: printer's and not one we invented.
 BAMBU_EXTERNAL_SPOOL_SLOT = 254
 
+#: Где в поле `info` подающей системы лежит номер экструдера, который она кормит.
+#:
+#: `info` — шестнадцатеричная строка флагов; биты 8–11 держат номер экструдера
+#: (`DevFilaSystemParser::ParseV1_0` в Bambu Studio). Номера совпадают с теми, в
+#: которых команда печати называет сопла: `0` — правое, `1` — левое
+#: (`DevExtruderSystem.h`: «0-right 1-left», `CloudTaskNozzleId`). Совпадение не
+#: случайное — это одна и та же нумерация прошивки, и переводить между ними
+#: нечего.
+BAMBU_AMS_INFO_EXTRUDER_SHIFT = 8
+BAMBU_AMS_INFO_EXTRUDER_MASK = 0xF
+
+#: Значение того же поля, означающее «привязки к одному соплу нет»: система
+#: кормит оба через переключатель либо не привязана ни к одному. Ограничением
+#: это не является — такое место заправки годится любому соплу, и трактовать его
+#: как «никакому» значило бы запретить печать на исправной машине.
+BAMBU_AMS_EXTRUDER_ANY = 0xE
+
+#: Какое сопло кормит внешний держатель катушки. Их два у двухсопловой машины, и
+#: номера не подряд: `255` — основной экструдер (правое сопло), `254` —
+#: вспомогательный (левое). Значения прошивки (`VIRTUAL_TRAY_MAIN_ID` /
+#: `VIRTUAL_TRAY_DEPUTY_ID`), и порядок у них обратный номерам сопел — угадать
+#: его нельзя.
+BAMBU_EXTERNAL_SPOOL_NOZZLE: dict[int, int] = {255: 0, 254: 1}
+
+
+def _ams_unit_nozzle(unit: Mapping[str, Any]) -> int | None:
+    """Какое сопло кормит эта подающая система, по её полю `info`.
+
+    ``None`` означает «сказать нечего» и НЕ равно «никакое»: поля может не быть
+    вовсе (односопловая машина, прошивка постарше), а значение
+    :data:`BAMBU_AMS_EXTRUDER_ANY` прямо говорит, что привязки к одному соплу
+    нет. И то и другое обязано читаться как «ограничения нет» — иначе печать
+    запрещалась бы на исправной машине.
+    """
+    raw = unit.get("info")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        bits = int(raw.strip(), 16)
+    except ValueError:
+        return None
+    extruder = (bits >> BAMBU_AMS_INFO_EXTRUDER_SHIFT) & BAMBU_AMS_INFO_EXTRUDER_MASK
+    if extruder == BAMBU_AMS_EXTRUDER_ANY:
+        return None
+    return extruder
+
+
 #: Trays per AMS unit, used to give the slots one flat numbering across units —
 #: the printer numbers trays 0..3 inside each unit and identifies the unit
 #: separately, but the hub compares against a single list of loaded filaments.
@@ -531,6 +578,7 @@ def bambu_ams_slots(print_state: dict[str, Any]) -> list[AmsSlot]:
             continue
         unit_index = BambuAdapter._safe_int(unit.get("id"))
         unit_index = ordinal if unit_index is None else unit_index
+        unit_nozzle = _ams_unit_nozzle(unit)
         trays = unit.get("tray")
         if not isinstance(trays, list):
             continue
@@ -551,6 +599,7 @@ def bambu_ams_slots(print_state: dict[str, Any]) -> list[AmsSlot]:
                     material=material,
                     color=_tray_color(tray.get("tray_color")),
                     remaining_pct=remaining if remaining is not None and remaining >= 0 else None,
+                    nozzle=unit_nozzle,
                 )
             )
 
@@ -571,6 +620,11 @@ def bambu_ams_slots(print_state: dict[str, Any]) -> list[AmsSlot]:
                 # the printer fills the field with 0 — which as a percentage
                 # reads "empty" for a spool that may be full.
                 remaining_pct=None,
+                # У двухсопловой машины держателей два, по одному на сопло, и
+                # номера у них обратные номерам сопел (`255` — правое, `254` —
+                # левое). Держатель, о котором прошивка так не говорит,
+                # ограничения не несёт.
+                nozzle=BAMBU_EXTERNAL_SPOOL_NOZZLE.get(index),
             )
         )
     return slots
