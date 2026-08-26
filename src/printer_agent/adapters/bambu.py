@@ -109,16 +109,13 @@ BAMBU_UPLOAD_DIR = "/"
 #: `file:///`. So the FTP layout does not predict the answer and neither does the
 #: brand; only the printer does, which is why this is a setting and why a wrong
 #: one now names itself in the error rather than failing mute.
-#: Сколько мест держит таблица соответствия AMS в команде печати.
+#: Чем помечен филамент, которому места заправки не назначено.
 #:
-#: Studio отдаёт её фиксированной длины и заполняет неиспользованные места
-#: `-1` — плита на один филамент уезжает как `[0,-1,-1,-1]`. Взято из открытой
-#: реализации сетевого плагина (`ClusterM/open-bamboo-networking`,
-#: `print_job.cpp::format_ams_mapping`), которая сверялась со стоковым
-#: `libbambu_networking.so` на живой прошивке, а не из чьего-то пересказа
-#: протокола: два независимых клиента шлют `[0]`, и на односопловых машинах это
-#: проходит — то есть по их поведению отличие не обнаруживается вовсе.
-BAMBU_AMS_MAPPING_SLOTS = 4
+#: Значение Bambu Studio (`SelectMachineDialog::get_ams_mapping_result`): в
+#: таблице `ams_mapping2` неназначенная строка едет как `{"ams_id": 255,
+#: "slot_id": 255}`. Ноль здесь означал бы первое место первой подающей системы,
+#: то есть печать не тем пластиком.
+BAMBU_UNASSIGNED_SLOT = 0xFF
 
 BAMBU_PRINT_URL_PREFIX = "file:///sdcard/"
 
@@ -808,14 +805,14 @@ class BambuAdapter(PrinterAdapter):
             payload["ams_mapping"] = await self._positional_mapping(
                 ams_mapping, payload.get("param"), local_path
             )
-            # Вторая половина таблицы — для второго сопла. Стоковый плагин шлёт
-            # это поле ВСЕГДА, даже пустым массивом (сверено на живой прошивке,
-            # см. `BAMBU_AMS_MAPPING_SLOTS`), а мы не слали его вовсе — и H2D,
-            # машина двухсопловая, отвечал `0700-8012`: «не удалось получить
-            # таблицу соответствия AMS», вставая на паузу на нулевом слое.
-            # Пустой массив означает «для второго сопла раскладки нет», что
-            # правда: хаб сопла не различает и назначает слоты одним списком.
-            payload["ams_mapping2"] = []
+            # Та самая «таблица соответствия AMS», которой H2D не мог
+            # получить (`0700-8012`, пауза на нулевом слое). Пустым массивом
+            # она была ровно один день — по комментарию открытой реализации
+            # плагина, что стоковый шлёт её «даже пустой». Шлёт-то он её
+            # всегда, но Studio её ЗАПОЛНЯЕТ.
+            payload["ams_mapping2"] = self._slot_table(
+                ams_mapping, len(payload["ams_mapping"])
+            )
 
         await self._publish_json({"print": payload})
         return {
@@ -859,11 +856,11 @@ class BambuAdapter(PrinterAdapter):
         part in whatever happens to be loaded, which is scrap discovered hours
         later.
 
-        The array is then **padded to** :data:`BAMBU_AMS_MAPPING_SLOTS` with
-        `-1`: Studio serialises a one-filament plate as `[0,-1,-1,-1]`, not as
-        `[0]`. A short table is not a smaller table — the firmware reads a fixed
-        number of places, and what it makes of a truncated one it does not say.
-        The trailing `-1` mean "this place is not used", which is exactly true.
+        Длина — по числу филаментов плиты, без дополнения: так её строит сам
+        Studio (`SelectMachineDialog::get_ams_mapping_result`, `mapping_v0_json`).
+        Дополнение до четырёх, стоявшее здесь один день, было ошибкой — оно
+        пришло из пересказа протокола, а не из его источника, и на H2D ничего не
+        изменило.
         """
         count = None
         if plate and local_path is not None:
@@ -877,8 +874,53 @@ class BambuAdapter(PrinterAdapter):
                 f"the hub's ams_mapping leaves filament {named} of {count} unassigned;"
                 " the printer takes one slot per filament and cannot be told to skip one"
             )
-        places = max(count, BAMBU_AMS_MAPPING_SLOTS)
-        return [int(mapping[index]) if index in mapping else -1 for index in range(places)]
+        return [int(mapping[index]) for index in range(count)]
+
+    @staticmethod
+    def _slot_table(mapping: Mapping[int, int], count: int) -> list[dict[str, int]]:
+        """Места заправки в том виде, в каком их читает многосопловая прошивка.
+
+        `ams_mapping` — плоский список номеров, `ams_mapping2` — тот же выбор
+        объектами `{"ams_id", "slot_id"}`, по одному на филамент. Так его строит
+        Studio (`SelectMachineDialog::get_ams_mapping_result`, `mapping_v1_json`):
+        первая таблица осталась от одноsopловых машин и номер подающей системы
+        выразить не может, вторая может — и двухсопловая машина читает именно её.
+
+        Номер разбирается обратно тем же правилом, которым хаб его собирал:
+        `index = номер_системы * BAMBU_TRAYS_PER_UNIT + место`. Правило одно на
+        обе стороны намеренно — разойдись они, печать пошла бы из места, которого
+        человек не выбирал, и узналось бы это по цвету готовой детали.
+
+        Внешний держатель катушки (254/255) в эту арифметику не входит: его
+        номер не составной, и он едет как есть в обоих полях — так же, как
+        Studio поступает со строкой, которой места не нашлось.
+
+        Args:
+            mapping: Пары «филамент → место заправки» от хаба.
+            count: Сколько филаментов у плиты.
+
+        Returns:
+            list: По объекту на филамент, в порядке филаментов.
+        """
+        table: list[dict[str, int]] = []
+        for index in range(count):
+            slot = mapping.get(index)
+            if slot is None:
+                table.append(
+                    {"ams_id": BAMBU_UNASSIGNED_SLOT, "slot_id": BAMBU_UNASSIGNED_SLOT}
+                )
+                continue
+            slot = int(slot)
+            if slot >= BAMBU_EXTERNAL_SPOOL_SLOT:
+                table.append({"ams_id": slot, "slot_id": slot})
+                continue
+            table.append(
+                {
+                    "ams_id": slot // BAMBU_TRAYS_PER_UNIT,
+                    "slot_id": slot % BAMBU_TRAYS_PER_UNIT,
+                }
+            )
+        return table
 
     async def _refuse_a_silent_single_colour(
         self, plate: str, local_path: str | Path | None, ams_mapping: list[int] | None

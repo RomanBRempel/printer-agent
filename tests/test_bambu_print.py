@@ -132,14 +132,14 @@ async def test_slot_mapping_from_the_hub_reaches_the_printer(published) -> None:
     await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping={0: 2, 1: 0})
 
     payload = published.messages[0]["print"]
-    # Дополнено до четырёх мест: Studio шлёт таблицу фиксированной длины, а
-    # неиспользованные места помечает `-1`. Короткая таблица — не меньшая
-    # таблица, и что прошивка делает с усечённой, она не сообщает.
-    assert payload["ams_mapping"] == [2, 0, -1, -1]
+    assert payload["ams_mapping"] == [2, 0]
     assert payload["use_ams"] is True
-    # Вторая половина — для второго сопла. Стоковый плагин шлёт её всегда, а мы
-    # не слали вовсе: H2D отвечал `0700-8012` и вставал на паузу на нулевом слое.
-    assert payload["ams_mapping2"] == []
+    # Та же раскладка объектами — её читает многосопловая прошивка. Номер
+    # разбирается обратно тем же правилом, которым хаб его собирал.
+    assert payload["ams_mapping2"] == [
+        {"ams_id": 0, "slot_id": 2},
+        {"ams_id": 0, "slot_id": 0},
+    ]
 
 
 @pytest.mark.asyncio
@@ -637,32 +637,34 @@ def make_two_colour_project(path: Path, *, plate: int, filaments: int) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_a_single_filament_plate_still_fills_the_whole_table(published) -> None:
-    """Плита на один филамент уезжает как `[0,-1,-1,-1]`, а не как `[0]`.
+async def test_a_second_ams_unit_is_expressible_only_in_the_object_table(published) -> None:
+    """Плоский номер не различает подающие системы, объектный — различает.
 
-    Отличие не обнаруживается по поведению односопловых машин — они печатают и
-    с коротким массивом, поэтому два независимых открытых клиента шлют `[0]` и
-    выглядят исправными. Двухсопловая H2D на нём вставала на паузу.
+    Хаб нумерует места сквозно (`система * 4 + место`), и пятое место — это
+    первое место ВТОРОЙ системы. В плоской таблице оно неотличимо от пятого
+    места первой; ради этого вторая таблица и существует.
     """
     adapter = make_adapter()
 
-    await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping={0: 3})
+    await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping={0: 4, 1: 7})
 
     payload = published.messages[0]["print"]
-    assert payload["ams_mapping"] == [3, -1, -1, -1]
+    assert payload["ams_mapping"] == [4, 7]
+    assert payload["ams_mapping2"] == [
+        {"ams_id": 1, "slot_id": 0},
+        {"ams_id": 1, "slot_id": 3},
+    ]
 
 
 @pytest.mark.asyncio
-async def test_a_plate_wider_than_the_table_is_not_truncated(published) -> None:
-    """Пять филаментов — пять мест: дополнение не имеет права ничего срезать."""
+async def test_the_external_spool_is_not_split_into_unit_and_slot(published) -> None:
+    """Номер внешнего держателя не составной — арифметика к нему неприменима."""
     adapter = make_adapter()
 
-    await adapter.start_print(
-        "f00d", "part.gcode.3mf", ams_mapping={0: 0, 1: 1, 2: 2, 3: 3, 4: 254}
-    )
+    await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping={0: 254})
 
     payload = published.messages[0]["print"]
-    assert payload["ams_mapping"] == [0, 1, 2, 3, 254]
+    assert payload["ams_mapping2"] == [{"ams_id": 254, "slot_id": 254}]
 
 
 @pytest.mark.asyncio
