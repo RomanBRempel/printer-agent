@@ -180,6 +180,117 @@ def plate_filament_count(path: str | Path, plate_entry: str) -> int | None:
     return None
 
 
+#: Сопло, на котором слайсер нарезал филамент, в номерах КОМАНДЫ печати.
+#:
+#: Нумерации две и они не совпадают: в файле Studio пишет `1` — левое, `2` —
+#: правое (`FilamentMapNozzleId`), а в команде левое это `1`, правое — `0`
+#: (`CloudTaskNozzleId`). Перепутать их — значит печатать не тем соплом, и
+#: обнаружится это готовой деталью, а не отказом.
+BAMBU_TASK_NOZZLE_BY_FILAMENT_MAP: dict[int, int] = {1: 1, 2: 0}
+
+
+def nozzle_mapping_in_project(path: str | Path, plate_entry: str) -> list[int] | None:
+    """На каком сопле нарезан каждый филамент плиты — по порядку филаментов.
+
+    Нужно машинам с двумя соплами: у них «таблица соответствия» состоит не
+    только из мест заправки, но и из того, какое сопло каждый филамент подаёт.
+    Не сказав этого, H2D отвечал `0700-8012` — «не удалось получить таблицу
+    соответствия AMS» — и вставал на паузу на нулевом слое.
+
+    Данные лежат в самом файле, в двух местах, и соединять их приходится
+    ОБЯЗАТЕЛЬНО: `Metadata/model_settings.config` хранит раскладку по филаментам
+    ПРОЕКТА (`filament_maps`, значения через пробел, индекс — номер филамента
+    минус один), а команда печати нумерует филаменты ПОЗИЦИЯМИ В ПЛИТЕ. Односо-
+    ставная деталь сплошь и рядом нарезана третьим филаментом проекта, и взять
+    `filament_maps` как есть значит отдать сопло чужого филамента. Порядок
+    позиций даёт `Metadata/slice_info.config` — тот же, по которому считается
+    :func:`plate_filament_count`.
+
+    `None` означает «сказать нечего» и НЕ равно «оба на левом»: у односоплового
+    принтера раскладки в файле нет вовсе, и поле в команду тогда не кладётся —
+    так же поступает стоковый плагин. Выдуманное значение здесь означало бы
+    печать не тем соплом.
+
+    Args:
+        path: Локальная копия `.3mf`.
+        plate_entry: Запись плиты (`Metadata/plate_2.gcode`).
+
+    Returns:
+        list[int] | None: Номер сопла на каждую позицию филамента плиты.
+    """
+    plate_number = "".join(ch for ch in Path(plate_entry).stem if ch.isdigit())
+    if not plate_number:
+        return None
+    try:
+        with zipfile.ZipFile(path) as archive:
+            slice_info = archive.read("Metadata/slice_info.config")
+            model_settings = archive.read("Metadata/model_settings.config")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return None
+
+    order = _plate_filament_ids(slice_info, plate_number)
+    maps = _plate_filament_maps(model_settings, plate_number)
+    if not order or not maps:
+        return None
+
+    nozzles: list[int] = []
+    for filament_id in order:
+        if filament_id < 1 or filament_id > len(maps):
+            # Номер филамента вне раскладки — соединить нечем. Подставить сопло
+            # наугад хуже, чем не сказать ничего: принтер тогда решит сам.
+            return None
+        side = maps[filament_id - 1]
+        if side not in BAMBU_TASK_NOZZLE_BY_FILAMENT_MAP:
+            return None
+        nozzles.append(BAMBU_TASK_NOZZLE_BY_FILAMENT_MAP[side])
+    return nozzles
+
+
+def _plate_filament_ids(slice_info: bytes, plate_number: str) -> list[int]:
+    """Номера филаментов плиты В ПОРЯДКЕ ПОЗИЦИЙ, как их нумеровал слайсер."""
+    try:
+        root = ElementTree.fromstring(slice_info)
+    except ElementTree.ParseError:
+        return []
+    for plate in root.iter("plate"):
+        index = next(
+            (item.get("value") for item in plate.iter("metadata") if item.get("key") == "index"),
+            None,
+        )
+        if index != plate_number:
+            continue
+        ids: list[int] = []
+        for filament in plate.iter("filament"):
+            try:
+                ids.append(int(str(filament.get("id") or "").strip()))
+            except ValueError:
+                return []
+        return ids
+    return []
+
+
+def _plate_filament_maps(model_settings: bytes, plate_number: str) -> list[int]:
+    """Раскладка филаментов ПРОЕКТА по соплам, как её записал слайсер."""
+    try:
+        root = ElementTree.fromstring(model_settings)
+    except ElementTree.ParseError:
+        return []
+    for plate in root.iter("plate"):
+        entries = {
+            item.get("key"): item.get("value")
+            for item in plate.iter("metadata")
+            if item.get("key")
+        }
+        if str(entries.get("plater_id") or "").strip() != plate_number:
+            continue
+        raw = str(entries.get("filament_maps") or "").split()
+        try:
+            return [int(value) for value in raw]
+        except ValueError:
+            return []
+    return []
+
+
 def plate_in_project(path: str | Path) -> str | None:
     """Which plate of a sliced `.3mf` the printer should be told to run.
 
@@ -595,6 +706,8 @@ class BambuAdapter(PrinterAdapter):
         #: on the printer and no way to look inside it. Empty after a restart,
         #: which falls back to the default — the behaviour that was there before.
         self._plate_by_name: dict[str, str] = {}
+        #: Раскладка филаментов по соплам, снятая при загрузке файла.
+        self._nozzles_by_plate: dict[str, list[int]] = {}
         self._connected = False
         #: When the MQTT session was last known to be down, on the monotonic
         #: clock. Set from the start: an adapter that has never connected has
@@ -814,6 +927,16 @@ class BambuAdapter(PrinterAdapter):
                 ams_mapping, len(payload["ams_mapping"])
             )
 
+        # Какое сопло подаёт каждый филамент. Часть той же «таблицы
+        # соответствия»: не сказав этого, двухсопловая машина её не собирает.
+        # Кладётся ОТДЕЛЬНО от `ams_mapping` — она нужна и печати с внешних
+        # держателей, где подающая система не задействована вовсе. Поля нет
+        # вовсе, когда сказать нечего: у односоплового принтера раскладки в
+        # файле не бывает, и выдумывать сопло нельзя.
+        nozzles = await self._nozzles_for(name, payload.get("param"), local_path)
+        if nozzles:
+            payload["nozzle_mapping"] = nozzles
+
         await self._publish_json({"print": payload})
         return {
             "ok": True,
@@ -875,6 +998,26 @@ class BambuAdapter(PrinterAdapter):
                 " the printer takes one slot per filament and cannot be told to skip one"
             )
         return [int(mapping[index]) for index in range(count)]
+
+    async def _nozzles_for(
+        self, name: str, plate: str | None, local_path: str | Path | None
+    ) -> list[int] | None:
+        """Раскладка по соплам: с диска, если он есть, иначе по памяти загрузки.
+
+        Тот же порядок и та же причина, что у :meth:`_plate_for`: диск отвечает
+        за файл, каким он есть сейчас, а память — только за файл, который этот
+        процесс загружал. Оба нужны: печать, запущенная кнопкой «файл уже на
+        принтере», загрузки за собой не имеет, а кеш доставленных файлов
+        подрезается по возрасту.
+        """
+        if not str(name).lower().endswith(".3mf"):
+            return None
+        if local_path is not None and plate:
+            found = await asyncio.to_thread(nozzle_mapping_in_project, local_path, plate)
+            if found:
+                self._nozzles_by_plate[name] = found
+                return found
+        return self._nozzles_by_plate.get(name)
 
     @staticmethod
     def _slot_table(mapping: Mapping[int, int], count: int) -> list[dict[str, int]]:
@@ -1017,6 +1160,12 @@ class BambuAdapter(PrinterAdapter):
             plate = await asyncio.to_thread(plate_in_project, source)
             if plate:
                 self._plate_by_name[name] = plate
+                # Запоминаем сейчас, пока локальная копия ещё здесь: печать,
+                # запущенную кнопкой «файл уже на принтере», сопровождать будет
+                # нечем — загрузки в этой сессии за ней не стоит.
+                nozzles = await asyncio.to_thread(nozzle_mapping_in_project, source, plate)
+                if nozzles:
+                    self._nozzles_by_plate[name] = nozzles
         return {
             "ok": True,
             "remote_name": name,

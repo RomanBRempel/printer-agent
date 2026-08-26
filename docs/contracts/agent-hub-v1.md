@@ -611,6 +611,15 @@ in `error_text` — the agent does **not** go looking for the file, it has no UR
 for it and must not guess one. The hub answers that outcome by offering the file
 again.
 
+On a printer with more than one nozzle the agent also sends which nozzle each
+filament is sliced for. That is not something the hub can tell it: the answer is
+inside the sliced file, in `Metadata/model_settings.config`, and it is indexed by
+the *project's* filament numbering while the print command counts filaments by
+their position in the plate. The agent joins the two and sends the result; the
+hub is not involved and its `ams_mapping` contract does not change. Without it an
+H2D refuses the print with `0700-8012` — "could not get the AMS mapping" — and
+stops on layer zero.
+
 `ams_mapping` (optional) is which loaded slot each filament of the program goes
 to, using the same `index` values that `state.ams.slots[]` reported — including
 `254` for an external spool holder.

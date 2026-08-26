@@ -682,3 +682,101 @@ async def test_no_mapping_means_no_table_at_all(published) -> None:
     assert payload["use_ams"] is False
     assert "ams_mapping2" not in payload
 
+
+# ─── Какое сопло подаёт каждый филамент ──────────────────────────────────────
+
+
+def _project_with_nozzles(tmp_path, *, filament_ids, filament_maps):
+    """`.3mf` с плитой 1: порядок филаментов и раскладка проекта по соплам."""
+    import zipfile
+
+    slice_info = (
+        "<config><plate>"
+        + '<metadata key="index" value="1"/>'
+        + "".join(f'<filament id="{i}" type="PLA"/>' for i in filament_ids)
+        + "</plate></config>"
+    )
+    model_settings = (
+        "<config><plate>"
+        + '<metadata key="plater_id" value="1"/>'
+        + '<metadata key="filament_maps" value="'
+        + " ".join(str(v) for v in filament_maps)
+        + '"/>'
+        + "</plate></config>"
+    )
+    path = tmp_path / "part.gcode.3mf"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("Metadata/plate_1.gcode", "; gcode")
+        archive.writestr("Metadata/slice_info.config", slice_info)
+        archive.writestr("Metadata/model_settings.config", model_settings)
+    return path
+
+
+def test_the_nozzle_is_taken_for_the_plate_position_not_the_project_id(tmp_path):
+    """Односоставная деталь сплошь и рядом нарезана третьим филаментом проекта.
+
+    Взять `filament_maps` как есть значило бы отдать сопло чужого филамента:
+    команда нумерует филаменты позициями в плите, а раскладка — номерами
+    проекта. Соединяет их порядок из `slice_info.config`.
+    """
+    # Проект на три филамента: левое, правое, правое. Плита использует третий.
+    path = _project_with_nozzles(tmp_path, filament_ids=[3], filament_maps=[1, 2, 2])
+
+    assert bambu.nozzle_mapping_in_project(path, "Metadata/plate_1.gcode") == [0]
+
+
+def test_both_nozzles_are_translated_into_command_numbering(tmp_path):
+    """У слайсера левое `1`, правое `2`; в команде левое `1`, правое `0`."""
+    path = _project_with_nozzles(tmp_path, filament_ids=[1, 2], filament_maps=[1, 2])
+
+    assert bambu.nozzle_mapping_in_project(path, "Metadata/plate_1.gcode") == [1, 0]
+
+
+def test_a_single_nozzle_project_says_nothing_at_all(tmp_path):
+    """Пустой ответ — НЕ «оба на левом»: выдуманное сопло это печать не тем.
+
+    У односоплового принтера раскладки в файле нет вовсе, и поле в команду
+    тогда не кладётся — так же поступает стоковый плагин.
+    """
+    path = _project_with_nozzles(tmp_path, filament_ids=[1], filament_maps=[])
+    assert bambu.nozzle_mapping_in_project(path, "Metadata/plate_1.gcode") is None
+
+    import zipfile
+
+    bare = tmp_path / "bare.gcode.3mf"
+    with zipfile.ZipFile(bare, "w") as archive:
+        archive.writestr("Metadata/plate_1.gcode", "; gcode")
+    assert bambu.nozzle_mapping_in_project(bare, "Metadata/plate_1.gcode") is None
+
+
+def test_a_filament_outside_the_map_is_not_guessed(tmp_path):
+    """Соединить нечем — молчим: принтер тогда решит сам, и это честнее."""
+    path = _project_with_nozzles(tmp_path, filament_ids=[5], filament_maps=[1, 2])
+
+    assert bambu.nozzle_mapping_in_project(path, "Metadata/plate_1.gcode") is None
+
+
+@pytest.mark.asyncio
+async def test_the_print_command_carries_the_nozzle_map(published, tmp_path) -> None:
+    """Без неё двухсопловая машина таблицу соответствия не собирает."""
+    path = _project_with_nozzles(tmp_path, filament_ids=[1, 2], filament_maps=[2, 1])
+    adapter = make_adapter()
+
+    await adapter.start_print(
+        "f00d", "part.gcode.3mf", ams_mapping={0: 0, 1: 1}, local_path=path
+    )
+
+    payload = published.messages[0]["print"]
+    assert payload["nozzle_mapping"] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_no_nozzle_map_means_no_field(published) -> None:
+    """Поля нет вовсе, когда сказать нечего, — а не пустой массив."""
+    adapter = make_adapter()
+
+    await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping={0: 0})
+
+    payload = published.messages[0]["print"]
+    assert "nozzle_mapping" not in payload
+
