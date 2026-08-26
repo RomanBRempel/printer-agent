@@ -712,24 +712,70 @@ def _project_with_nozzles(tmp_path, *, filament_ids, filament_maps):
     return path
 
 
-def test_the_nozzle_is_taken_for_the_plate_position_not_the_project_id(tmp_path):
-    """Односоставная деталь сплошь и рядом нарезана третьим филаментом проекта.
+def test_the_project_filaments_are_read_whole_not_just_the_plate(tmp_path):
+    """Таблицы нумерованы филаментами ПРОЕКТА, а плита берёт из них часть.
 
-    Взять `filament_maps` как есть значило бы отдать сопло чужого филамента:
-    команда нумерует филаменты позициями в плите, а раскладка — номерами
-    проекта. Соединяет их порядок из `slice_info.config`.
+    Односоставная деталь сплошь и рядом нарезана третьим филаментом проекта, и
+    короткая таблица отдаёт слот филаменту №1, которого в плите нет.
     """
     # Проект на три филамента: левое, правое, правое. Плита использует третий.
     path = _project_with_nozzles(tmp_path, filament_ids=[3], filament_maps=[1, 2, 2])
 
-    assert bambu.nozzle_mapping_in_project(path, "Metadata/plate_1.gcode") == [0]
+    project = bambu.nozzle_mapping_in_project(path, "Metadata/plate_1.gcode")
+    assert project.count == 3
+    assert project.plate_ids == (3,)
+    assert project.nozzles == (1, 0, 0)
 
 
 def test_both_nozzles_are_translated_into_command_numbering(tmp_path):
     """У слайсера левое `1`, правое `2`; в команде левое `1`, правое `0`."""
     path = _project_with_nozzles(tmp_path, filament_ids=[1, 2], filament_maps=[1, 2])
 
-    assert bambu.nozzle_mapping_in_project(path, "Metadata/plate_1.gcode") == [1, 0]
+    project = bambu.nozzle_mapping_in_project(path, "Metadata/plate_1.gcode")
+    assert project.nozzles == (1, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_plate_using_the_third_filament_leaves_the_others_unassigned(
+    published, tmp_path
+) -> None:
+    """Ровно случай, стоивший H2D отказа `0700-8012`.
+
+    Проект на три филамента, плита использует третий. Слот обязан достаться
+    ему, а не первому, и таблицы обязаны быть длиной в три записи.
+    """
+    path = _project_with_nozzles(tmp_path, filament_ids=[3], filament_maps=[1, 2, 2])
+    adapter = make_adapter()
+
+    await adapter.start_print(
+        "f00d", "part.gcode.3mf", ams_mapping={0: 2}, local_path=path
+    )
+
+    payload = published.messages[0]["print"]
+    assert payload["ams_mapping"] == [-1, -1, 2]
+    assert payload["ams_mapping2"] == [
+        {"ams_id": 255, "slot_id": 255},
+        {"ams_id": 255, "slot_id": 255},
+        {"ams_id": 0, "slot_id": 2},
+    ]
+    # Сопло называется у КАЖДОГО филамента проекта, а не только у печатаемого.
+    assert payload["nozzle_mapping"] == [1, 0, 0]
+
+
+@pytest.mark.asyncio
+async def test_without_the_file_the_short_table_still_goes_out(published) -> None:
+    """Файл прочитать не удалось — длину выдумывать не по чему.
+
+    Короткая таблица хотя бы работает там, где нумерации совпадают
+    (односоставный проект), а молчание отменило бы печать вовсе.
+    """
+    adapter = make_adapter()
+
+    await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping={0: 1})
+
+    payload = published.messages[0]["print"]
+    assert payload["ams_mapping"] == [1]
+    assert "nozzle_mapping" not in payload
 
 
 def test_a_single_nozzle_project_says_nothing_at_all(tmp_path):

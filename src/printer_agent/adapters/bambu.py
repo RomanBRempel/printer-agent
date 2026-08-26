@@ -10,6 +10,7 @@ import time
 import xml.etree.ElementTree as ElementTree
 import zipfile
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
@@ -189,8 +190,35 @@ def plate_filament_count(path: str | Path, plate_entry: str) -> int | None:
 BAMBU_TASK_NOZZLE_BY_FILAMENT_MAP: dict[int, int] = {1: 1, 2: 0}
 
 
-def nozzle_mapping_in_project(path: str | Path, plate_entry: str) -> list[int] | None:
-    """На каком сопле нарезан каждый филамент плиты — по порядку филаментов.
+@dataclass(frozen=True)
+class ProjectFilaments:
+    """Как устроены филаменты ПРОЕКТА, к которому принадлежит эта плита.
+
+    Таблицы команды печати нумерованы филаментами проекта, а не позициями в
+    плите: Studio строит их циклом по всем филаментам проекта и помечает
+    неиспользованные (`SelectMachineDialog::get_ams_mapping_result`). Проект на
+    три филамента, плита из которых берёт один третий, уезжает как
+    `[-1, -1, слот]`, а не как `[слот]`.
+
+    Разница молчит на односоставных проектах, где филамент один и обе нумерации
+    совпадают, — там печатали и с короткой таблицей. Двухсопловая машина с
+    проектом на три филамента получала слот для филамента №1, которого в плите
+    нет, оставляла нужный №3 без слота и отвечала `0700-8012`.
+
+    Attributes:
+        count: Сколько филаментов у проекта — длина всех трёх таблиц.
+        plate_ids: Номер филамента ПРОЕКТА на каждую позицию плиты, по порядку
+            позиций. Им переводится раскладка хаба (она приходит позициями).
+        nozzles: Сопло каждого филамента проекта в нумерации команды печати.
+    """
+
+    count: int
+    plate_ids: tuple[int, ...]
+    nozzles: tuple[int, ...]
+
+
+def nozzle_mapping_in_project(path: str | Path, plate_entry: str) -> ProjectFilaments | None:
+    """Как устроены филаменты проекта этой плиты — **единственное чтение**.
 
     Нужно машинам с двумя соплами: у них «таблица соответствия» состоит не
     только из мест заправки, но и из того, какое сопло каждый филамент подаёт.
@@ -232,18 +260,17 @@ def nozzle_mapping_in_project(path: str | Path, plate_entry: str) -> list[int] |
     maps = _plate_filament_maps(model_settings, plate_number)
     if not order or not maps:
         return None
+    if any(fid < 1 or fid > len(maps) for fid in order):
+        # Номер филамента вне раскладки — соединить нечем. Подставить сопло
+        # наугад хуже, чем не сказать ничего: принтер тогда решит сам.
+        return None
 
     nozzles: list[int] = []
-    for filament_id in order:
-        if filament_id < 1 or filament_id > len(maps):
-            # Номер филамента вне раскладки — соединить нечем. Подставить сопло
-            # наугад хуже, чем не сказать ничего: принтер тогда решит сам.
-            return None
-        side = maps[filament_id - 1]
+    for side in maps:
         if side not in BAMBU_TASK_NOZZLE_BY_FILAMENT_MAP:
             return None
         nozzles.append(BAMBU_TASK_NOZZLE_BY_FILAMENT_MAP[side])
-    return nozzles
+    return ProjectFilaments(count=len(maps), plate_ids=tuple(order), nozzles=tuple(nozzles))
 
 
 def _plate_filament_ids(slice_info: bytes, plate_number: str) -> list[int]:
@@ -760,8 +787,8 @@ class BambuAdapter(PrinterAdapter):
         #: on the printer and no way to look inside it. Empty after a restart,
         #: which falls back to the default — the behaviour that was there before.
         self._plate_by_name: dict[str, str] = {}
-        #: Раскладка филаментов по соплам, снятая при загрузке файла.
-        self._nozzles_by_plate: dict[str, list[int]] = {}
+        #: Устройство филаментов проекта, снятое при загрузке файла.
+        self._project_by_name: dict[str, ProjectFilaments] = {}
         self._connected = False
         #: When the MQTT session was last known to be down, on the monotonic
         #: clock. Set from the start: an adapter that has never connected has
@@ -962,24 +989,28 @@ class BambuAdapter(PrinterAdapter):
             payload["command"] = "gcode_file"
             payload["param"] = url[len("file://"):] if url.startswith("file://") else url
 
+        # Устройство филаментов проекта: длина таблиц и перевод «позиция в плите
+        # → номер филамента проекта». Читается один раз на команду — обе таблицы
+        # и раскладка по соплам обязаны быть согласованы между собой.
+        project = await self._project_for(name, payload.get("param"), local_path)
+
         if ams_mapping:
             # The hub matched the program against the slots this printer
             # reported, so its answer is more informed than the printer's own
             # pick. Without a mapping the AMS stays out of it entirely: letting
             # the printer choose a slot it was not told about is how a job comes
             # out in the wrong material.
-            payload["use_ams"] = True
-            payload["ams_mapping"] = await self._positional_mapping(
+            by_position = await self._positional_mapping(
                 ams_mapping, payload.get("param"), local_path
             )
-            # Та самая «таблица соответствия AMS», которой H2D не мог
-            # получить (`0700-8012`, пауза на нулевом слое). Пустым массивом
-            # она была ровно один день — по комментарию открытой реализации
-            # плагина, что стоковый шлёт её «даже пустой». Шлёт-то он её
-            # всегда, но Studio её ЗАПОЛНЯЕТ.
-            payload["ams_mapping2"] = self._slot_table(
-                ams_mapping, len(payload["ams_mapping"])
-            )
+            payload["use_ams"] = True
+            payload["ams_mapping"] = self._project_mapping(by_position, project)
+            # Та самая «таблица соответствия AMS», которой H2D не мог получить
+            # (`0700-8012`, пауза на нулевом слое). Пустым массивом она была
+            # ровно один день — по комментарию открытой реализации плагина, что
+            # стоковый шлёт её «даже пустой». Шлёт-то он её всегда, но Studio её
+            # ЗАПОЛНЯЕТ.
+            payload["ams_mapping2"] = self._slot_table(payload["ams_mapping"])
 
         # Какое сопло подаёт каждый филамент. Часть той же «таблицы
         # соответствия»: не сказав этого, двухсопловая машина её не собирает.
@@ -987,9 +1018,8 @@ class BambuAdapter(PrinterAdapter):
         # держателей, где подающая система не задействована вовсе. Поля нет
         # вовсе, когда сказать нечего: у односоплового принтера раскладки в
         # файле не бывает, и выдумывать сопло нельзя.
-        nozzles = await self._nozzles_for(name, payload.get("param"), local_path)
-        if nozzles:
-            payload["nozzle_mapping"] = nozzles
+        if project is not None:
+            payload["nozzle_mapping"] = list(project.nozzles)
 
         await self._publish_json({"print": payload})
         return {
@@ -1067,9 +1097,9 @@ class BambuAdapter(PrinterAdapter):
             )
         return [int(mapping[index]) for index in range(count)]
 
-    async def _nozzles_for(
+    async def _project_for(
         self, name: str, plate: str | None, local_path: str | Path | None
-    ) -> list[int] | None:
+    ) -> ProjectFilaments | None:
         """Раскладка по соплам: с диска, если он есть, иначе по памяти загрузки.
 
         Тот же порядок и та же причина, что у :meth:`_plate_for`: диск отвечает
@@ -1082,13 +1112,46 @@ class BambuAdapter(PrinterAdapter):
             return None
         if local_path is not None and plate:
             found = await asyncio.to_thread(nozzle_mapping_in_project, local_path, plate)
-            if found:
-                self._nozzles_by_plate[name] = found
+            if found is not None:
+                self._project_by_name[name] = found
                 return found
-        return self._nozzles_by_plate.get(name)
+        return self._project_by_name.get(name)
 
     @staticmethod
-    def _slot_table(mapping: Mapping[int, int], count: int) -> list[dict[str, int]]:
+    def _project_mapping(by_position: list[int], project: ProjectFilaments | None) -> list[int]:
+        """Раскладку хаба — в нумерацию филаментов ПРОЕКТА.
+
+        Хаб называет филаменты позициями в плите (иначе он их и не видит), а
+        таблицы команды нумерованы филаментами проекта: проект на три филамента,
+        плита из которых берёт третий, уезжает как `[-1, -1, слот]`. Неверная
+        длина молчит на односоставных проектах — там обе нумерации совпадают, —
+        и стоила H2D отказа `0700-8012`: слот доставался филаменту №1, которого
+        в плите нет, а нужный №3 оставался ни с чем.
+
+        Файл прочитать не удалось (нет локальной копии, обрезанный архив) —
+        отдаём раскладку как есть: короткая таблица хотя бы работает там, где
+        нумерации совпадают, а выдумывать длину не по чему.
+
+        Args:
+            by_position: Слоты по позициям филаментов плиты.
+            project: Устройство филаментов проекта либо ``None``.
+
+        Returns:
+            list[int]: Слот на каждый филамент проекта; `-1` — не участвует.
+        """
+        if project is None:
+            return by_position
+        table = [-1] * project.count
+        for position, slot in enumerate(by_position):
+            if position >= len(project.plate_ids):
+                break
+            index = project.plate_ids[position] - 1
+            if 0 <= index < project.count:
+                table[index] = int(slot)
+        return table
+
+    @staticmethod
+    def _slot_table(slots: list[int]) -> list[dict[str, int]]:
         """Места заправки в том виде, в каком их читает многосопловая прошивка.
 
         `ams_mapping` — плоский список номеров, `ams_mapping2` — тот же выбор
@@ -1114,14 +1177,17 @@ class BambuAdapter(PrinterAdapter):
             list: По объекту на филамент, в порядке филаментов.
         """
         table: list[dict[str, int]] = []
-        for index in range(count):
-            slot = mapping.get(index)
-            if slot is None:
+        for slot in slots:
+            slot = int(slot)
+            if slot < 0:
+                # Филамент проекта, которого нет в этой плите: место заправки
+                # ему не назначается вовсе, и Studio помечает такую строку тем
+                # же «нет места», а не нулём — ноль означал бы первое место
+                # первой подающей системы.
                 table.append(
                     {"ams_id": BAMBU_UNASSIGNED_SLOT, "slot_id": BAMBU_UNASSIGNED_SLOT}
                 )
                 continue
-            slot = int(slot)
             if slot >= BAMBU_EXTERNAL_SPOOL_SLOT:
                 table.append({"ams_id": slot, "slot_id": slot})
                 continue
@@ -1231,9 +1297,9 @@ class BambuAdapter(PrinterAdapter):
                 # Запоминаем сейчас, пока локальная копия ещё здесь: печать,
                 # запущенную кнопкой «файл уже на принтере», сопровождать будет
                 # нечем — загрузки в этой сессии за ней не стоит.
-                nozzles = await asyncio.to_thread(nozzle_mapping_in_project, source, plate)
-                if nozzles:
-                    self._nozzles_by_plate[name] = nozzles
+                project = await asyncio.to_thread(nozzle_mapping_in_project, source, plate)
+                if project is not None:
+                    self._project_by_name[name] = project
         return {
             "ok": True,
             "remote_name": name,

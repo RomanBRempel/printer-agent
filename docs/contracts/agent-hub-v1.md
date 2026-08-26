@@ -623,6 +623,14 @@ in `error_text` — the agent does **not** go looking for the file, it has no UR
 for it and must not guess one. The hub answers that outcome by offering the file
 again.
 
+The three tables the agent builds for the printer — slots, slots-with-unit, and
+nozzles — are numbered by the **project's** filaments, not by their position in
+the plate. A project with three filaments whose plate uses only the third sends
+`[-1, -1, slot]`, not `[slot]`. The hub knows nothing about this and should not:
+it names filaments by plate position, which is all it can see, and the agent
+translates. The difference is silent on single-filament projects, where the two
+numberings coincide.
+
 On a printer with more than one nozzle the agent also sends which nozzle each
 filament is sliced for. That is not something the hub can tell it: the answer is
 inside the sliced file, in `Metadata/model_settings.config`, and it is indexed by
