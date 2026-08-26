@@ -21,21 +21,10 @@ import logging
 from collections.abc import Callable
 from contextlib import suppress
 
-from typing import Any
-
 from .config import AgentConfig
 from .updates import UpdateManifest, apply_update, check_for_update
 
 logger = logging.getLogger(__name__)
-
-
-class UpdateUnavailable(RuntimeError):
-    """This agent cannot act on a hub update request at all.
-
-    Distinct from an install that fails: nothing was attempted, and repeating
-    the request changes nothing until the machine's configuration does. It maps
-    onto `unsupported` rather than `failed`.
-    """
 
 #: How often to re-ask whether the agent is idle enough to restart. Short, so an
 #: update lands soon after a transfer ends rather than at the next daily check.
@@ -56,20 +45,14 @@ class AutoUpdater:
         *,
         is_busy: Callable[[], bool],
         restart: Callable[[], None],
-        restarts_itself: bool = True,
     ):
         self.config = config
         self._is_busy = is_busy
         self._restart = restart
-        self._restarts_itself = restarts_itself
         self._stop_event = asyncio.Event()
         #: Versions this process already failed to install. Retrying the same
         #: broken package every cycle only fills the log and the link.
         self._refused: set[str] = set()
-        #: The install started by the hub, if one is still running. One at a
-        #: time: a second request while the first is waiting for an idle moment
-        #: must not start a parallel pip.
-        self._requested_task: asyncio.Task[None] | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -91,80 +74,6 @@ class AutoUpdater:
             if self._stop_event.is_set():
                 return
             await self._cycle()
-
-    async def update_now(self, *, target_version: str = "") -> dict[str, Any]:
-        """Check and install because the hub asked, not because the clock did.
-
-        This returns as soon as the *decision* is made, not when the new version
-        is running: installing waits for an idle moment and then restarts the
-        process, so an answer sent afterwards would never reach the hub. The
-        `command_result` therefore reports what was scheduled, and the `hello`
-        of the restarted agent — which carries `agent_version` — is what says it
-        took effect. Same shape as a `settings_update`, for the same reason.
-
-        Two rules differ from the scheduled cycle, both because a person asked:
-        `updates.auto_update` is not consulted (that flag governs the unattended
-        path, and this *is* the operator installing it, from the hub instead of
-        from the desktop app), and a version this process refused earlier is
-        retried once — whatever broke the install may since have been fixed, and
-        the alternative is an agent that can never be repaired from the hub.
-        """
-        if not self.config.updates.feed_url:
-            raise UpdateUnavailable("this agent has no update feed configured")
-        if self._requested_task is not None and not self._requested_task.done():
-            raise UpdateUnavailable("an update requested earlier is still running")
-
-        status = await asyncio.to_thread(check_for_update, self.config.updates.feed_url)
-        if not status.update_available or status.manifest is None:
-            logger.info(
-                "hub asked for an update; already on the latest version",
-                extra={"action": "hub_update", "version": status.current_version},
-            )
-            return {
-                "scheduled": False,
-                "reason": "already_latest",
-                "current_version": status.current_version,
-                "latest_version": status.latest_version,
-            }
-
-        manifest = status.manifest
-        if target_version and target_version != manifest.version:
-            # The hub named a version and the feed offers a different one. Doing
-            # it anyway would install something nobody asked for, on a fleet
-            # where the operator is watching for one specific number.
-            raise UpdateUnavailable(
-                f"the update feed offers {manifest.version}, not the requested {target_version}"
-            )
-
-        self._refused.discard(manifest.version)
-        self._requested_task = asyncio.create_task(
-            self._apply_when_idle(manifest), name="printer-agent-update-request"
-        )
-        busy = self._is_busy()
-        logger.info(
-            "hub asked for an update",
-            extra={
-                "action": "hub_update",
-                "version": status.current_version,
-                "latest": manifest.version,
-                "busy": str(busy),
-            },
-        )
-        return {
-            "scheduled": True,
-            "current_version": status.current_version,
-            "latest_version": manifest.version,
-            # True means the install is queued behind a file transfer or an open
-            # camera session, so the restart is minutes away rather than
-            # seconds. It gives up after IDLE_WAIT_LIMIT_S and the scheduled
-            # check picks it up later.
-            "waiting_for_idle": busy,
-            # False on a console run, where nobody is there to restart the
-            # process: the package is installed and the old code keeps running
-            # until someone starts it again. The hub must not wait for a new
-            # `hello` that is not coming.
-            "restarts_itself": self._restarts_itself,
-        }
 
     async def _cycle(self) -> None:
         try:
