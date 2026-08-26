@@ -780,3 +780,36 @@ async def test_no_nozzle_map_means_no_field(published) -> None:
     payload = published.messages[0]["print"]
     assert "nozzle_mapping" not in payload
 
+
+@pytest.mark.asyncio
+async def test_what_was_sent_comes_back_for_diagnosis(published, tmp_path) -> None:
+    """MQTT ничего не подтверждает — печать разбирается по отправленному.
+
+    Пока таблиц в ответе не было, отличить «раскладку не отправили» от
+    «отправили, и она не та» было нечем, и разбор H2D встал ровно на этой
+    развилке: команда в ленте показывала адрес и плиту, но не то, что решало
+    исход.
+    """
+    path = _project_with_nozzles(tmp_path, filament_ids=[1], filament_maps=[2])
+    adapter = make_adapter()
+
+    result = await adapter.start_print(
+        "f00d", "part.gcode.3mf", ams_mapping={0: 5}, local_path=path
+    )
+
+    assert result["ams_mapping"] == [5]
+    assert result["ams_mapping2"] == [{"ams_id": 1, "slot_id": 1}]
+    assert result["nozzle_mapping"] == [0]
+
+
+@pytest.mark.asyncio
+async def test_absence_in_the_answer_is_itself_an_answer(published) -> None:
+    """Ключа нет — значит сказать было нечего, а не «забыли положить»."""
+    adapter = make_adapter()
+
+    result = await adapter.start_print("f00d", "part.gcode.3mf")
+
+    assert "ams_mapping" not in result
+    assert "ams_mapping2" not in result
+    assert "nozzle_mapping" not in result
+

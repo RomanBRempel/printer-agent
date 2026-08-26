@@ -948,6 +948,20 @@ class BambuAdapter(PrinterAdapter):
             # what was sent and nothing else.
             "param": payload["param"],
             "use_ams": payload["use_ams"],
+            # Таблицы возвращаются по той же причине, по которой возвращается
+            # адрес: MQTT ничего не подтверждает, и печать, которая не началась,
+            # разбирается по тому, что было послано, и больше ни по чему. Пока
+            # их здесь не было, отличить «раскладку не отправили» от «отправили,
+            # и она не та» было НЕЧЕМ — а это ровно та развилка, на которой
+            # 26.08.2026 встал разбор H2D. Отсутствие ключа — тоже ответ: оно
+            # означает, что сказать было нечего.
+            **({"ams_mapping": payload["ams_mapping"]} if "ams_mapping" in payload else {}),
+            **({"ams_mapping2": payload["ams_mapping2"]} if "ams_mapping2" in payload else {}),
+            **(
+                {"nozzle_mapping": payload["nozzle_mapping"]}
+                if "nozzle_mapping" in payload
+                else {}
+            ),
         }
 
     def _ftps_timeout(self) -> float:
