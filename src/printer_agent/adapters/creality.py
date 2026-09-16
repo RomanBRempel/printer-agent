@@ -105,6 +105,13 @@ def normalize_creality_status(raw_state: Any) -> PrinterStatus:
     return _CREALITY_STATE_MAP.get(value, PrinterStatus.maintenance)
 
 
+def _creality_uploaded_name(name: str) -> str:
+    """Keep only the printer-safe filename, with no path separators."""
+    cleaned = str(name or "").strip().replace("\\", "/")
+    stem = PurePosixPath(cleaned).name or cleaned
+    return stem or "print.gcode"
+
+
 async def discover_creality(
     hosts: list[str], *, port: int = CREALITY_WS_PORT, timeout_s: float = 1.5
 ) -> list[dict[str, Any]]:
@@ -243,7 +250,7 @@ class CrealityAdapter(PrinterAdapter):
             pause=True,
             resume=True,
             cancel=True,
-            upload=False,
+            upload=True,
             cfs=bool(self._safe_int(self._state.get("cfsConnect"))),
             # Follows the probe, not the brand: the mjpg-streamer port is closed
             # on stock firmware, so a raised flag would be a dead button.
@@ -257,9 +264,44 @@ class CrealityAdapter(PrinterAdapter):
         ams_mapping: Mapping[int, int] | None = None,
         local_path: str | Path | None = None,
     ) -> dict[str, Any]:
-        # Accepted for one signature across adapters; this printer has no
-        # addressable feeding system to map filaments onto.
-        raise UnsupportedCommandError("Creality print start is not implemented yet")
+        # The newer Creality LAN protocol accepts a print command by the printer
+        # side filename. Adapters are expected to accept the common signature even
+        # when the machine has no AMS mapping to apply.
+        requested = (remote_name or file_ref or "").strip()
+        if not requested:
+            raise RuntimeError("start_print needs a file name")
+        filename = _creality_uploaded_name(requested)
+        await self._send({"print": filename})
+        return {"ok": True, "filename": filename, "requested_name": requested}
+
+    async def upload_file(self, local_path: str | Path, remote_name: str) -> dict[str, Any]:
+        """Push a G-code file into the printer's upload endpoint.
+
+        The Ender 5 Max exposes a Creality LAN upload endpoint over the web UI's
+        HTTP path rather than a Moonraker RPC method, and the print command then
+        selects the file by its printer-side name.
+        """
+        source = Path(local_path)
+        if not source.is_file():
+            raise RuntimeError(f"{source} is not a file")
+        name = _creality_uploaded_name((remote_name or source.name).strip() or source.name)
+        session = self._ensure_http_session()
+        with source.open("rb") as handle:
+            form = aiohttp.FormData(quote_fields=False)
+            form.add_field("print", "false")
+            form.add_field("file", handle, filename=name, content_type="application/octet-stream")
+            async with session.post(
+                f"http://{self.printer.host}/api/files/upload",
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300),
+            ) as response:
+                response.raise_for_status()
+                try:
+                    body = await response.json(content_type=None)
+                except ValueError:
+                    body = {}
+        result = body if isinstance(body, dict) else {}
+        return {"ok": True, "remote_name": name, "path": name, "root": "gcodes", **result}
 
     async def pause(self) -> dict[str, Any]:
         await self._send({"pause": 1})

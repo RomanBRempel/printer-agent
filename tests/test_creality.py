@@ -176,11 +176,75 @@ def test_cfs_capability_follows_the_printer() -> None:
     assert build(PRINTING_FRAME).capabilities().cfs is False
 
 
-def test_pause_resume_cancel_are_advertised_upload_is_not() -> None:
+def test_pause_resume_cancel_are_advertised_and_upload_is_supported() -> None:
     capabilities = build(PRINTING_FRAME).capabilities()
 
     assert (capabilities.pause, capabilities.resume, capabilities.cancel) == (True, True, True)
-    assert (capabilities.upload, capabilities.camera) == (False, False)
+    assert (capabilities.upload, capabilities.camera) == (True, False)
+
+
+@pytest.mark.asyncio
+async def test_creality_upload_file_posts_to_the_printer_upload_endpoint(tmp_path) -> None:
+    source = tmp_path / "part.gcode"
+    source.write_text("G1 X10 Y20\n", encoding="utf-8")
+
+    adapter = build(PRINTING_FRAME)
+    calls: list[str] = []
+
+    class FakeResponse:
+        status = 200
+        headers = {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def json(self, content_type=None):
+            return {"ok": True}
+
+        async def read(self):
+            return b""
+
+    class FakeSession:
+        def post(self, url: str, *, data=None, timeout=None, json=None):
+            calls.append(url)
+            return FakeResponse()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(creality_module.aiohttp, "ClientSession", lambda *args, **kwargs: FakeSession())
+    try:
+        result = await adapter.upload_file(source, "part.gcode")
+    finally:
+        monkeypatch.undo()
+
+    assert calls and calls[0].endswith("/api/files/upload")
+    assert result["ok"] is True
+    assert result["remote_name"] == "part.gcode"
+
+
+@pytest.mark.asyncio
+async def test_creality_start_print_sends_a_print_command() -> None:
+    adapter = build(PRINTING_FRAME)
+    sent: list[str] = []
+
+    class FakeSocket:
+        closed = False
+
+        async def send_str(self, data: str) -> None:
+            sent.append(data)
+
+    adapter._websocket = FakeSocket()
+
+    result = await adapter.start_print("file-ref", "part.gcode")
+
+    assert result["ok"] is True
+    assert result["filename"] == "part.gcode"
+    assert sent == ['{"method": "set", "params": {"print": "part.gcode"}}']
 
 
 @pytest.mark.asyncio
