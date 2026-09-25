@@ -37,6 +37,7 @@ recovery:
   enabled: true
   after_offline_s: 60      # unreachable this long before a search starts
   min_interval_s: 300      # between searches; doubles up to 1 h while nothing is found
+  survey_interval_s: 3600  # sweep for unregistered printers even when none is lost; 0 = off
   networks: []             # empty: the /24 of every configured printer
 printers:
   - key: printer-1

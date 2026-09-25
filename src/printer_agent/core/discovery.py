@@ -17,6 +17,7 @@ from ..adapters.bambu import BAMBU_MQTT_PORT, discover_bambu, discover_bambu_tls
 from ..adapters.creality import CREALITY_WS_PORT, discover_creality
 from ..adapters.moonraker import discover_moonraker
 from ..config import PrinterConfig
+from .recovery import name_key
 
 #: Refuse to sweep anything larger than a /22 — a /16 is 65k probes and, on a
 #: corporate network, indistinguishable from a port scan.
@@ -49,10 +50,9 @@ class DiscoveredPrinter:
     @property
     def suggested_key(self) -> str:
         """A printer_key that is stable, readable and safe for the contract."""
-        base = self.name or self.serial or self.host
-        cleaned = "".join(char if char.isalnum() else "-" for char in base.lower())
-        cleaned = "-".join(part for part in cleaned.split("-") if part)
-        return cleaned or f"{self.brand}-printer"
+        # The same spelling recovery uses to find a printer by the name it was
+        # added under, before its identity has been learned.
+        return name_key(self.name or self.serial or self.host) or f"{self.brand}-printer"
 
     @property
     def needs_credentials(self) -> bool:
@@ -206,9 +206,12 @@ async def find_printers(
     for exactly one of them. Bambu is found by its certificate rather than SSDP:
     this runs inside the service, which must not bind a listening socket.
     """
+    defaults = {"moonraker": 7125, "creality": CREALITY_WS_PORT, "bambu": BAMBU_MQTT_PORT}
     by_brand: dict[str, set[int]] = {}
     for printer in printers:
-        by_brand.setdefault(printer.brand, set()).add(printer.port or 0)
+        # Resolved here, so an entry on the default port and one that leaves it
+        # unset are one probe, not two answers from the same machine.
+        by_brand.setdefault(printer.brand, set()).add(printer.port or defaults.get(printer.brand, 0))
     records: list[dict[str, Any]] = []
     for start in range(0, len(hosts), FIND_BATCH_HOSTS):
         records.extend(await _find_batch(by_brand, hosts[start : start + FIND_BATCH_HOSTS], timeout_s))

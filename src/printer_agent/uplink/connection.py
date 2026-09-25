@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from typing import Any
@@ -33,6 +34,7 @@ from ..contracts import (
     TemperatureSnapshot,
     build_envelope,
     is_retryable_hello_reject,
+    utc_iso,
     utc_now_iso,
 )
 from ..core.discovery import find_printers, hosts_for, local_ipv4_networks
@@ -47,8 +49,8 @@ from ..core.logtail import (
     tail_lines,
 )
 from ..core.outbox import EventOutbox
-from ..core.recovery import plan_relocation, scan_networks, write_printer_fields
-from ..core.registry import build_adapter
+from ..core.recovery import RelocationPlan, plan_relocation, scan_networks, unregistered_devices, write_printer_fields
+from ..core.registry import ADAPTERS, build_adapter
 from ..logsetup import active_log_path
 from ..core.state import PrinterStateStore
 from .camera import CameraService
@@ -213,6 +215,13 @@ def _failure_reason(exc: Exception, timeout: float) -> str:
     return str(exc) or exc.__class__.__name__
 
 
+def _report_stamp(report: dict[str, Any]) -> str:
+    """What makes two network reports the same news: not when they were made."""
+    return json.dumps(
+        {key: report.get(key) for key in ("lost", "moved", "unregistered")}, sort_keys=True, default=str
+    )
+
+
 def _restart_required_changes(running: AgentConfig, incoming: AgentConfig) -> list[str]:
     """Settings a live agent cannot adopt, named so the log says which one.
 
@@ -287,6 +296,16 @@ class HubConnection:
         self._recovery_last_at: float | None = None
         self._recovery_interval = float(config.recovery.min_interval_s)
         self._recovery_last_lost: frozenset[str] = frozenset()
+        #: Loop time of the last sweep of any kind, and of agent start: the
+        #: first survey waits `after_offline_s`, so the printers that are lost
+        #: at startup are already known to be lost when it runs.
+        self._survey_last_at: float | None = None
+        self._started_at: float | None = None
+        #: The last `network_report` built, and the stamp of the one the hub has.
+        #: Kept across sessions: a report made while the hub was unreachable is
+        #: exactly the one the operator needs when it comes back.
+        self._network_report: dict[str, Any] | None = None
+        self._network_report_stamp = ""
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -340,6 +359,10 @@ class HubConnection:
                             self._ws = ws
                             self.state.connected = True
                             await self._flush_outbox(ws)
+                            # A new session is a hub that may have restarted and
+                            # forgotten; the report is small, so say it again.
+                            self._network_report_stamp = ""
+                            await self._send_network_report()
                             await self._ws_loop(ws)
                         finally:
                             self._ws = None
@@ -836,6 +859,7 @@ class HubConnection:
                 await self._reload_config_if_changed()
                 snapshots = await self._collect_snapshots()
                 self._maybe_start_recovery(snapshots)
+                await self._prune_network_report(snapshots)
                 self._record_events(snapshots)
                 await self._flush_outbox()
                 await self._send_telemetry(snapshots)
@@ -1074,14 +1098,19 @@ class HubConnection:
     # -- recovery after readdressing -------------------------------------
 
     def _maybe_start_recovery(self, snapshots: list[PrinterSnapshot]) -> None:
-        """Start a search for lost printers when one is due.
+        """Start a sweep of the network when one is due.
 
-        Lost means: unreachable for `recovery.after_offline_s`, or answered by
-        another device at its address. Only a printer with a known identity can
-        be looked for. The scan runs beside the poll loop, which keeps
-        reporting while it takes its tens of seconds.
+        Two things make one due. A printer is lost: unreachable for
+        `recovery.after_offline_s`, or answered by another device at its
+        address. Or the periodic survey (`recovery.survey_interval_s`) is up,
+        which is how a printer plugged in at the location reaches the hub
+        without anyone opening the discovery dialog. Every sweep does both jobs,
+        so a search for a lost printer also reports what else answered. It runs
+        beside the poll loop, which keeps reporting while it takes its seconds.
         """
         now = asyncio.get_running_loop().time()
+        if self._started_at is None:
+            self._started_at = now
         for snapshot in snapshots:
             if snapshot.status == PrinterStatus.offline:
                 self._offline_since.setdefault(snapshot.printer_key, now)
@@ -1093,30 +1122,46 @@ class HubConnection:
             return
         if self._recovery_task is not None and not self._recovery_task.done():
             return
-        lost = [
-            printer
-            for printer in self.config.printers
-            if printer.identity()
-            and (
-                printer.key in self._quarantined
-                or now - self._offline_since.get(printer.key, now) >= recovery.after_offline_s
-            )
-        ]
+        lost = self._lost_printers(now)
+        survey_due = recovery.survey_interval_s > 0 and (
+            now - self._started_at >= recovery.after_offline_s
+            if self._survey_last_at is None
+            else now - self._survey_last_at >= recovery.survey_interval_s
+        )
         if not lost:
             self._recovery_interval = float(recovery.min_interval_s)
-            return
         keys = frozenset(printer.key for printer in lost)
         # A newly lost printer is worth a prompt look even while an older one,
         # probably switched off, has pushed the interval up.
         interval = (
             float(recovery.min_interval_s) if keys - self._recovery_last_lost else self._recovery_interval
         )
-        if self._recovery_last_at is not None and now - self._recovery_last_at < interval:
+        search_due = bool(lost) and (
+            self._recovery_last_at is None or now - self._recovery_last_at >= interval
+        )
+        if not (search_due or survey_due):
             return
-        self._recovery_last_at = now
         self._recovery_last_lost = keys
+        if lost:
+            self._recovery_last_at = now
+        self._survey_last_at = now
         self._recovery_task = asyncio.create_task(self._recover(lost), name="printer-agent-recovery")
         self._recovery_task.add_done_callback(self._recovery_done)
+
+    def _lost_printers(self, now: float) -> list[PrinterConfig]:
+        """Printers the hub should hear about as lost, in config order.
+
+        A printer whose identity was never learned is included: it can still be
+        found by the name it was added under, and if not, the hub still needs
+        to know that nobody can look after it.
+        """
+        after = self.config.recovery.after_offline_s
+        return [
+            printer
+            for printer in self.config.printers
+            if printer.key in self._quarantined
+            or now - self._offline_since.get(printer.key, now) >= after
+        ]
 
     def _recovery_done(self, task: asyncio.Task[bool]) -> None:
         moved = False
@@ -1128,33 +1173,37 @@ class HubConnection:
                 moved = bool(task.result())
         floor = float(self.config.recovery.min_interval_s)
         ceiling = max(RECOVERY_MAX_INTERVAL_S, floor)
+        if not self._recovery_last_lost:
+            return  # a survey with nothing lost says nothing about backing off
         self._recovery_interval = floor if moved else min(max(self._recovery_interval * 2, floor), ceiling)
 
     async def _recover(self, lost: list[PrinterConfig]) -> bool:
-        """Look for lost printers by identity and move the ones found.
+        """Sweep the network: move lost printers that were found, report the rest.
 
         The move is a write to `agent.yaml`, not a change to a live adapter: the
         poll loop's reload rebuilds what changed and tells the hub, the same way
-        an operator's edit would, and the new address survives a restart.
+        an operator's edit would, and the new address survives a restart. What
+        could not be moved, and what answered without being configured, goes to
+        the hub as a `network_report` - an agent that fixes what it can and
+        stays silent about the rest leaves the operator to find out from a print
+        that never started.
         """
         path = self.config.source_path
-        if path is None or not path.exists():
-            logger.warning(
-                "cannot follow printers to new addresses without a config file",
-                extra={"action": "recovery"},
-            )
-            return False
         local = await asyncio.to_thread(local_ipv4_networks)
-        hosts = hosts_for(scan_networks(self.config.printers, self.config.recovery.networks, local))
+        networks = scan_networks(self.config.printers, self.config.recovery.networks, local)
+        hosts = hosts_for(networks)
         logger.info(
-            "looking for printers at new addresses",
+            "looking for printers at new addresses" if lost else "surveying the network for printers",
             extra={
                 "action": "recovery",
                 "printers": ",".join(printer.key for printer in lost),
                 "hosts": str(len(hosts)),
             },
         )
-        records = await find_printers(lost, hosts)
+        # Every protocol the agent speaks, on its default port as well as on the
+        # ports configured: a printer nobody has configured is on the default.
+        probes = list(self.config.printers) + [PrinterConfig(key="", brand=brand, host="") for brand in ADAPTERS]
+        records = await find_printers(probes, hosts)
         # Planned against the roster as it is *now*: an edit may have landed
         # during the scan.
         plan = plan_relocation(self.config.printers, {printer.key for printer in lost}, records)
@@ -1165,10 +1214,19 @@ class HubConnection:
             )
         for reason in plan.refused:
             logger.warning("printer address left unchanged", extra={"action": "recovery", "error": reason})
-        if not plan.moves:
-            return False
+
         old_hosts = {printer.key: printer.host for printer in self.config.printers}
-        changed = write_printer_fields(path, {key: {"host": host} for key, host in plan.moves.items()})
+        changed: list[str] = []
+        if plan.moves:
+            if path is None or not path.exists():
+                logger.warning(
+                    "cannot follow printers to new addresses without a config file",
+                    extra={"action": "recovery"},
+                )
+                plan.refused.extend(f"{key}: no config file to record {host} in" for key, host in plan.moves.items())
+                plan.moves = {}
+            else:
+                changed = write_printer_fields(path, {key: {"host": host} for key, host in plan.moves.items()})
         for key in changed:
             logger.info(
                 "printer found at a new address",
@@ -1179,7 +1237,115 @@ class HubConnection:
                     "host": plan.moves[key],
                 },
             )
+
+        self._network_report = self._build_network_report(networks, lost, plan, changed, old_hosts, records)
+        await self._send_network_report()
         return bool(changed)
+
+    def _build_network_report(
+        self,
+        networks: list[Any],
+        lost: list[PrinterConfig],
+        plan: RelocationPlan,
+        changed: list[str],
+        old_hosts: dict[str, str],
+        records: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        loop_now = asyncio.get_running_loop().time()
+        wall_now = time.time()
+        lost_entries: list[dict[str, Any]] = []
+        unresolved = set(plan.not_found) | {
+            key for reason in plan.refused for key in reason.split(":", 1)[0].split(", ")
+        }
+        for printer in lost:
+            # A printer found where it is configured is back, not lost; one that
+            # moved is in `moved`.
+            if printer.key not in unresolved:
+                continue
+            # `refused` reasons start with the keys they are about.
+            refusals = [
+                reason for reason in plan.refused if printer.key in reason.split(":", 1)[0].split(", ")
+            ]
+            details = [self._quarantined[printer.key]] if printer.key in self._quarantined else []
+            entry: dict[str, Any] = {
+                "printer_key": printer.key,
+                "brand": printer.brand,
+                "host": printer.host,
+                "device_id": printer.identity(),
+                "reason": "ambiguous" if refusals else "not_found",
+            }
+            if details + refusals:
+                entry["detail"] = "; ".join(details + refusals)
+            since = self._offline_since.get(printer.key)
+            if since is not None:
+                entry["offline_since"] = utc_iso(wall_now - (loop_now - since))
+            lost_entries.append(entry)
+
+        # Judged against the roster after the moves, or a printer that was just
+        # followed to its new address would be reported there as a stranger.
+        moved_to = {key: plan.moves[key] for key in changed}
+        roster = [replace(printer, host=moved_to.get(printer.key, printer.host)) for printer in self.config.printers]
+        # Unsent moves from an earlier sweep are kept: the hub was unreachable
+        # when they happened, and this is the only record of them it will get.
+        previous_moves = list((self._network_report or {}).get("moved") or [])
+        return {
+            "location_key": self.config.location_key,
+            "scanned_at": utc_now_iso(),
+            "networks": [str(network) for network in networks],
+            "lost": lost_entries,
+            "moved": previous_moves
+            + [{"printer_key": key, "old_host": old_hosts.get(key, ""), "host": moved_to[key]} for key in changed],
+            "unregistered": unregistered_devices(roster, records),
+        }
+
+    async def _prune_network_report(self, snapshots: list[PrinterSnapshot]) -> None:
+        """Take back what the last report said once it stops being true.
+
+        A report is one sweep's view, and sweeps can be an hour apart. A lost
+        printer that answers again, or a stranger the operator has just added
+        to the config, must not stay on the hub's screen for that hour.
+        """
+        report = self._network_report
+        if report is None:
+            return
+        online = {snapshot.printer_key for snapshot in snapshots if snapshot.status != PrinterStatus.offline}
+        keys = {printer.key for printer in self.config.printers}
+        hosts = {printer.host for printer in self.config.printers}
+        lost = [entry for entry in report["lost"] if entry["printer_key"] in keys - online]
+        unregistered = [entry for entry in report["unregistered"] if entry["host"] not in hosts]
+        if lost == report["lost"] and unregistered == report["unregistered"]:
+            return
+        self._network_report = {**report, "lost": lost, "unregistered": unregistered}
+        await self._send_network_report()
+
+    async def _send_network_report(self) -> None:
+        """Send the last report if the hub has not seen it; keep it if it cannot.
+
+        Sent on change only - a location with a printer switched off for the
+        weekend must not repeat the same news every sweep. An older hub answers
+        `unknown_message_type`, which is logged and harmless: the report is not
+        in the outbox, so nothing is left pending by it.
+        """
+        report = self._network_report
+        ws = self._ws
+        if report is None or ws is None or ws.closed:
+            return
+        stamp = _report_stamp(report)
+        if stamp == self._network_report_stamp:
+            return
+        await self._send(ws, build_envelope(MessageType.network_report.value, report))
+        # A move is news once; the lost and unregistered lists are state. A new
+        # dict, because the one just sent is the message.
+        report = self._network_report = {**report, "moved": []}
+        self._network_report_stamp = _report_stamp(report)
+        logger.info(
+            "reported the network to the hub",
+            extra={
+                "action": "network_report",
+                "lost": ",".join(entry["printer_key"] for entry in report["lost"]),
+                "unregistered": ",".join(entry["host"] for entry in report["unregistered"]),
+            },
+        )
 
     async def _ensure_adapter_connected(
         self, key: str, adapter: PrinterAdapter, timeout: float = PRINTER_POLL_TIMEOUT_S

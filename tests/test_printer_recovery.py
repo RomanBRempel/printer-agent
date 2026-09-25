@@ -27,9 +27,16 @@ from printer_agent.config import (
     normalize_device_id,
     validate_config,
 )
-from printer_agent.contracts import PrinterSnapshot, PrinterStatus, build_envelope
+from printer_agent.contracts import AGENT_TO_HUB_TYPES, PrinterSnapshot, PrinterStatus, build_envelope
+from printer_agent.core.discovery import DiscoveredPrinter
 from printer_agent.core.outbox import EventOutbox
-from printer_agent.core.recovery import plan_relocation, scan_networks, write_printer_fields
+from printer_agent.core.recovery import (
+    name_key,
+    plan_relocation,
+    scan_networks,
+    unregistered_devices,
+    write_printer_fields,
+)
 from printer_agent.settings_bundle import apply_remote_settings
 from printer_agent.uplink import connection as connection_module
 from printer_agent.uplink.connection import IDENTITY_MISMATCH, HubConnection
@@ -41,8 +48,8 @@ def printer(key: str, host: str, device_id: str = "", brand: str = "moonraker", 
     return PrinterConfig(key=key, brand=brand, host=host, device_id=device_id, **extra)
 
 
-def record(host: str, *device_ids: str, brand: str = "moonraker") -> dict[str, Any]:
-    return {"brand": brand, "host": host, "port": 7125, "device_ids": list(device_ids)}
+def record(host: str, *device_ids: str, brand: str = "moonraker", name: str = "") -> dict[str, Any]:
+    return {"brand": brand, "host": host, "port": 7125, "device_ids": list(device_ids), "name": name or host}
 
 
 # -- identity ------------------------------------------------------------------
@@ -99,11 +106,14 @@ def base_config(**overrides: Any) -> dict[str, Any]:
 
 
 def test_device_id_and_recovery_settings_round_trip() -> None:
-    config = config_from_dict(base_config(recovery={"after_offline_s": 30, "networks": "10.13.0.0/24"}))
+    config = config_from_dict(
+        base_config(recovery={"after_offline_s": 30, "survey_interval_s": 0, "networks": "10.13.0.0/24"})
+    )
 
     assert config.printers[0].device_id == "k1c-b24e"
     assert config.recovery.enabled is True
     assert config.recovery.after_offline_s == 30
+    assert config.recovery.survey_interval_s == 0
     assert config.recovery.networks == ["10.13.0.0/24"]
     again = config_from_dict(config_to_dict(config))
     assert again.printers[0].device_id == "k1c-b24e"
@@ -189,9 +199,76 @@ def test_two_printers_that_swapped_addresses_both_move() -> None:
     assert plan.moves == {"a": "10.0.0.6", "b": "10.0.0.5"}
 
 
-def test_a_printer_without_identity_is_not_looked_for() -> None:
-    plan = plan_relocation([printer("p", "10.0.0.5")], {"p"}, [record("10.0.0.6", "")])
-    assert plan.moves == {} and plan.not_found == []
+def test_a_printer_without_identity_is_found_by_the_name_it_was_added_under() -> None:
+    """loc-1, 2026-09-25: the router restart came before the agent had ever
+    reached its printers, so no identity had been learned — but every key was
+    the device's own name, as the discovery dialog makes it."""
+    printers = [printer("k1c-b24e", "10.13.0.125", brand="creality")]
+    records = [
+        record("10.13.0.46", "k1c-b24e", brand="creality", name="K1C-B24E"),
+        record("10.13.0.48", "k1-022d", brand="creality", name="K1-022D"),
+    ]
+
+    plan = plan_relocation(printers, {"k1c-b24e"}, records)
+
+    assert plan.moves == {"k1c-b24e": "10.13.0.46"}
+
+
+def test_the_name_rule_is_the_one_the_discovery_dialog_uses() -> None:
+    found = DiscoveredPrinter(brand="moonraker", host="10.13.0.44", port=7125, name="K2Plus-0EC5")
+    assert found.suggested_key == name_key("K2Plus-0EC5") == "k2plus-0ec5"
+
+
+def test_a_name_is_no_match_for_a_device_another_entry_owns() -> None:
+    printers = [
+        printer("k1-0942", "10.13.0.126"),
+        printer("other", "10.13.0.200", "fc:ee:28:03:09:42"),
+    ]
+    records = [record("10.13.0.45", "fc:ee:28:03:09:42", name="K1-0942")]
+
+    plan = plan_relocation(printers, {"k1-0942"}, records)
+
+    assert plan.moves == {} and plan.not_found == ["k1-0942"]
+
+
+def test_a_key_of_the_operators_own_choosing_is_not_guessed_at() -> None:
+    printers = [printer("Ender5", "10.13.0.129", brand="creality")]
+    records = [record("10.13.0.49", "ender-5 max-549b", brand="creality", name="Ender-5 Max-549B")]
+
+    plan = plan_relocation(printers, {"Ender5"}, records)
+
+    assert plan.moves == {} and plan.not_found == ["Ender5"]
+
+
+# -- unregistered devices -------------------------------------------------------
+
+
+def test_a_device_nobody_configured_is_unregistered_once_per_address() -> None:
+    printers = [printer("k2plus-0ec5", "10.13.0.44", "fc:ee:28:0c:0e:c5")]
+    records = [
+        # the configured one, on both protocols its board speaks
+        record("10.13.0.44", "fc:ee:28:0c:0e:c5", name="K2Plus-0EC5"),
+        record("10.13.0.44", "k2plus-svr", brand="creality", name="K2Plus-SVR"),
+        # a stranger answering two protocols
+        record("10.13.0.49", "fc:ee:11:05:54:9b", name="Ender-5"),
+        {**record("10.13.0.49", "ender-5 max-549b", brand="creality", name="Ender-5 Max-549B"), "model": "F004"},
+        # a Bambu, which says nothing about itself but its serial
+        {**record("10.13.0.47", "0948BB5B2400603", brand="bambu", name=""), "port": 8883},
+    ]
+
+    devices = unregistered_devices(printers, records)
+
+    assert [device["host"] for device in devices] == ["10.13.0.47", "10.13.0.49"]
+    assert devices[0]["protocols"] == [{"brand": "bambu", "port": 8883, "device_id": "0948bb5b2400603"}]
+    assert devices[1]["model"] == "F004"
+    assert {protocol["brand"] for protocol in devices[1]["protocols"]} == {"creality", "moonraker"}
+
+
+def test_a_configured_printer_that_moved_is_lost_not_new() -> None:
+    printers = [printer("k1-0942", "10.13.0.126", "fc:ee:28:03:09:42")]
+    records = [record("10.13.0.45", "fc:ee:28:03:09:42", name="K1-0942")]
+
+    assert unregistered_devices(printers, records) == []
 
 
 def test_the_search_starts_in_the_subnets_the_printers_were_in() -> None:
@@ -353,8 +430,14 @@ async def test_a_lost_printer_is_found_and_moved(agent, monkeypatch) -> None:
     hub._maybe_start_recovery([offline])
     assert await hub._recovery_task is True
 
-    assert searched == [["k1-0942"]]
+    # Every protocol the agent speaks is probed, not only the lost printer's.
+    assert "k1-0942" in searched[0] and searched[0].count("") == 3
     assert yaml.safe_load(path.read_text(encoding="utf-8"))["printers"][0]["host"] == "10.13.0.45"
+    [report] = ws.sent_of_type("network_report")
+    assert report["payload"]["moved"] == [
+        {"printer_key": "k1-0942", "old_host": "10.13.0.126", "host": "10.13.0.45"}
+    ]
+    assert report["payload"]["lost"] == [] and report["payload"]["unregistered"] == []
     await hub._reload_config_if_changed()
     assert hub._adapters["k1-0942"].printer.host == "10.13.0.45"
     assert ws.sent_of_type("inventory")
@@ -379,3 +462,115 @@ async def test_a_printer_that_stays_missing_is_searched_for_less_often(agent, mo
     first = hub._recovery_task
     hub._maybe_start_recovery([offline])
     assert hub._recovery_task is first  # too soon for another sweep
+
+
+# -- telling the hub -----------------------------------------------------------
+
+
+def test_network_report_is_an_agent_message() -> None:
+    assert "network_report" in AGENT_TO_HUB_TYPES
+
+
+@pytest.mark.asyncio
+async def test_the_hub_hears_about_a_printer_that_cannot_be_found(agent, monkeypatch) -> None:
+    hub, ws, _path = agent
+
+    async def find_a_stranger(printers, hosts, **_: Any):
+        return [{**record("10.13.0.47", "0948BB5B2400603", brand="bambu", name=""), "port": 8883}]
+
+    monkeypatch.setattr(connection_module, "find_printers", find_a_stranger)
+    monkeypatch.setattr(connection_module, "local_ipv4_networks", lambda: [])
+    offline = PrinterSnapshot(printer_key="k1-0942", status=PrinterStatus.offline, status_raw="offline")
+    hub._maybe_start_recovery([offline])
+    hub._offline_since["k1-0942"] -= hub.config.recovery.after_offline_s
+    hub._maybe_start_recovery([offline])
+    assert await hub._recovery_task is False
+
+    [report] = ws.sent_of_type("network_report")
+    payload = report["payload"]
+    assert payload["location_key"] == "loc-1"
+    assert payload["networks"] == ["10.13.0.0/24"]
+    [lost] = payload["lost"]
+    assert lost["printer_key"] == "k1-0942"
+    assert lost["reason"] == "not_found"
+    assert lost["device_id"] == "fc:ee:28:03:09:42"
+    assert lost["offline_since"].endswith("Z")
+    assert [device["host"] for device in payload["unregistered"]] == ["10.13.0.47"]
+
+    # The same news again is not sent again ...
+    await hub._send_network_report()
+    assert len(ws.sent_of_type("network_report")) == 1
+
+    # ... but the printer answering again takes it back at once.
+    online = PrinterSnapshot(printer_key="k1-0942", status=PrinterStatus.idle, status_raw="idle")
+    await hub._prune_network_report([online])
+    latest = ws.sent_of_type("network_report")[-1]["payload"]
+    assert latest["lost"] == [] and len(ws.sent_of_type("network_report")) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_survey_runs_with_nothing_lost(agent, monkeypatch) -> None:
+    hub, ws, _path = agent
+    calls: list[int] = []
+
+    async def find_a_stranger(printers, hosts, **_: Any):
+        calls.append(1)
+        return [record("10.13.0.49", "fc:ee:11:05:54:9b", name="Ender-5")]
+
+    monkeypatch.setattr(connection_module, "find_printers", find_a_stranger)
+    monkeypatch.setattr(connection_module, "local_ipv4_networks", lambda: [])
+    online = PrinterSnapshot(printer_key="k1-0942", status=PrinterStatus.idle, status_raw="idle")
+
+    hub._maybe_start_recovery([online])
+    assert hub._recovery_task is None  # the first survey waits after_offline_s
+    hub._started_at -= hub.config.recovery.after_offline_s
+    hub._maybe_start_recovery([online])
+    assert await hub._recovery_task is False
+    assert hub._recovery_interval == hub.config.recovery.min_interval_s  # a survey does not back off
+
+    hub._maybe_start_recovery([online])
+    assert len(calls) == 1  # not again before survey_interval_s
+
+    [report] = ws.sent_of_type("network_report")
+    assert report["payload"]["lost"] == []
+    assert report["payload"]["unregistered"][0]["name"] == "Ender-5"
+
+
+@pytest.mark.asyncio
+async def test_a_report_made_while_the_hub_was_away_is_sent_when_it_is_back(agent, monkeypatch) -> None:
+    hub, ws, _path = agent
+    hub._ws = None
+
+    async def find_moved(printers, hosts, **_: Any):
+        return [record("10.13.0.45", "fc:ee:28:03:09:42")]
+
+    monkeypatch.setattr(connection_module, "find_printers", find_moved)
+    monkeypatch.setattr(connection_module, "local_ipv4_networks", lambda: [])
+    hub._offline_since["k1-0942"] = asyncio.get_running_loop().time() - 3600
+    offline = PrinterSnapshot(printer_key="k1-0942", status=PrinterStatus.offline, status_raw="offline")
+    hub._maybe_start_recovery([offline])
+    assert await hub._recovery_task is True
+    assert ws.sent_of_type("network_report") == []
+
+    hub._ws = ws
+    await hub._send_network_report()
+    [report] = ws.sent_of_type("network_report")
+    assert report["payload"]["moved"][0]["host"] == "10.13.0.45"
+
+
+@pytest.mark.asyncio
+async def test_a_printer_found_where_it_is_configured_is_not_reported_lost(agent, monkeypatch) -> None:
+    hub, ws, _path = agent
+
+    async def find_in_place(printers, hosts, **_: Any):
+        return [record("10.13.0.126", "fc:ee:28:03:09:42"), record("10.13.0.126", "fc:ee:28:03:09:42")]
+
+    monkeypatch.setattr(connection_module, "find_printers", find_in_place)
+    monkeypatch.setattr(connection_module, "local_ipv4_networks", lambda: [])
+    hub._offline_since["k1-0942"] = asyncio.get_running_loop().time() - 3600
+    offline = PrinterSnapshot(printer_key="k1-0942", status=PrinterStatus.offline, status_raw="offline")
+    hub._maybe_start_recovery([offline])
+    assert await hub._recovery_task is False
+
+    [report] = ws.sent_of_type("network_report")
+    assert report["payload"]["lost"] == [] and report["payload"]["unregistered"] == []

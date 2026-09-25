@@ -15,6 +15,7 @@ class MessageType(StrEnum):
     inventory = "inventory"
     settings = "settings"
     log = "log"
+    network_report = "network_report"
     telemetry = "telemetry"
     event = "event"
     command_result = "command_result"
@@ -40,6 +41,7 @@ AGENT_TO_HUB_TYPES = frozenset(
         MessageType.inventory.value,
         MessageType.settings.value,
         MessageType.log.value,
+        MessageType.network_report.value,
         MessageType.telemetry.value,
         MessageType.event.value,
         MessageType.command_result.value,
@@ -297,6 +299,11 @@ class Envelope:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def utc_iso(epoch_s: float) -> str:
+    """A Unix time in the same spelling as :func:`utc_now_iso`."""
+    return datetime.fromtimestamp(epoch_s, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def build_envelope(message_type: str, payload: dict[str, Any], *, msg_id: str | None = None, ts: str | None = None) -> dict[str, Any]:

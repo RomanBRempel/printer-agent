@@ -50,26 +50,47 @@ def plan_relocation(
       successfully where it is, so either it is the device there, or it has no
       identity to prove otherwise — and taking the address from under it would
       put two config entries on one machine.
+
+    A printer whose identity was never learned is matched by the **name** the
+    device reports instead — only exactly, and only a device whose own identity
+    no other entry claims. That is not a guess dressed up: the discovery dialog
+    builds the key *from* that name (`K1C-B24E` becomes `k1c-b24e`), and it is
+    the case the identity cannot cover — the one where DHCP moved everything
+    before the agent had reached a printer even once (loc-1, 2026-09-25, a day
+    the identity release went out after the router restart). A printer added
+    under a name of the operator's choosing is simply not found this way, and
+    stays reported as lost rather than pinned on some other machine.
     """
     plan = RelocationPlan()
     by_key = {printer.key: printer for printer in printers}
+    claimed_ids = {printer.identity() for printer in printers if printer.identity()}
 
     for key in sorted(lost):
         printer = by_key.get(key)
-        identity = printer.identity() if printer is not None else ""
-        if printer is None or not identity:
+        if printer is None:
             continue
-        hosts = {
-            str(record.get("host", ""))
-            for record in records
-            if record.get("brand") == printer.brand
-            and identity in {normalize_device_id(value) for value in record.get("device_ids") or []}
-        }
+        identity = printer.identity()
+        if identity:
+            hosts = {
+                str(record.get("host", ""))
+                for record in records
+                if record.get("brand") == printer.brand and identity in record_ids(record)
+            }
+            described = identity
+        else:
+            hosts = {
+                str(record.get("host", ""))
+                for record in records
+                if record.get("brand") == printer.brand
+                and name_key(record.get("name")) == name_key(printer.key)
+                and not (record_ids(record) & claimed_ids)
+            }
+            described = f"the name {printer.key}"
         hosts.discard("")
         if not hosts:
             plan.not_found.append(key)
         elif len(hosts) > 1:
-            plan.refused.append(f"{key}: {identity} answers at {', '.join(sorted(hosts))}")
+            plan.refused.append(f"{key}: {described} answers at {', '.join(sorted(hosts))}")
         elif printer.host not in hosts:
             plan.moves[key] = hosts.pop()
         # else: it answers where it is configured — it is back, nothing to do.
@@ -90,6 +111,81 @@ def plan_relocation(
             plan.refused.append(f"{key}: {host} is in use by printer {holder}, which is online")
             plan.moves.pop(key)
     return plan
+
+
+def record_ids(record: dict[str, Any]) -> set[str]:
+    """Every identity a discovery record answered with, normalized."""
+    return {normalize_device_id(value) for value in record.get("device_ids") or []} - {""}
+
+
+def name_key(value: Any) -> str:
+    """A device name the way the discovery dialog turns it into a printer key.
+
+    Kept in step with `DiscoveredPrinter.suggested_key` on purpose: matching a
+    key back to the device it was named after only works if both sides spell
+    it the same way.
+    """
+    text = str(value or "").lower()
+    cleaned = "".join(char if char.isalnum() else "-" for char in text)
+    return "-".join(part for part in cleaned.split("-") if part)
+
+
+def unregistered_devices(printers: list[PrinterConfig], records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Printers that answered on the network and that no config entry names.
+
+    Grouped by address, because one machine may answer more than one protocol
+    (a Creality board speaks its socket *and* Moonraker, with a different
+    identity on each) and it is still one machine to add. An address is
+    registered when a config entry points at it, or when any identity it
+    answered with belongs to a config entry — the latter covers a printer that
+    has moved and not yet been followed, which is lost, not new.
+    """
+    configured_hosts = {printer.host for printer in printers}
+    claimed_ids = {printer.identity() for printer in printers if printer.identity()}
+    by_host: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        host = str(record.get("host") or "")
+        if host:
+            by_host.setdefault(host, []).append(record)
+
+    devices: list[dict[str, Any]] = []
+    for host, answers in by_host.items():
+        if host in configured_hosts:
+            continue
+        if any(record_ids(record) & claimed_ids for record in answers):
+            continue
+        answers = sorted(answers, key=lambda record: str(record.get("brand") or ""))
+        named = next((record for record in answers if record.get("name") and record.get("name") != host), {})
+        modelled = next((record for record in answers if record.get("model")), {})
+        devices.append(
+            {
+                "host": host,
+                "name": str(named.get("name") or ""),
+                "model": str(modelled.get("model") or ""),
+                "protocols": _protocols(answers),
+            }
+        )
+    return sorted(devices, key=_host_order)
+
+
+def _protocols(answers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    protocols: list[dict[str, Any]] = []
+    for record in answers:
+        entry = {
+            "brand": str(record.get("brand") or ""),
+            "port": int(record.get("port") or 0),
+            "device_id": min(record_ids(record) or {""}),
+        }
+        if entry not in protocols:
+            protocols.append(entry)
+    return protocols
+
+
+def _host_order(device: dict[str, Any]) -> tuple[int, str]:
+    try:
+        return int(ipaddress.IPv4Address(device["host"])), ""
+    except ValueError:
+        return 1 << 32, str(device["host"])
 
 
 def scan_networks(

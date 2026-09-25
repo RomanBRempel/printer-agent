@@ -140,7 +140,7 @@ What the agent is currently configured with, in answer to a `settings_request`.
     "outbox": { "max_events": 5000 },
     "print_files": { "max_age_h": 72, "max_total_mb": 2048 },
     "updates": { "feed_url": "https://…", "auto_update": true, "check_on_startup": true, "check_interval_h": 6 },
-    "recovery": { "enabled": true, "after_offline_s": 60, "min_interval_s": 300, "networks": [] },
+    "recovery": { "enabled": true, "after_offline_s": 60, "min_interval_s": 300, "survey_interval_s": 3600, "networks": [] },
     "printers": [
       {
         "key": "printer-1",
@@ -181,11 +181,15 @@ different order. `device_id` is what the machine itself answers with — a MAC f
 `moonraker`, the firmware hostname for `creality`; a `bambu` entry has none,
 because `credentials.serial` already is one. The agent records it on its own the
 first time it reaches a printer, checks it every time the printer reappears, and
-when a printer with a known identity stays unreachable, looks for that identity on
-the network and rewrites `host` (`recovery` controls when and where). The hub
-learns of a move the way it learns of any edit: through `inventory`, and a
-`settings_request` afterwards shows the new `host`. Both fields are optional — an
-agent that predates them sends neither.
+when a printer stays unreachable, looks for that identity on the network and
+rewrites `host` (`recovery` controls when and where). A printer whose identity was
+never learned is looked for by the device name its key was made from, exactly and
+only where unique. The hub learns of a move the way it learns of any edit: through
+`inventory`, and a `settings_request` afterwards shows the new `host`; the
+`network_report` that follows the sweep names the move and what could not be
+resolved. `recovery.survey_interval_s` is a sweep that runs whether or not anything
+is lost (`0` turns it off). All of these fields are optional — an agent that
+predates them sends none.
 
 ### `log`
 
@@ -229,6 +233,76 @@ distinguishable from an empty field.
 A request the agent cannot serve — an unknown file name, an unreadable directory
 — is answered with the same message carrying `error` and no `lines`. It is not a
 `command_result`: nothing was done to a printer.
+
+### `network_report`
+
+What the agent's last sweep of the location's network found, sent on its own.
+
+```json
+{
+  "location_key": "loc-1",
+  "scanned_at": "2026-09-25T13:10:00Z",
+  "networks": ["10.13.0.0/24"],
+  "lost": [
+    {
+      "printer_key": "a1-mini-sancho",
+      "brand": "bambu",
+      "host": "10.13.0.132",
+      "device_id": "0309da4b0803132",
+      "reason": "not_found",
+      "detail": "",
+      "offline_since": "2026-09-25T08:02:11Z"
+    }
+  ],
+  "moved": [
+    { "printer_key": "k1c-b24e", "old_host": "10.13.0.125", "host": "10.13.0.46" }
+  ],
+  "unregistered": [
+    {
+      "host": "10.13.0.47",
+      "name": "",
+      "model": "",
+      "protocols": [ { "brand": "bambu", "port": 8883, "device_id": "0948bb5b2400603" } ]
+    }
+  ]
+}
+```
+
+A sweep runs when a configured printer is lost — unreachable for
+`recovery.after_offline_s`, or answering as another device — and every
+`recovery.survey_interval_s` regardless, the first one `after_offline_s` after the
+agent starts. Each sweep probes every protocol the agent speaks, so looking for one
+lost printer also finds whatever else is on the network.
+
+- **`lost`** — configured printers that are unreachable and were not followed to a
+  new address. `reason` is `not_found` (nothing on the network answered as it) or
+  `ambiguous` (more than one address did, or its address is held by a printer
+  that works — the agent will not pick). `detail` is readable text for the
+  operator, present when there is something to say: it carries the
+  `identity_mismatch` explanation for a printer whose address now answers as
+  another device. `device_id` is empty for a printer whose identity was never
+  learned. `offline_since` is when the agent first saw it unreachable.
+- **`moved`** — printers the agent followed to a new address in this sweep. The
+  same move also arrives as an `inventory` and shows in `settings`; this list is
+  here so that the hub can say *what happened* rather than show a changed field.
+  A move is reported once; one made while the hub was unreachable is kept and sent
+  after the next `hello`.
+- **`unregistered`** — addresses that answered a printer protocol and that no
+  configured printer names, neither by `host` nor by identity. One entry per
+  address, because one machine can answer more than one protocol (a Creality
+  board speaks its own socket and Moonraker, with a different `device_id` on
+  each) and it is still one machine to add. `name` and `model` are what the device
+  said about itself and may be empty — a Bambu printer tells nothing before its
+  access code is known. Adding one is an operator decision: the agent never adds
+  printers by itself.
+
+The message is **state, not an event**: each one replaces the previous one whole,
+and an empty list means "none". It is sent when its content changes — a lost
+printer that answers again, or a stranger that has been added to the config, is
+taken back without waiting for the next sweep — and again after every `hello`. It
+is not stored in the outbox and not acknowledged: after an agent restart the next
+sweep produces it again. A hub that predates the type answers
+`unknown_message_type`, which the agent logs and otherwise ignores.
 
 ### `telemetry`
 

@@ -107,11 +107,17 @@ class RecoveryConfig:
     back off while nothing is found — a printer that is simply switched off must
     not turn into a subnet sweep every few minutes forever. An empty
     ``networks`` means the /24 of every configured printer plus the agent's own.
+
+    ``survey_interval_s`` is a sweep that runs whether or not anything is lost,
+    so a printer plugged in at the location reaches the hub as *unregistered*
+    instead of waiting for someone to open the discovery dialog; ``0`` turns it
+    off and leaves only the searches for lost printers.
     """
 
     enabled: bool = True
     after_offline_s: int = 60
     min_interval_s: int = 300
+    survey_interval_s: int = 3600
     networks: list[str] = field(default_factory=list)
 
 
@@ -239,6 +245,7 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
             "enabled": config.recovery.enabled,
             "after_offline_s": config.recovery.after_offline_s,
             "min_interval_s": config.recovery.min_interval_s,
+            "survey_interval_s": config.recovery.survey_interval_s,
             "networks": list(config.recovery.networks),
         },
         "printers": [
@@ -417,6 +424,7 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
             enabled=_parse_bool(recovery_data.get("enabled"), True),
             after_offline_s=_int(recovery_data.get("after_offline_s"), 60, "recovery.after_offline_s"),
             min_interval_s=_int(recovery_data.get("min_interval_s"), 300, "recovery.min_interval_s"),
+            survey_interval_s=_int(recovery_data.get("survey_interval_s"), 3600, "recovery.survey_interval_s"),
             networks=[_text(item) for item in networks if _text(item)],
         ),
         printers=printers,
@@ -456,6 +464,8 @@ def validate_config(config: AgentConfig) -> list[str]:
         errors.append("recovery.after_offline_s must be positive")
     if config.recovery.min_interval_s <= 0:
         errors.append("recovery.min_interval_s must be positive")
+    if config.recovery.survey_interval_s < 0:
+        errors.append("recovery.survey_interval_s must be zero (off) or positive")
     for network in config.recovery.networks:
         try:
             ipaddress.IPv4Network(network, strict=False)
