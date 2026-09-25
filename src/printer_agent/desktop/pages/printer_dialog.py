@@ -36,6 +36,7 @@ class PrinterDialog(QDialog):
         self.result_printer: PrinterConfig | None = None
 
         source = printer or PrinterConfig(key="", brand="moonraker", host="")
+        self._source = source
         credentials = dict(source.credentials or {})
         access_code = str(credentials.pop("access_code", ""))
         serial = str(credentials.pop("serial", ""))
@@ -199,5 +200,13 @@ class PrinterDialog(QDialog):
             port=port,
             credentials=credentials,
             camera_snapshot_url=camera_url,
+            # Only while it still names the same machine: pointed at another
+            # address, the entry may now mean another printer, and the agent
+            # learns whatever answers there.
+            device_id=(
+                self._source.device_id
+                if brand == self._source.brand and host == self._source.host
+                else ""
+            ),
         )
         self.accept()

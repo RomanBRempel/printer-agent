@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 import aiohttp
 
-from ..config import PrinterConfig
+from ..config import PrinterConfig, normalize_device_id
 from ..contracts import ErrorSnapshot, JobSnapshot, PrinterCapabilities, PrinterSnapshot, PrinterStatus, TemperatureSnapshot, job_status_for, utc_now_iso
 from .base import PrinterAdapter, UnsupportedCommandError
 
@@ -61,6 +61,7 @@ QUERY_OBJECTS: dict[str, None] = {
 REST_ROUTES: dict[str, tuple[str, str]] = {
     "server.info": ("GET", "/server/info"),
     "printer.info": ("GET", "/printer/info"),
+    "machine.system_info": ("GET", "/machine/system_info"),
     "printer.objects.query": ("GET", "/printer/objects/query"),
     "printer.print.start": ("POST", "/printer/print/start"),
     "printer.print.pause": ("POST", "/printer/print/pause"),
@@ -137,6 +138,14 @@ async def _probe_moonraker_host(
         result = body.get("result") if isinstance(body, dict) else None
         if not isinstance(result, dict) or "state" not in result:
             continue  # something else is listening on this port
+        device_ids: list[str] = []
+        try:
+            async with session.get(f"http://{host}:{port}/machine/system_info") as response:
+                if response.status == 200:
+                    info = await response.json(content_type=None)
+                    device_ids = sorted(moonraker_device_ids(info.get("result") if isinstance(info, dict) else None))
+        except Exception:
+            pass  # still a printer; it just cannot be recognised later
         return {
             "brand": "moonraker",
             "host": host,
@@ -144,9 +153,30 @@ async def _probe_moonraker_host(
             "name": str(result.get("hostname") or "") or host,
             "model": str(result.get("software_version") or ""),
             "serial": "",
+            "device_ids": device_ids,
             "source": "http",
         }
     return None
+
+
+def moonraker_device_ids(result: Any) -> frozenset[str]:
+    """The MAC addresses in a `machine.system_info` result.
+
+    The network card is the one identity every Moonraker host has: Creality's
+    MIPS and ARM boards report `cpu_info.serial_number` as "" or "0", and the
+    hostname is whatever someone last typed. A board with several interfaces
+    yields several, and any of them identifies it.
+    """
+    info = result.get("system_info") if isinstance(result, dict) else None
+    network = info.get("network") if isinstance(info, dict) else None
+    ids: set[str] = set()
+    for interface in (network or {}).values():
+        if not isinstance(interface, dict):
+            continue
+        mac = normalize_device_id(interface.get("mac_address"))
+        if mac and mac.strip("0:"):
+            ids.add(mac)
+    return frozenset(ids)
 
 
 def _safe_upload_name(name: str) -> str:
@@ -188,6 +218,9 @@ class MoonrakerAdapter(PrinterAdapter):
         # Moonraker build answers it, including Creality's fork.
         await self._call("printer.info")
         await self._probe_camera()
+
+    async def device_ids(self) -> frozenset[str]:
+        return moonraker_device_ids(await self._call("machine.system_info"))
 
     async def disconnect(self) -> None:
         if self._session is not None:

@@ -1,0 +1,17 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "build-gui-installer",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"installer/windows/build-gui-installer-exe.ps1"
+			],
+			"isBackground": false
+		}
+	]
+}

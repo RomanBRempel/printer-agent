@@ -28,7 +28,7 @@ from typing import Any
 
 import aiohttp
 
-from ..config import PrinterConfig
+from ..config import PrinterConfig, normalize_device_id
 from ..contracts import (
     ErrorSnapshot,
     JobSnapshot,
@@ -167,6 +167,7 @@ def creality_discovery_record(state: dict[str, Any], host: str, port: int = CREA
     others ("F004" for the Ender-5 Max); it is passed through as reported rather
     than translated, because a wrong translation is worse than a raw code.
     """
+    hostname = normalize_device_id(state.get("hostname"))
     return {
         "brand": "creality",
         "host": host,
@@ -174,6 +175,7 @@ def creality_discovery_record(state: dict[str, Any], host: str, port: int = CREA
         "name": str(state.get("hostname") or "") or host,
         "model": str(state.get("model") or ""),
         "serial": "",
+        "device_ids": [hostname] if hostname else [],
         "source": "ws",
     }
 
@@ -186,6 +188,10 @@ class CrealityAdapter(PrinterAdapter):
         self._connection_task: asyncio.Task[None] | None = None
         self._websocket: aiohttp.ClientWebSocketResponse | None = None
         self._state: dict[str, Any] = {}
+        #: The firmware hostname *this* socket reported. Kept apart from the
+        #: merged state, which outlives a reconnect: after one, the old value
+        #: would vouch for whatever device now holds the address.
+        self._hostname = ""
         self._connected = False
         self._last_error: str = ""
         #: Snapshot URL, configured or found by probing. Empty means no camera,
@@ -211,6 +217,15 @@ class CrealityAdapter(PrinterAdapter):
         # The camera rides its own HTTP port, independent of the vendor socket;
         # probe it once here so the `hello` capabilities are already right.
         await self._probe_camera()
+
+    async def device_ids(self) -> frozenset[str]:
+        """The hostname the firmware reports, e.g. `K1C-B24E`.
+
+        This socket offers no serial and no MAC, but the K-series firmware
+        builds its hostname from the last two bytes of the MAC, so it is as
+        stable as the board. Empty until the first full state frame.
+        """
+        return frozenset({self._hostname}) if self._hostname else frozenset()
 
     async def disconnect(self) -> None:
         self._stop_event.set()
@@ -375,6 +390,7 @@ class CrealityAdapter(PrinterAdapter):
                         self._websocket = websocket
                         self._connected = True
                         self._last_error = ""
+                        self._hostname = ""
                         backoff = 1.0
                         await websocket.send_str(json.dumps(REQUEST_STATE))
                         next_beat = loop.time() + HEARTBEAT_INTERVAL_S
@@ -426,6 +442,8 @@ class CrealityAdapter(PrinterAdapter):
         if not updates:
             return
         self._state.update(updates)
+        if updates.get("hostname"):
+            self._hostname = normalize_device_id(updates["hostname"])
         if "state" in self._state:
             self._ready_event.set()
 

@@ -13,15 +13,20 @@ import socket
 from dataclasses import dataclass
 from typing import Any
 
-from ..adapters.bambu import discover_bambu
-from ..adapters.creality import discover_creality
+from ..adapters.bambu import BAMBU_MQTT_PORT, discover_bambu, discover_bambu_tls
+from ..adapters.creality import CREALITY_WS_PORT, discover_creality
 from ..adapters.moonraker import discover_moonraker
+from ..config import PrinterConfig
 
 #: Refuse to sweep anything larger than a /22 — a /16 is 65k probes and, on a
 #: corporate network, indistinguishable from a port scan.
 MAX_SCAN_HOSTS = 1024
 DEFAULT_SCAN_TIMEOUT_S = 1.5
 DEFAULT_LISTEN_TIMEOUT_S = 6.0
+#: Addresses probed at once by :func:`find_printers`. It runs inside the service,
+#: on the selector loop Windows needs for MQTT, where `select()` stops at 512
+#: sockets — shared with the hub session and every printer connection.
+FIND_BATCH_HOSTS = 64
 
 
 @dataclass(slots=True)
@@ -33,6 +38,9 @@ class DiscoveredPrinter:
     model: str = ""
     serial: str = ""
     source: str = ""
+    #: What the printer will answer with once configured; see
+    #: `PrinterConfig.device_id`. Empty where the probe could not tell.
+    device_id: str = ""
 
     @property
     def identity(self) -> tuple[str, str]:
@@ -141,6 +149,7 @@ def merge(records: list[dict[str, Any]], known_hosts: set[str] | None = None) ->
             model=str(record.get("model", "")),
             serial=str(record.get("serial", "")),
             source=str(record.get("source", "")),
+            device_id=min(record.get("device_ids") or [""]),
         )
         if not printer.brand or not printer.host:
             continue
@@ -181,3 +190,51 @@ async def discover(
         if isinstance(result, list):
             records.extend(result)
     return merge(records, known_hosts)
+
+
+async def find_printers(
+    printers: list[PrinterConfig],
+    hosts: list[str],
+    *,
+    timeout_s: float = DEFAULT_SCAN_TIMEOUT_S,
+) -> list[dict[str, Any]]:
+    """Probe `hosts` with the protocols `printers` speak, on the ports they use.
+
+    Unlike :func:`discover` this does not merge: a Creality board answers both
+    its WebSocket and Moonraker, with a *different* identity on each (a hostname
+    on one, a MAC on the other), and the printer being looked for is configured
+    for exactly one of them. Bambu is found by its certificate rather than SSDP:
+    this runs inside the service, which must not bind a listening socket.
+    """
+    by_brand: dict[str, set[int]] = {}
+    for printer in printers:
+        by_brand.setdefault(printer.brand, set()).add(printer.port or 0)
+    records: list[dict[str, Any]] = []
+    for start in range(0, len(hosts), FIND_BATCH_HOSTS):
+        records.extend(await _find_batch(by_brand, hosts[start : start + FIND_BATCH_HOSTS], timeout_s))
+    return records
+
+
+async def _find_batch(
+    by_brand: dict[str, set[int]], hosts: list[str], timeout_s: float
+) -> list[dict[str, Any]]:
+    probes = []
+    for brand, ports in by_brand.items():
+        if brand == "moonraker":
+            probes.append(
+                discover_moonraker(hosts, ports=tuple(sorted({port or 7125 for port in ports})), timeout_s=timeout_s)
+            )
+        elif brand == "creality":
+            probes.extend(
+                discover_creality(hosts, port=port or CREALITY_WS_PORT, timeout_s=timeout_s) for port in ports
+            )
+        elif brand == "bambu":
+            probes.extend(
+                discover_bambu_tls(hosts, port=port or BAMBU_MQTT_PORT, timeout_s=timeout_s * 2) for port in ports
+            )
+    results = await asyncio.gather(*probes, return_exceptions=True)
+    records: list[dict[str, Any]] = []
+    for result in results:
+        if isinstance(result, list):
+            records.extend(result)
+    return records

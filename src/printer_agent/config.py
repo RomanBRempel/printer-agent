@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import ipaddress
 import logging
 import os
 
@@ -67,6 +68,51 @@ class PrinterConfig:
     #: Still-image URL for the camera, when the printer's is not where the
     #: adapter would look by itself. Not a credential: it is an address.
     camera_snapshot_url: str = ""
+    #: What the machine at `host` says it is — a MAC for Moonraker, the firmware
+    #: hostname for Creality. DHCP hands addresses out again, so `host` is only
+    #: where the printer was last seen; this is how the agent tells the same
+    #: printer at a new address from a different printer at the old one. The
+    #: agent fills it in itself the first time it reaches the printer. Bambu
+    #: needs none: its `credentials.serial` already is one.
+    device_id: str = ""
+
+    def identity(self) -> str:
+        """The identifier the device must answer with, normalized; empty if unknown."""
+        if self.brand == "bambu":
+            return normalize_device_id((self.credentials or {}).get("serial"))
+        return normalize_device_id(self.device_id)
+
+
+def normalize_device_id(value: Any) -> str:
+    """One spelling per identifier: MACs and hostnames arrive in any case."""
+    if value is None:
+        return ""
+    text = str(value).strip().lower()
+    return text.replace("-", ":") if _looks_like_mac(text) else text
+
+
+def _looks_like_mac(text: str) -> bool:
+    parts = text.replace("-", ":").split(":")
+    return len(parts) == 6 and all(
+        len(part) == 2 and all(char in "0123456789abcdef" for char in part) for part in parts
+    )
+
+
+@dataclass(slots=True)
+class RecoveryConfig:
+    """Finding a printer again after DHCP gave it another address.
+
+    A printer that stays unreachable for ``after_offline_s`` and whose identity
+    is known is looked for on the network; a match rewrites its `host`. Scans
+    back off while nothing is found — a printer that is simply switched off must
+    not turn into a subnet sweep every few minutes forever. An empty
+    ``networks`` means the /24 of every configured printer plus the agent's own.
+    """
+
+    enabled: bool = True
+    after_offline_s: int = 60
+    min_interval_s: int = 300
+    networks: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -80,6 +126,7 @@ class AgentConfig:
     outbox: OutboxConfig = field(default_factory=OutboxConfig)
     print_files: PrintFilesConfig = field(default_factory=PrintFilesConfig)
     updates: UpdateConfig = field(default_factory=UpdateConfig)
+    recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     printers: list[PrinterConfig] = field(default_factory=list)
     #: File this config was read from, so a long-running agent can notice the
     #: operator editing it. Set by :func:`parse_config`; ``None`` for a config
@@ -188,6 +235,12 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
             "check_on_startup": config.updates.check_on_startup,
             "check_interval_h": config.updates.check_interval_h,
         },
+        "recovery": {
+            "enabled": config.recovery.enabled,
+            "after_offline_s": config.recovery.after_offline_s,
+            "min_interval_s": config.recovery.min_interval_s,
+            "networks": list(config.recovery.networks),
+        },
         "printers": [
             {
                 "key": printer.key,
@@ -200,6 +253,7 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
                     else {}
                 ),
                 **({"credentials": printer.credentials} if printer.credentials else {}),
+                **({"device_id": printer.device_id} if printer.device_id else {}),
             }
             for printer in config.printers
         ],
@@ -276,7 +330,9 @@ def _parse_bool(value: Any, default: bool = False) -> bool:
 
 #: Everything a `printers[]` entry may say about itself. Anything else is a
 #: mistake worth naming rather than dropping.
-_PRINTER_KEYS = frozenset({"key", "brand", "host", "port", "credentials", "camera_snapshot_url"})
+_PRINTER_KEYS = frozenset(
+    {"key", "brand", "host", "port", "credentials", "camera_snapshot_url", "device_id"}
+)
 
 #: Settings that belong one level down, under `credentials`. Written beside
 #: `host` they parse as valid YAML, vanish into nothing, and leave the printer
@@ -311,6 +367,10 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
     print_files_data = data.get("print_files") or {}
     updates_data = data.get("updates") or {}
     backoff_data = data.get("command_reconnect_backoff_s") or {}
+    recovery_data = data.get("recovery") or {}
+    networks = recovery_data.get("networks") or []
+    if isinstance(networks, str):
+        networks = [networks]
     printers: list[PrinterConfig] = []
     for item in data.get("printers", []):
         if not isinstance(item, dict):
@@ -325,6 +385,7 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
                 port=_int(item.get("port"), 0, f"printer {key}: port") if item.get("port") is not None else None,
                 credentials=item.get("credentials") or {},
                 camera_snapshot_url=_text(item.get("camera_snapshot_url")),
+                device_id=normalize_device_id(_text(item.get("device_id"))),
             )
         )
     return AgentConfig(
@@ -351,6 +412,12 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
             auto_update=_parse_bool(updates_data.get("auto_update"), False),
             check_on_startup=_parse_bool(updates_data.get("check_on_startup"), True),
             check_interval_h=int(updates_data.get("check_interval_h", 24) or 0),
+        ),
+        recovery=RecoveryConfig(
+            enabled=_parse_bool(recovery_data.get("enabled"), True),
+            after_offline_s=_int(recovery_data.get("after_offline_s"), 60, "recovery.after_offline_s"),
+            min_interval_s=_int(recovery_data.get("min_interval_s"), 300, "recovery.min_interval_s"),
+            networks=[_text(item) for item in networks if _text(item)],
         ),
         printers=printers,
     )
@@ -385,8 +452,27 @@ def validate_config(config: AgentConfig) -> list[str]:
     # `auto_update` without a feed is pointless but deliberately *not* an error:
     # an agent already running that combination would refuse to start after an
     # update, which turns a useless setting into an outage.
+    if config.recovery.after_offline_s <= 0:
+        errors.append("recovery.after_offline_s must be positive")
+    if config.recovery.min_interval_s <= 0:
+        errors.append("recovery.min_interval_s must be positive")
+    for network in config.recovery.networks:
+        try:
+            ipaddress.IPv4Network(network, strict=False)
+        except ValueError:
+            errors.append(f"recovery.networks: {network} is not an IPv4 network")
     if not config.printers:
         errors.append("printers must not be empty")
+    owners: dict[tuple[str, str], str] = {}
+    for printer in config.printers:
+        identity = printer.identity()
+        if not identity:
+            continue
+        # Two entries claiming one machine would each follow it to its new
+        # address, and the hub would get the same printer twice under two keys.
+        other = owners.setdefault((printer.brand, identity), printer.key)
+        if other != printer.key:
+            errors.append(f"printer {printer.key}: same device as printer {other} ({identity})")
     for printer in config.printers:
         if not printer.key:
             errors.append("each printer needs a key")

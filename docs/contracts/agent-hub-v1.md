@@ -140,6 +140,7 @@ What the agent is currently configured with, in answer to a `settings_request`.
     "outbox": { "max_events": 5000 },
     "print_files": { "max_age_h": 72, "max_total_mb": 2048 },
     "updates": { "feed_url": "https://…", "auto_update": true, "check_on_startup": true, "check_interval_h": 6 },
+    "recovery": { "enabled": true, "after_offline_s": 60, "min_interval_s": 300, "networks": [] },
     "printers": [
       {
         "key": "printer-1",
@@ -147,7 +148,8 @@ What the agent is currently configured with, in answer to a `settings_request`.
         "host": "10.13.0.130",
         "port": 7125,
         "camera_snapshot_url": "",
-        "credentials": { "api_key": "__redacted__" }
+        "credentials": { "api_key": "__redacted__" },
+        "device_id": "fc:ee:28:0c:0e:c5"
       }
     ]
   },
@@ -172,6 +174,18 @@ editor that does not silently blank a working credential.
 `request_msg_id` carries the `msg_id` of the envelope being answered. Unlike
 `inventory`, this message is never sent unsolicited: settings change because
 someone changed them, and whoever did already knows.
+
+**`printers[].host` is where the printer was last seen, not what it is.** Printers
+take their addresses from DHCP, and a router restart hands them out again in a
+different order. `device_id` is what the machine itself answers with — a MAC for
+`moonraker`, the firmware hostname for `creality`; a `bambu` entry has none,
+because `credentials.serial` already is one. The agent records it on its own the
+first time it reaches a printer, checks it every time the printer reappears, and
+when a printer with a known identity stays unreachable, looks for that identity on
+the network and rewrites `host` (`recovery` controls when and where). The hub
+learns of a move the way it learns of any edit: through `inventory`, and a
+`settings_request` afterwards shows the new `host`. Both fields are optional — an
+agent that predates them sends neither.
 
 ### `log`
 
@@ -367,6 +381,15 @@ material density, and the printer reports neither. An adapter that gets a mass
 straight from the firmware sends `job.filament_used_g` instead, and the hub
 prefers it over its own estimate.
 
+**An `offline` printer may be reachable.** `error.code` says which: `offline`
+for a printer that did not answer, `identity_mismatch` for an address that
+answered as a *different* device — its `device_id` (or Bambu serial) is not this
+printer's, which after a DHCP reshuffle is the usual case. Such a printer takes
+no commands: every new `command` for it is answered `failed` with the reason in
+`error_text`, because a print sent there would start on the wrong machine. It
+stays so until the agent finds the printer again or the device at the address
+proves to be the right one.
+
 **`job.status` and `status` are separate vocabularies.** `idle`, `offline` and
 `maintenance` describe a machine and have no job counterpart, so the agent omits
 `job.status` instead of putting a printer value in it.
@@ -527,6 +550,13 @@ no other way to express a removal, so a `printers` array replaces the roster
 wholesale and a printer missing from it is dropped from the agent. Omit the key
 entirely to leave the roster alone; sending `[]` removes every printer, which the
 agent will do.
+
+**An omitted `device_id` is kept while the entry still points at the same
+machine.** A hub that does not know the field posts entries without it, and
+dropping it would leave the printer unrecognisable after its next move. It is
+kept when `brand` and `host` are unchanged, and cleared otherwise — an entry
+pointed at another address may now mean another machine, and the agent learns
+whatever answers there. Send `"device_id": ""` to make it forget explicitly.
 
 **`__redacted__` means "keep what you have".** The hub reads secrets out of
 `settings` as that marker, so posting the block back must not overwrite the real

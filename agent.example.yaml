@@ -27,6 +27,17 @@ updates:
   # How often a running agent re-asks the feed. 0 keeps the old behaviour:
   # only at service start, which a box that stays up for weeks never reaches.
   check_interval_h: 24
+# Printers take their addresses from DHCP. Each printer's identity (a MAC for
+# moonraker, the firmware hostname for creality, the serial for bambu) is
+# recorded as `device_id` the first time the agent reaches it; a printer that
+# then stays unreachable is looked for by that identity and its `host` is
+# rewritten here. A printer whose address answers as another device reports
+# offline (`identity_mismatch`) and takes no commands until it is found.
+recovery:
+  enabled: true
+  after_offline_s: 60      # unreachable this long before a search starts
+  min_interval_s: 300      # between searches; doubles up to 1 h while nothing is found
+  networks: []             # empty: the /24 of every configured printer
 printers:
   - key: printer-1
     brand: moonraker

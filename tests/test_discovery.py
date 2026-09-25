@@ -134,6 +134,7 @@ def test_parse_bambu_ssdp_extracts_identity():
         "name": "Цех-1 P1S",
         "model": "BL-P001",
         "serial": "01P00A123456789",
+        "device_ids": ["01p00a123456789"],
         "source": "ssdp",
     }
 

@@ -17,11 +17,12 @@ function Invoke-Checked {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$What,
-        [Parameter(Mandatory = $true)][scriptblock]$Command
+        [Parameter(Mandatory = $true)][scriptblock]$Command,
+        [int[]]$SuccessCodes = @(0)
     )
 
     & $Command
-    if ($LASTEXITCODE -ne 0) {
+    if ($LASTEXITCODE -notin $SuccessCodes) {
         throw "$What failed with exit code $LASTEXITCODE."
     }
 }
@@ -33,13 +34,167 @@ function Test-Administrator {
 }
 
 function Get-PythonLauncher {
+    $candidates = @()
+
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        return @{ Command = "py"; Args = @("-3.11") }
+        # Prefer 3.11+, but do not require exactly 3.11.
+        $candidates += @{ Command = "py"; Args = @("-3") }
+        $candidates += @{ Command = "py"; Args = @("-3.11") }
     }
     if (Get-Command python -ErrorAction SilentlyContinue) {
-        return @{ Command = "python"; Args = @() }
+        $candidates += @{ Command = "python"; Args = @() }
     }
-    throw "Python 3.11+ was not found. Install Python first or use the py launcher."
+
+    $known = @(
+        (Join-Path $env:SystemRoot "py.exe"),
+        (Join-Path $env:LocalAppData "Programs\Python\Launcher\py.exe"),
+        (Join-Path $env:ProgramFiles "Python311\python.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Python311\python.exe")
+    )
+    foreach ($candidate in $known) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path $candidate)) {
+            if ($candidate.ToLowerInvariant().EndsWith("py.exe")) {
+                $candidates += @{ Command = $candidate; Args = @("-3") }
+                $candidates += @{ Command = $candidate; Args = @("-3.11") }
+                continue
+            }
+            $candidates += @{ Command = $candidate; Args = @() }
+        }
+    }
+
+    foreach ($candidate in $candidates) {
+        try {
+            $versionText = (& $candidate.Command @($candidate.Args) -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null).Trim()
+            if ($LASTEXITCODE -ne 0) {
+                continue
+            }
+            $parts = $versionText.Split('.')
+            if ($parts.Count -lt 2) {
+                continue
+            }
+            $major = [int]$parts[0]
+            $minor = [int]$parts[1]
+            if (($major -gt 3) -or ($major -eq 3 -and $minor -ge 11)) {
+                return $candidate
+            }
+        }
+        catch {
+            continue
+        }
+    }
+
+    return $null
+}
+
+function Invoke-ProcessChecked {
+    param(
+        [Parameter(Mandatory = $true)][string]$What,
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [int[]]$SuccessCodes = @(0)
+    )
+
+    if (-not (Test-Path $FilePath)) {
+        throw "$What failed: executable not found at $FilePath"
+    }
+
+    $proc = Start-Process -FilePath $FilePath -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden
+    if ($proc.ExitCode -notin $SuccessCodes) {
+        throw "$What failed with exit code $($proc.ExitCode)."
+    }
+}
+
+function Install-PythonRuntime {
+    param([string]$ScriptRoot)
+
+    Write-Host "Python 3.11+ not found. Installing Python runtime..."
+    $attemptErrors = @()
+
+    $bundled = Get-ChildItem -Path $ScriptRoot -Filter "python-3.11*-amd64.exe" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+
+    if ($null -ne $bundled) {
+        try {
+            Write-Host "Using bundled Python installer: $($bundled.Name)"
+            $bundledTemp = Join-Path $env:TEMP $bundled.Name
+            Copy-Item $bundled.FullName $bundledTemp -Force
+            try {
+                # Running from a normal TEMP path is more reliable than
+                # launching directly from PyInstaller's _MEI extraction folder.
+                Invoke-ProcessChecked -What "Bundled Python install" -FilePath $bundledTemp -Arguments @(
+                    "/quiet", "InstallAllUsers=1", "PrependPath=1", "Include_pip=1", "Include_launcher=1"
+                ) -SuccessCodes @(0, 3010)
+            }
+            finally {
+                if (Test-Path $bundledTemp) {
+                    Remove-Item $bundledTemp -Force -ErrorAction SilentlyContinue
+                }
+            }
+            return
+        }
+        catch {
+            $attemptErrors += "bundled: $($_.Exception.Message)"
+            Write-Warning "Bundled Python installer failed, trying the next method."
+        }
+    }
+
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        try {
+            Write-Host "Using winget to install Python 3.11..."
+            Invoke-Checked -What "winget Python install" -SuccessCodes @(0, 3010) -Command {
+                & winget install --id Python.Python.3.11 --accept-package-agreements --accept-source-agreements --scope machine --silent
+            }
+            return
+        }
+        catch {
+            $attemptErrors += "winget: $($_.Exception.Message)"
+            Write-Warning "winget Python install failed, trying direct download."
+        }
+    }
+
+    $pythonInstallerUrl = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
+    $downloadedInstaller = Join-Path $env:TEMP "python-3.11.9-amd64.exe"
+    try {
+        Write-Host "Downloading Python installer: $pythonInstallerUrl"
+        Invoke-WebRequest -Uri $pythonInstallerUrl -OutFile $downloadedInstaller -UseBasicParsing
+        Invoke-ProcessChecked -What "Downloaded Python install" -FilePath $downloadedInstaller -Arguments @(
+            "/quiet", "InstallAllUsers=1", "PrependPath=1", "Include_pip=1", "Include_launcher=1"
+        ) -SuccessCodes @(0, 3010)
+        return
+    }
+    finally {
+        if (Test-Path $downloadedInstaller) {
+            Remove-Item $downloadedInstaller -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    throw "Python runtime installation failed. Attempts: $($attemptErrors -join '; ')"
+}
+
+function Ensure-PythonLauncher {
+    param([string]$ScriptRoot)
+
+    $launcher = Get-PythonLauncher
+    if ($null -ne $launcher) {
+        return $launcher
+    }
+
+    Install-PythonRuntime -ScriptRoot $ScriptRoot
+
+    # Refresh PATH in the current process after a machine-scope installation.
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if (-not [string]::IsNullOrWhiteSpace($machinePath)) {
+        $env:Path = "$machinePath;$userPath"
+    }
+
+    $launcher = Get-PythonLauncher
+    if ($null -ne $launcher) {
+        return $launcher
+    }
+
+    throw "Python 3.11+ installation did not expose 'py' or 'python'. Install Python manually and re-run the installer."
 }
 
 function New-Shortcut {
@@ -141,11 +296,20 @@ $legacyShortcuts = @(
     (Join-Path $desktopDir "Printer Agent - Configure.lnk")
 )
 
-$pythonLauncher = Get-PythonLauncher
+$pythonLauncher = Ensure-PythonLauncher -ScriptRoot $PSScriptRoot
 $pyCmd = $pythonLauncher.Command
 $pyArgs = $pythonLauncher.Args
 $autoUpdateEnabled = Convert-ToBoolean -Value $AutoUpdate
-Invoke-Checked -What "Virtual environment creation" -Command { & $pyCmd @pyArgs -m venv $venvPath }
+try {
+    Invoke-Checked -What "Virtual environment creation" -Command { & $pyCmd @pyArgs -m venv $venvPath }
+}
+catch {
+    Install-PythonRuntime -ScriptRoot $PSScriptRoot
+    $pythonLauncher = Ensure-PythonLauncher -ScriptRoot $PSScriptRoot
+    $pyCmd = $pythonLauncher.Command
+    $pyArgs = $pythonLauncher.Args
+    Invoke-Checked -What "Virtual environment creation" -Command { & $pyCmd @pyArgs -m venv $venvPath }
+}
 $pythonExe = Join-Path $venvPath "Scripts\python.exe"
 $pythonwExe = Join-Path $venvPath "Scripts\pythonw.exe"
 $guiExe = Join-Path $venvPath "Scripts\printer-agent-gui.exe"

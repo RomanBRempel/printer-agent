@@ -42,6 +42,7 @@ as the desktop app — [gui_installer.py](gui_installer.py) imports
 What it does:
 
 - requests elevation, then shows a single window with the install parameters
+- auto-installs Python 3.11 when it is missing on the target machine
 - reports the named steps of [install.ps1](install.ps1) as a progress timeline
 - keeps the PowerShell transcript out of the window: it goes to
   `ProgramData\printer-agent\logs\installer-*.log`, surfaced by a **Журнал**

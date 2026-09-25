@@ -10,6 +10,8 @@ $sourceRoot = Join-Path $repoRoot "src"
 $guiInstallerPy = (Resolve-Path (Join-Path $PSScriptRoot "gui_installer.py")).Path
 $installPs1 = (Resolve-Path (Join-Path $PSScriptRoot "install.ps1")).Path
 $iconPath = Join-Path $PSScriptRoot "printer-agent.ico"
+$pythonBootstrapUrl = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
+$pythonBootstrapName = "python-3.11.9-amd64.exe"
 
 if (-not (Test-Path $pythonExe)) {
     throw "Python executable was not found at $pythonExe"
@@ -38,6 +40,15 @@ New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $workDir = Join-Path $PSScriptRoot "build"
 New-Item -ItemType Directory -Force -Path $workDir | Out-Null
 
+# Keep a Python bootstrapper inside the installer so setup works on machines
+# without a preinstalled interpreter.
+$pythonBootstrap = Join-Path $workDir $pythonBootstrapName
+if (-not (Test-Path $pythonBootstrap)) {
+    Write-Host "Downloading Python bootstrap installer: $pythonBootstrapUrl"
+    Invoke-WebRequest -Uri $pythonBootstrapUrl -OutFile $pythonBootstrap -UseBasicParsing
+}
+Write-Host "Bundling Python bootstrap installer: $pythonBootstrapName"
+
 # Qt subsystems the installer never touches. Left in, they roughly double the
 # bundle for no benefit.
 $excluded = @(
@@ -60,7 +71,8 @@ $commonArgs = @(
     # gui_installer imports the desktop app's theme so both look identical.
     "--paths", $sourceRoot,
     "--add-data", "$installPs1;.",
-    "--add-data", "$($wheel.FullName);."
+    "--add-data", "$($wheel.FullName);.",
+    "--add-data", "$pythonBootstrap;."
 )
 
 if (Test-Path $iconPath) {

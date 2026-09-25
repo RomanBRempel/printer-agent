@@ -36,6 +36,17 @@ class PrinterAdapter(ABC):
     def capabilities(self) -> PrinterCapabilities:
         raise NotImplementedError
 
+    async def device_ids(self) -> frozenset[str]:
+        """What the machine at the configured address says it is, normalized.
+
+        DHCP gives addresses out again, so a reachable printer is not proof of
+        the *right* printer: the neighbour that inherited the address answers
+        the same protocol just as well, and a print sent to it is a print on
+        the wrong machine. Empty means this protocol cannot tell, and nothing
+        is checked. Called only on a connected adapter.
+        """
+        return frozenset()
+
     async def start_print(
         self,
         file_ref: str,

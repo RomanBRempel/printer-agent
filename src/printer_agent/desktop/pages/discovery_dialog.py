@@ -86,6 +86,8 @@ class DiscoveryRow(QWidget):
             host=self.printer.host,
             port=self.printer.port or None,
             credentials=credentials,
+            # Bambu's identity is its serial, already in the credentials.
+            device_id="" if self.printer.brand == "bambu" else self.printer.device_id,
         )
 
 

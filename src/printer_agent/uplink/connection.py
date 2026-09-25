@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -13,6 +13,7 @@ import aiohttp
 from ..adapters.base import PrinterAdapter, UnsupportedCommandError
 from ..config import (
     AgentConfig,
+    PrinterConfig,
     config_from_dict,
     config_to_dict,
     load_config_file,
@@ -34,6 +35,7 @@ from ..contracts import (
     is_retryable_hello_reject,
     utc_now_iso,
 )
+from ..core.discovery import find_printers, hosts_for, local_ipv4_networks
 from ..core.filecache import PrintFileCache
 from ..core.logtail import (
     UnknownLogFile,
@@ -45,6 +47,7 @@ from ..core.logtail import (
     tail_lines,
 )
 from ..core.outbox import EventOutbox
+from ..core.recovery import plan_relocation, scan_networks, write_printer_fields
 from ..core.registry import build_adapter
 from ..logsetup import active_log_path
 from ..core.state import PrinterStateStore
@@ -70,6 +73,14 @@ OUTBOX_FLUSH_LIMIT = 200
 #: cancelled and reported as offline while the desktop app — which waits 12 s —
 #: showed the same printer running.
 PRINTER_POLL_TIMEOUT_S = 20.0
+
+#: Ceiling for the gap between recovery scans that keep finding nothing. A
+#: printer that is switched off is indistinguishable from one that moved, and
+#: it must not cost the location a subnet sweep every few minutes all weekend.
+RECOVERY_MAX_INTERVAL_S = 3600.0
+
+#: `error.code` of a printer whose address now answers as a different device.
+IDENTITY_MISMATCH = "identity_mismatch"
 
 
 class HubRejected(RuntimeError):
@@ -263,6 +274,19 @@ class HubConnection:
         #: File transfers running outside the receive loop, kept referenced so
         #: the event loop cannot collect a task mid-download.
         self._transfers: set[asyncio.Task[None]] = set()
+        #: Printers whose device was checked since they last came online. A
+        #: printer is re-checked every time it reappears, because reappearing is
+        #: exactly when DHCP may have put another machine at its address.
+        self._verified: set[str] = set()
+        #: printer_key -> why its address is answered by some other device.
+        #: Such a printer reports offline and takes no commands.
+        self._quarantined: dict[str, str] = {}
+        #: printer_key -> loop time it was first seen offline in this stretch.
+        self._offline_since: dict[str, float] = {}
+        self._recovery_task: asyncio.Task[bool] | None = None
+        self._recovery_last_at: float | None = None
+        self._recovery_interval = float(config.recovery.min_interval_s)
+        self._recovery_last_lost: frozenset[str] = frozenset()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -288,6 +312,10 @@ class HubConnection:
                 await poll_task
             for transfer in list(self._transfers):
                 transfer.cancel()
+            if self._recovery_task is not None:
+                self._recovery_task.cancel()
+                with suppress(Exception, asyncio.CancelledError):
+                    await self._recovery_task
             with suppress(Exception, asyncio.CancelledError):
                 await self._camera.stop_all()
             with suppress(Exception, asyncio.CancelledError):
@@ -457,6 +485,28 @@ class HubConnection:
             self.outbox.record_command_result(
                 command_id, printer_key, result["status"], result["error_text"], {}
             )
+            await self._send(ws, build_envelope(MessageType.command_result.value, result))
+            return
+
+        refusal = self._quarantined.get(printer_key)
+        if refusal and self.outbox.get_command_result(command_id) is None:
+            # Checked after the stored-result lookup, so a replay of a command
+            # that already ran still gets its real answer. Anything new is
+            # refused outright: the device at this address is not the printer
+            # the hub means, and a print started there is a print on the wrong
+            # machine.
+            logger.warning(
+                "command refused: the printer's address answers as another device",
+                extra={"action": "hub_command", "printer_key": printer_key, "command_id": command_id},
+            )
+            result = {
+                "command_id": command_id,
+                "printer_key": printer_key,
+                "status": CommandStatus.failed.value,
+                "error_text": refusal,
+                "response": {},
+            }
+            self.outbox.record_command_result(command_id, printer_key, result["status"], refusal, {})
             await self._send(ws, build_envelope(MessageType.command_result.value, result))
             return
 
@@ -785,6 +835,7 @@ class HubConnection:
             try:
                 await self._reload_config_if_changed()
                 snapshots = await self._collect_snapshots()
+                self._maybe_start_recovery(snapshots)
                 self._record_events(snapshots)
                 await self._flush_outbox()
                 await self._send_telemetry(snapshots)
@@ -849,7 +900,13 @@ class HubConnection:
         incoming = {printer.key: printer for printer in config.printers}
         removed = [key for key in previous if key not in incoming]
         added = [key for key in incoming if key not in previous]
-        rebuilt = [key for key, printer in incoming.items() if key in previous and previous[key] != printer]
+        # A learned `device_id` is written into the file by the agent itself;
+        # that must not tear down a working connection to adopt it.
+        rebuilt = [
+            key
+            for key, printer in incoming.items()
+            if key in previous and replace(previous[key], device_id="") != replace(printer, device_id="")
+        ]
 
         for name in _restart_required_changes(self.config, config):
             logger.warning(
@@ -861,6 +918,9 @@ class HubConnection:
             adapter = self._adapters.pop(key, None)
             self._connected_adapters.discard(key)
             self._state_store.forget(key)
+            self._verified.discard(key)
+            self._quarantined.pop(key, None)
+            self._offline_since.pop(key, None)
             # The frame loop holds the old adapter; leaving it running would keep
             # filming through a connection nothing else uses any more.
             with suppress(Exception):
@@ -870,6 +930,12 @@ class HubConnection:
                     await adapter.disconnect()
         for key in added + rebuilt:
             self._adapters[key] = build_adapter(incoming[key])
+        for key, printer in incoming.items():
+            if key in previous and previous[key].device_id != printer.device_id:
+                # Someone changed or cleared it by hand: check the device, or
+                # learn it again, on the next poll rather than the next outage.
+                self._verified.discard(key)
+                self._quarantined.pop(key, None)
 
         # Read fresh every cycle, so assigning them is all it takes.
         self.config.printers = list(config.printers)
@@ -877,6 +943,7 @@ class HubConnection:
         self.config.heartbeat_interval_s = config.heartbeat_interval_s
         self.config.command_reconnect_backoff_s = config.command_reconnect_backoff_s
         self.config.outbox.max_events = config.outbox.max_events
+        self.config.recovery = config.recovery
         if not (removed or added or rebuilt):
             return
         logger.info(
@@ -907,7 +974,7 @@ class HubConnection:
     async def _poll_adapter(self, key: str, adapter: PrinterAdapter, timeout: float) -> PrinterSnapshot:
         await self._ensure_adapter_connected(key, adapter, timeout)
         try:
-            return await asyncio.wait_for(adapter.get_state(), timeout=timeout)
+            snapshot = await asyncio.wait_for(adapter.get_state(), timeout=timeout)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -917,6 +984,202 @@ class HubConnection:
                 "printer poll failed", extra={"action": "poll", "printer_key": key, "error": reason}
             )
             return self._offline_snapshot(adapter, reason)
+        return await self._check_identity(key, adapter, snapshot, timeout)
+
+    async def _check_identity(
+        self, key: str, adapter: PrinterAdapter, snapshot: PrinterSnapshot, timeout: float
+    ) -> PrinterSnapshot:
+        """Make sure the device answering is the printer this key means.
+
+        After DHCP reshuffles a location, the address in the config can belong
+        to a neighbour that speaks the same protocol. Its telemetry would arrive
+        under the wrong key, and the hub's next print would start on it. So a
+        printer is checked each time it (re)appears; a printer with no identity
+        yet has the one it answers with recorded, and one that answers with a
+        different identity is reported offline until recovery moves it.
+        """
+        if snapshot.status == PrinterStatus.offline:
+            self._verified.discard(key)
+            return snapshot
+        if key in self._verified:
+            return snapshot
+        try:
+            actual = await asyncio.wait_for(adapter.device_ids(), timeout=timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Unchecked this cycle, not trusted: the next poll asks again.
+            logger.debug(
+                "printer identity unavailable",
+                extra={"action": "identity", "printer_key": key, "error": str(exc)},
+            )
+            return snapshot
+        printer = self._printer_config(key) or adapter.printer
+        expected = printer.identity()
+        if not actual:
+            self._verified.add(key)
+            return snapshot
+        if not expected:
+            self._learn_identity(printer, min(actual))
+            self._verified.add(key)
+            return snapshot
+        if expected in actual:
+            self._verified.add(key)
+            if self._quarantined.pop(key, None):
+                logger.info(
+                    "printer identity confirmed again",
+                    extra={"action": "identity", "printer_key": key, "host": printer.host},
+                )
+            return snapshot
+
+        reason = (
+            f"{printer.host} now answers as {min(actual)}, not as this printer ({expected}); "
+            "its address was probably reassigned by DHCP"
+        )
+        if key not in self._quarantined:
+            logger.warning(
+                "printer address answers as another device",
+                extra={"action": "identity", "printer_key": key, "host": printer.host, "error": reason},
+            )
+        self._quarantined[key] = reason
+        return self._offline_snapshot(adapter, reason, code=IDENTITY_MISMATCH)
+
+    def _printer_config(self, key: str) -> PrinterConfig | None:
+        return next((printer for printer in self.config.printers if printer.key == key), None)
+
+    def _learn_identity(self, printer: PrinterConfig, device_id: str) -> None:
+        """Record the identity a printer answered with, so it can be found again.
+
+        Written to the file because it has to outlive the process: the moment it
+        is needed is after a site-wide power cut, when the agent restarts and
+        every address in the config is stale.
+        """
+        printer.device_id = device_id
+        path = self.config.source_path
+        if path is None or not path.exists():
+            return
+        try:
+            write_printer_fields(path, {printer.key: {"device_id": device_id}})
+        except Exception as exc:
+            logger.warning(
+                "could not record printer identity",
+                extra={"action": "identity", "printer_key": printer.key, "error": str(exc)},
+            )
+            return
+        logger.info(
+            "recorded printer identity",
+            extra={"action": "identity", "printer_key": printer.key, "device_id": device_id},
+        )
+
+    # -- recovery after readdressing -------------------------------------
+
+    def _maybe_start_recovery(self, snapshots: list[PrinterSnapshot]) -> None:
+        """Start a search for lost printers when one is due.
+
+        Lost means: unreachable for `recovery.after_offline_s`, or answered by
+        another device at its address. Only a printer with a known identity can
+        be looked for. The scan runs beside the poll loop, which keeps
+        reporting while it takes its tens of seconds.
+        """
+        now = asyncio.get_running_loop().time()
+        for snapshot in snapshots:
+            if snapshot.status == PrinterStatus.offline:
+                self._offline_since.setdefault(snapshot.printer_key, now)
+            else:
+                self._offline_since.pop(snapshot.printer_key, None)
+
+        recovery = self.config.recovery
+        if not recovery.enabled:
+            return
+        if self._recovery_task is not None and not self._recovery_task.done():
+            return
+        lost = [
+            printer
+            for printer in self.config.printers
+            if printer.identity()
+            and (
+                printer.key in self._quarantined
+                or now - self._offline_since.get(printer.key, now) >= recovery.after_offline_s
+            )
+        ]
+        if not lost:
+            self._recovery_interval = float(recovery.min_interval_s)
+            return
+        keys = frozenset(printer.key for printer in lost)
+        # A newly lost printer is worth a prompt look even while an older one,
+        # probably switched off, has pushed the interval up.
+        interval = (
+            float(recovery.min_interval_s) if keys - self._recovery_last_lost else self._recovery_interval
+        )
+        if self._recovery_last_at is not None and now - self._recovery_last_at < interval:
+            return
+        self._recovery_last_at = now
+        self._recovery_last_lost = keys
+        self._recovery_task = asyncio.create_task(self._recover(lost), name="printer-agent-recovery")
+        self._recovery_task.add_done_callback(self._recovery_done)
+
+    def _recovery_done(self, task: asyncio.Task[bool]) -> None:
+        moved = False
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.warning("printer search failed", extra={"action": "recovery", "error": str(exc)})
+            else:
+                moved = bool(task.result())
+        floor = float(self.config.recovery.min_interval_s)
+        ceiling = max(RECOVERY_MAX_INTERVAL_S, floor)
+        self._recovery_interval = floor if moved else min(max(self._recovery_interval * 2, floor), ceiling)
+
+    async def _recover(self, lost: list[PrinterConfig]) -> bool:
+        """Look for lost printers by identity and move the ones found.
+
+        The move is a write to `agent.yaml`, not a change to a live adapter: the
+        poll loop's reload rebuilds what changed and tells the hub, the same way
+        an operator's edit would, and the new address survives a restart.
+        """
+        path = self.config.source_path
+        if path is None or not path.exists():
+            logger.warning(
+                "cannot follow printers to new addresses without a config file",
+                extra={"action": "recovery"},
+            )
+            return False
+        local = await asyncio.to_thread(local_ipv4_networks)
+        hosts = hosts_for(scan_networks(self.config.printers, self.config.recovery.networks, local))
+        logger.info(
+            "looking for printers at new addresses",
+            extra={
+                "action": "recovery",
+                "printers": ",".join(printer.key for printer in lost),
+                "hosts": str(len(hosts)),
+            },
+        )
+        records = await find_printers(lost, hosts)
+        # Planned against the roster as it is *now*: an edit may have landed
+        # during the scan.
+        plan = plan_relocation(self.config.printers, {printer.key for printer in lost}, records)
+        for key in plan.not_found:
+            logger.warning(
+                "printer not found on the network",
+                extra={"action": "recovery", "printer_key": key},
+            )
+        for reason in plan.refused:
+            logger.warning("printer address left unchanged", extra={"action": "recovery", "error": reason})
+        if not plan.moves:
+            return False
+        old_hosts = {printer.key: printer.host for printer in self.config.printers}
+        changed = write_printer_fields(path, {key: {"host": host} for key, host in plan.moves.items()})
+        for key in changed:
+            logger.info(
+                "printer found at a new address",
+                extra={
+                    "action": "recovery",
+                    "printer_key": key,
+                    "old_host": old_hosts.get(key, ""),
+                    "host": plan.moves[key],
+                },
+            )
+        return bool(changed)
 
     async def _ensure_adapter_connected(
         self, key: str, adapter: PrinterAdapter, timeout: float = PRINTER_POLL_TIMEOUT_S
@@ -1003,14 +1266,16 @@ class HubConnection:
                     extra={"action": "shutdown", "printer_key": key, "error": str(exc)},
                 )
 
-    def _offline_snapshot(self, adapter: PrinterAdapter, reason: str) -> PrinterSnapshot:
+    def _offline_snapshot(
+        self, adapter: PrinterAdapter, reason: str, code: str = "offline"
+    ) -> PrinterSnapshot:
         return PrinterSnapshot(
             printer_key=adapter.printer_key,
             status=PrinterStatus.offline,
             status_raw="offline",
             job=JobSnapshot(),
             temps=TemperatureSnapshot(),
-            error=ErrorSnapshot(code="offline", message=reason),
+            error=ErrorSnapshot(code=code, message=reason),
             capabilities=adapter.capabilities(),
         )
 

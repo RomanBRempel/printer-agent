@@ -792,6 +792,7 @@ def parse_bambu_ssdp(datagram: bytes, sender_ip: str) -> dict[str, Any] | None:
         "name": headers.get("DEVNAME.BAMBU.COM", "").strip() or serial or host,
         "model": headers.get("DEVMODEL.BAMBU.COM", "").strip(),
         "serial": serial,
+        "device_ids": [serial.lower()] if serial else [],
         "source": "ssdp",
     }
 
@@ -839,6 +840,97 @@ async def discover_bambu(timeout_s: float = 6.0) -> list[dict[str, Any]]:
         transport.close()
 
     return list(found.values())
+
+
+#: DER encoding of the X.509 commonName attribute type, 2.5.4.3.
+_OID_COMMON_NAME = bytes((0x06, 0x03, 0x55, 0x04, 0x03))
+
+
+def bambu_certificate_serial(der: bytes) -> str:
+    """The subject common name of a Bambu MQTT certificate: the printer's serial.
+
+    Every Bambu printer presents a certificate issued by "BBL CA" whose subject
+    CN is its own serial number, so the TLS handshake alone names the machine —
+    no access code, no MQTT session, and no listening socket, which SSDP would
+    need and which Bambu Studio holds on a shop PC anyway. The issuer precedes
+    the subject in the encoding, so the last commonName is the one wanted. The
+    certificate is only *read*; it is self-issued, and nothing here trusts it.
+    """
+    start = der.rfind(_OID_COMMON_NAME)
+    if start < 0:
+        return ""
+    index = start + len(_OID_COMMON_NAME) + 1  # skip the string type tag
+    if index >= len(der) or der[index] >= 0x80:
+        return ""
+    length = der[index]
+    value = der[index + 1 : index + 1 + length]
+    return value.decode("utf-8", errors="replace").strip() if len(value) == length else ""
+
+
+def _certificate_reading_context() -> ssl.SSLContext:
+    """A TLS context that reads the peer certificate and trusts nothing.
+
+    Deliberately not `ssl.create_default_context()`: that loads the system CA
+    store, which on Windows is a blocking call of tens of milliseconds — made
+    once per address it froze the event loop long enough for every other probe
+    in the batch to time out, and inside the service it would stall the hub
+    session with them. Nothing is verified here, so no store is needed.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+async def probe_bambu_serial(
+    host: str,
+    port: int = BAMBU_MQTT_PORT,
+    timeout_s: float = 3.0,
+    context: ssl.SSLContext | None = None,
+) -> str:
+    """The serial of the Bambu printer answering at `host`, or "" for anything else."""
+    context = context or _certificate_reading_context()
+    writer = None
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=context), timeout=timeout_s
+        )
+        ssl_object = writer.get_extra_info("ssl_object")
+        der = ssl_object.getpeercert(binary_form=True) if ssl_object is not None else None
+    except (OSError, ssl.SSLError, asyncio.TimeoutError, TimeoutError):
+        return ""
+    finally:
+        if writer is not None:
+            writer.close()
+            with suppress(Exception):
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+    return bambu_certificate_serial(der or b"")
+
+
+async def discover_bambu_tls(
+    hosts: list[str], *, port: int = BAMBU_MQTT_PORT, timeout_s: float = 3.0
+) -> list[dict[str, Any]]:
+    """Find Bambu printers by asking each address for its MQTT certificate.
+
+    Slower than SSDP and blind to the model and name, but it is outbound only
+    and answers on demand, which is what re-finding a known printer needs.
+    """
+    context = _certificate_reading_context()
+    serials = await asyncio.gather(*(probe_bambu_serial(host, port, timeout_s, context) for host in hosts))
+    return [
+        {
+            "brand": "bambu",
+            "host": host,
+            "port": port,
+            "name": serial,
+            "model": "",
+            "serial": serial,
+            "device_ids": [serial.lower()],
+            "source": "tls",
+        }
+        for host, serial in zip(hosts, serials)
+        if serial
+    ]
 
 
 class BambuAdapter(PrinterAdapter):

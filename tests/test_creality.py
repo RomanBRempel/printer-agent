@@ -288,6 +288,7 @@ def test_discovery_record_uses_the_printer_hostname_and_model() -> None:
         "name": "K1C-B24E",
         "model": "K1C",
         "serial": "",
+        "device_ids": ["k1c-b24e"],
         "source": "ws",
     }
 

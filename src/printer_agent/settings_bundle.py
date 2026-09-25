@@ -334,6 +334,18 @@ def _merge_printers(
 
         if credentials:
             entry["credentials"] = credentials
+        # A hub that predates `device_id` sends entries without it, and dropping
+        # it would leave the printer unrecognisable after its next DHCP move.
+        # Kept only while the entry still points at the same machine; an
+        # explicit value, including "", is the sender's to set.
+        if (
+            "device_id" not in item
+            and existing is not None
+            and existing.device_id
+            and brand == existing.brand
+            and str(item.get("host", "")).strip() == existing.host
+        ):
+            entry["device_id"] = existing.device_id
         merged.append(entry)
 
     return merged
