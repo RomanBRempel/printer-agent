@@ -661,10 +661,32 @@ async def test_the_external_spool_is_not_split_into_unit_and_slot(published) -> 
     """Номер внешнего держателя не составной — арифметика к нему неприменима."""
     adapter = make_adapter()
 
-    await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping={0: 254})
+    await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping={0: 254, 1: 2})
 
     payload = published.messages[0]["print"]
-    assert payload["ams_mapping2"] == [{"ams_id": 254, "slot_id": 254}]
+    assert payload["ams_mapping2"] == [
+        {"ams_id": 254, "slot_id": 254},
+        {"ams_id": 0, "slot_id": 2},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_mapping_onto_the_external_spool_alone_leaves_the_ams_out(published) -> None:
+    """Только внешний держатель — печать с катушки, а не из подающей системы.
+
+    P1S без AMS сообщает единственное место, 254, и хаб честно сопоставляет
+    программу с ним. С `use_ams: true` такая машина отвечает `07FF-8012` и
+    встаёт на паузу на нулевом слое (08.10.2026).
+    """
+    adapter = make_adapter()
+
+    result = await adapter.start_print("f00d", "part.gcode.3mf", ams_mapping={0: 254})
+
+    payload = published.messages[0]["print"]
+    assert payload["use_ams"] is False
+    assert "ams_mapping" not in payload
+    assert "ams_mapping2" not in payload
+    assert result["use_ams"] is False
 
 
 @pytest.mark.asyncio

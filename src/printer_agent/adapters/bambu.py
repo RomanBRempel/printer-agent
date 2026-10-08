@@ -67,6 +67,11 @@ BAMBU_PRINT_ERRORS = {
     # cleared the address, the file and the model.
     "0500-4037": "The sliced file does not match this printer model",
     "0700-8012": "The printer could not take the AMS mapping — check ams_mapping",
+    # Тот же отказ с префиксом внешнего держателя: P1S без AMS, 08.10.2026,
+    # печать из очереди хаба. Команда ушла с `use_ams: true` и раскладкой из
+    # одного слота 254 — машине без AMS это просьба взять таблицу у системы,
+    # которой нет. См. `_uses_a_feeder_tray`.
+    "07FF-8012": "The printer could not take the AMS mapping — check ams_mapping",
     "0700-8011": "The AMS ran out of filament in the slot the print asked for",
     "0700-8001": "The filament cutter failed",
     "0700-8013": "Purging the previous filament timed out",
@@ -1167,6 +1172,7 @@ class BambuAdapter(PrinterAdapter):
             by_position = await self._positional_mapping(
                 ams_mapping, payload.get("param"), local_path
             )
+        if ams_mapping and self._uses_a_feeder_tray(by_position):
             payload["use_ams"] = True
             payload["ams_mapping"] = self._project_mapping(by_position, project)
             # Та самая «таблица соответствия AMS», которой H2D не мог получить
@@ -1280,6 +1286,26 @@ class BambuAdapter(PrinterAdapter):
                 self._project_by_name[name] = found
                 return found
         return self._project_by_name.get(name)
+
+    @staticmethod
+    def _uses_a_feeder_tray(by_position: list[int]) -> bool:
+        """Задействует ли раскладка хотя бы один лоток подающей системы.
+
+        Хаб сопоставляет программу со ВСЕМИ местами заправки, о которых принтер
+        сообщил, и внешний держатель (254/255) среди них — штатное место, а не
+        лоток AMS. Раскладка, в которой нет ни одного лотка, говорит «печатай с
+        внешней катушки», и команда для этого — `use_ams: false` без таблиц, как
+        её шлёт Studio. С `use_ams: true` машина без AMS (P1S, 08.10.2026)
+        отвечает `07FF-8012` и встаёт на паузу на нулевом слое: её просят взять
+        таблицу у подающей системы, которой нет.
+
+        Args:
+            by_position: Слоты по позициям филаментов плиты; `-1` — не участвует.
+
+        Returns:
+            bool: ``True``, если хоть один филамент идёт из лотка AMS.
+        """
+        return any(0 <= int(slot) < BAMBU_EXTERNAL_SPOOL_SLOT for slot in by_position)
 
     @staticmethod
     def _project_mapping(by_position: list[int], project: ProjectFilaments | None) -> list[int]:

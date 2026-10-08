@@ -755,6 +755,14 @@ stops on layer zero.
 to, using the same `index` values that `state.ams.slots[]` reported — including
 `254` for an external spool holder.
 
+A mapping that names **no feeder tray at all** — every filament on an external
+holder (`254`/`255`) — is a print from the spool, and a Bambu adapter sends it as
+`use_ams: false` with no slot tables, the way Studio does. Sending it as an AMS
+print made a P1S without an AMS refuse with `07FF-8012` and pause on layer zero
+(08.10.2026). The hub keeps sending such a mapping: it is a true statement about
+where the filament comes from, and the adapter is the side that knows what the
+printer's command has to look like for it.
+
 **Two shapes are accepted and mean the same thing.** The pairs are canonical:
 
 ```
