@@ -105,6 +105,11 @@ def normalize_creality_status(raw_state: Any) -> PrinterStatus:
     return _CREALITY_STATE_MAP.get(value, PrinterStatus.maintenance)
 
 
+#: Answers meaning the endpoint is not there at all, as opposed to a refusal of
+#: this file or a fault a retry may clear.
+_UPLOAD_ABSENT_STATUSES = frozenset({404, 405, 501})
+
+
 def _creality_uploaded_name(name: str) -> str:
     """Keep only the printer-safe filename, with no path separators."""
     cleaned = str(name or "").strip().replace("\\", "/")
@@ -199,6 +204,9 @@ class CrealityAdapter(PrinterAdapter):
         #: the mjpg-streamer port is not the vendor WebSocket this adapter holds.
         self._camera_url = printer.camera_snapshot_url.strip()
         self._camera_probed = bool(self._camera_url)
+        #: Only a configured endpoint: the firmware documents none, and one
+        #: assumed for the whole brand was a dead button on the K1C.
+        self._upload_url = printer.upload_url.strip()
         self._http_session: aiohttp.ClientSession | None = None
 
     @property
@@ -265,7 +273,7 @@ class CrealityAdapter(PrinterAdapter):
             pause=True,
             resume=True,
             cancel=True,
-            upload=True,
+            upload=bool(self._upload_url),
             cfs=bool(self._safe_int(self._state.get("cfsConnect"))),
             # Follows the probe, not the brand: the mjpg-streamer port is closed
             # on stock firmware, so a raised flag would be a dead button.
@@ -290,12 +298,17 @@ class CrealityAdapter(PrinterAdapter):
         return {"ok": True, "filename": filename, "requested_name": requested}
 
     async def upload_file(self, local_path: str | Path, remote_name: str) -> dict[str, Any]:
-        """Push a G-code file into the printer's upload endpoint.
+        """Push a G-code file to the printer's configured upload endpoint.
 
-        The Ender 5 Max exposes a Creality LAN upload endpoint over the web UI's
-        HTTP path rather than a Moonraker RPC method, and the print command then
-        selects the file by its printer-side name.
+        The print command then selects the file by its printer-side name. A
+        printer that answers the endpoint with "no such thing" is reported as
+        `unsupported`, not `failed`: a retry cannot change it, and the operator
+        needs to read "this printer does not take files", not a transport error.
         """
+        if not self._upload_url:
+            raise UnsupportedCommandError(
+                f"no upload endpoint for {self.printer.key}; set upload_url"
+            )
         source = Path(local_path)
         if not source.is_file():
             raise RuntimeError(f"{source} is not a file")
@@ -306,10 +319,15 @@ class CrealityAdapter(PrinterAdapter):
             form.add_field("print", "false")
             form.add_field("file", handle, filename=name, content_type="application/octet-stream")
             async with session.post(
-                f"http://{self.printer.host}/api/files/upload",
+                self._upload_url,
                 data=form,
                 timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300),
             ) as response:
+                if response.status in _UPLOAD_ABSENT_STATUSES:
+                    raise UnsupportedCommandError(
+                        f"{self._upload_url} answered {response.status}: "
+                        "the printer does not accept files there"
+                    )
                 response.raise_for_status()
                 try:
                     body = await response.json(content_type=None)

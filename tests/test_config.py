@@ -66,7 +66,13 @@ def test_config_roundtrip_through_yaml(tmp_path: Path) -> None:
                 host="192.168.1.10",
                 port=7125,
                 credentials={"access_code": "abc", "serial": "def"},
-            )
+            ),
+            PrinterConfig(
+                key="k1c-b24e",
+                brand="creality",
+                host="10.13.0.46",
+                upload_url="http://10.13.0.46/upload",
+            ),
         ],
     )
 
@@ -186,6 +192,7 @@ def test_a_known_key_says_nothing(caplog) -> None:
                         "host": "10.13.0.130",
                         "port": 7125,
                         "camera_snapshot_url": "http://10.13.0.130/webcam/?action=snapshot",
+                        "upload_url": "http://10.13.0.130/upload",
                         "credentials": {"api_key": "x"},
                     }
                 ]

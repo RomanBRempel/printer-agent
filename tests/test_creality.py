@@ -55,8 +55,10 @@ IDLE_FRAME = {
 }
 
 
-def build(frame: dict) -> CrealityAdapter:
-    adapter = CrealityAdapter(PrinterConfig(key="k1c", brand="creality", host="10.0.0.5"))
+def build(frame: dict, *, upload_url: str = "") -> CrealityAdapter:
+    adapter = CrealityAdapter(
+        PrinterConfig(key="k1c", brand="creality", host="10.0.0.5", upload_url=upload_url)
+    )
     adapter._state = dict(frame)
     adapter._connected = True
     return adapter
@@ -176,27 +178,38 @@ def test_cfs_capability_follows_the_printer() -> None:
     assert build(PRINTING_FRAME).capabilities().cfs is False
 
 
-def test_pause_resume_cancel_are_advertised_and_upload_is_supported() -> None:
+def test_pause_resume_cancel_are_advertised_and_upload_is_not_by_default() -> None:
     capabilities = build(PRINTING_FRAME).capabilities()
 
     assert (capabilities.pause, capabilities.resume, capabilities.cancel) == (True, True, True)
-    assert (capabilities.upload, capabilities.camera) == (True, False)
+    # No endpoint is known to work on every Creality model: one assumed for the
+    # whole brand answered 501 on a K1C, behind a button the hub had shown.
+    assert (capabilities.upload, capabilities.camera) == (False, False)
+
+
+def test_a_configured_upload_endpoint_raises_the_flag() -> None:
+    adapter = build(PRINTING_FRAME, upload_url="http://10.0.0.5/upload")
+
+    assert adapter.capabilities().upload is True
 
 
 @pytest.mark.asyncio
-async def test_creality_upload_file_posts_to_the_printer_upload_endpoint(tmp_path) -> None:
+async def test_upload_without_an_endpoint_is_unsupported(tmp_path) -> None:
     source = tmp_path / "part.gcode"
     source.write_text("G1 X10 Y20\n", encoding="utf-8")
 
-    adapter = build(PRINTING_FRAME)
-    calls: list[str] = []
+    with pytest.raises(UnsupportedCommandError, match="upload_url"):
+        await build(PRINTING_FRAME).upload_file(source, "part.gcode")
 
+
+def _fake_upload_session(monkeypatch, status: int, calls: list[str]) -> None:
     class FakeResponse:
-        status = 200
-        headers = {}
+        def __init__(self) -> None:
+            self.status = status
 
         def raise_for_status(self) -> None:
-            return None
+            if status >= 400:
+                raise RuntimeError(f"HTTP {status}")
 
         async def __aenter__(self):
             return self
@@ -207,24 +220,54 @@ async def test_creality_upload_file_posts_to_the_printer_upload_endpoint(tmp_pat
         async def json(self, content_type=None):
             return {"ok": True}
 
-        async def read(self):
-            return b""
-
     class FakeSession:
         def post(self, url: str, *, data=None, timeout=None, json=None):
             calls.append(url)
             return FakeResponse()
 
-    monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(creality_module.aiohttp, "ClientSession", lambda *args, **kwargs: FakeSession())
-    try:
-        result = await adapter.upload_file(source, "part.gcode")
-    finally:
-        monkeypatch.undo()
 
-    assert calls and calls[0].endswith("/api/files/upload")
+
+@pytest.mark.asyncio
+async def test_creality_upload_file_posts_to_the_configured_endpoint(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "part.gcode"
+    source.write_text("G1 X10 Y20\n", encoding="utf-8")
+    calls: list[str] = []
+    _fake_upload_session(monkeypatch, 200, calls)
+
+    result = await build(PRINTING_FRAME, upload_url="http://10.0.0.5/upload").upload_file(
+        source, "part.gcode"
+    )
+
+    assert calls == ["http://10.0.0.5/upload"]
     assert result["ok"] is True
     assert result["remote_name"] == "part.gcode"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, 405, 501])
+async def test_an_absent_endpoint_is_unsupported_not_failed(tmp_path, monkeypatch, status) -> None:
+    source = tmp_path / "part.gcode"
+    source.write_text("G1 X10 Y20\n", encoding="utf-8")
+    _fake_upload_session(monkeypatch, status, [])
+
+    with pytest.raises(UnsupportedCommandError, match=str(status)):
+        await build(PRINTING_FRAME, upload_url="http://10.0.0.5/upload").upload_file(
+            source, "part.gcode"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_server_fault_on_the_endpoint_stays_a_failure(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "part.gcode"
+    source.write_text("G1 X10 Y20\n", encoding="utf-8")
+    _fake_upload_session(monkeypatch, 500, [])
+
+    with pytest.raises(RuntimeError) as caught:
+        await build(PRINTING_FRAME, upload_url="http://10.0.0.5/upload").upload_file(
+            source, "part.gcode"
+        )
+    assert not isinstance(caught.value, UnsupportedCommandError)
 
 
 @pytest.mark.asyncio

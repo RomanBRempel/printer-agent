@@ -59,6 +59,8 @@ class PrinterDialog(QDialog):
         self.port_edit = QLineEdit("" if source.port is None else str(source.port))
         self.camera_url_edit = QLineEdit(source.camera_snapshot_url)
         self.camera_url_edit.setPlaceholderText("http://192.168.10.21/webcam/?action=snapshot")
+        self.upload_url_edit = QLineEdit(source.upload_url)
+        self.upload_url_edit.setPlaceholderText("http://192.168.10.21/upload")
         self.access_code_edit = QLineEdit(access_code)
         self.access_code_edit.setEchoMode(QLineEdit.Password)
         self.serial_edit = QLineEdit(serial)
@@ -109,6 +111,17 @@ class PrinterDialog(QDialog):
                 "Снимок камеры (URL)",
                 self.camera_url_edit,
                 hint="Пусто — агент ищет камеру сам; не нашёл — сообщает хабу, что камеры нет.",
+            )
+        )
+        layout.addWidget(
+            form_row(
+                "Загрузка файла (URL)",
+                self.upload_url_edit,
+                hint=(
+                    "Для Creality. Пусто — агент не предлагает загрузку файлов, и хаб не "
+                    "показывает кнопку «Отправить на принтер». Указывать только адрес, "
+                    "проверенный на этом принтере."
+                ),
             )
         )
         layout.addWidget(form_row("Дополнительные credentials (JSON)", self.extra_edit))
@@ -192,6 +205,9 @@ class PrinterDialog(QDialog):
         camera_url = self.camera_url_edit.text().strip()
         if camera_url and not camera_url.lower().startswith(("http://", "https://")):
             return self._fail("URL снимка камеры должен начинаться с http:// или https://.")
+        upload_url = self.upload_url_edit.text().strip()
+        if upload_url and not upload_url.lower().startswith(("http://", "https://")):
+            return self._fail("URL загрузки файла должен начинаться с http:// или https://.")
 
         self.result_printer = PrinterConfig(
             key=key,
@@ -200,6 +216,7 @@ class PrinterDialog(QDialog):
             port=port,
             credentials=credentials,
             camera_snapshot_url=camera_url,
+            upload_url=upload_url,
             # Only while it still names the same machine: pointed at another
             # address, the entry may now mean another printer, and the agent
             # learns whatever answers there.
