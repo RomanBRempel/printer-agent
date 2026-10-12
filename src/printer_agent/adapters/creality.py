@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from contextlib import suppress
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -106,50 +107,138 @@ def normalize_creality_status(raw_state: Any) -> PrinterStatus:
     return _CREALITY_STATE_MAP.get(value, PrinterStatus.maintenance)
 
 
-#: How a model takes a file and starts it. The firmware documents neither and
-#: they differ by model, so the pair is chosen per model, never for the brand:
-#: `/api/files/upload` assumed for the whole brand delivered files to the
-#: Ender-5 Max and answered `501 Not Implemented` on a K1C.
+#: The ways a Creality printer is known to take a file and start it. The
+#: firmware documents none, so none is assumed: `upload_file` tries them in this
+#: order, starting with the one this printer took last time
+#: (`printers[].upload_route`), and the agent records whichever worked — nobody
+#: types an address.
 #:
-#: `api` — multipart `POST /api/files/upload`, then `{"print": <name>}`;
-#:   confirmed by printing on the Ender-5 Max and the K1 (both printed through
-#:   it until a43 took the brand default away).
-#: `k1` — multipart `POST /upload/<name>`, then `opGcodeFile` with the full path
-#:   under `/usr/data`; the K1C's route — the one that answered 501 on `api` —
-#:   taken from OrcaSlicer's CrealityPrint host (`src/slic3r/Utils/
-#:   CrealityPrint.cpp`: `upload()`, `start_print()`), which prints on it.
+#: `upload` — multipart `POST /upload/<name>`, then `opGcodeFile:
+#:   "printprt:<dir>/<name>"` over the WebSocket: the firmware web UI's own
+#:   route (`static/js/app.*.js`) and OrcaSlicer's CrealityPrint host. Measured
+#:   12.10.2026 on two K1, a K1C, the Ender-5 Max and a K2 Plus: all take it.
+#: `api` — multipart `POST /api/files/upload`, then `{"print": <name>}`. The
+#:   same five machines answer it `501 Not Implemented`; kept second for a
+#:   firmware that still has it, since it once delivered to the Ender-5 Max.
+#: `moonraker` — `POST :7125/server/files/upload`, then
+#:   `POST :7125/printer/print/start`, for firmware that serves Moonraker (a
+#:   rooted K-series). Port 7125 is closed on all five measured machines.
 UPLOAD_ROUTE_API = "api"
-UPLOAD_ROUTE_K1 = "k1"
+UPLOAD_ROUTE_UPLOAD = "upload"
+UPLOAD_ROUTE_MOONRAKER = "moonraker"
+UPLOAD_ROUTES: tuple[str, ...] = (UPLOAD_ROUTE_UPLOAD, UPLOAD_ROUTE_API, UPLOAD_ROUTE_MOONRAKER)
 
-#: (model codes, hostname prefixes, route). Matched by the code the firmware
-#: reports and, in case another firmware reports another code, by the hostname
-#: it builds from the model name (`K1C-B24E`). The trailing dash keeps `k1-`
-#: from matching a K1C or a K1 Max. A model that is not here gets no button:
-#: an unconfirmed guess is exactly the dead button a43 removed.
-_MODEL_UPLOAD_ROUTES: tuple[tuple[frozenset[str], tuple[str, ...], str], ...] = (
-    (frozenset({"F004"}), ("ender-5 max",), UPLOAD_ROUTE_API),
-    (frozenset({"K1"}), ("k1-",), UPLOAD_ROUTE_API),
-    (frozenset({"K1C"}), ("k1c-",), UPLOAD_ROUTE_K1),
-)
+MOONRAKER_PORT = 7125
 
-_UPLOAD_ROUTE_PATHS = {
-    UPLOAD_ROUTE_API: "/api/files/upload",
-    UPLOAD_ROUTE_K1: "/upload/{name}",
-}
+#: Where the firmware keeps G-code, when the printer has not said. Measured on
+#: 12.10.2026: K1, K1C and the Ender-5 Max keep it under `/usr/data`, the K2 Plus
+#: under `/mnt/UDISK`. OrcaSlicer's rule ("K1 family `/usr/data`, the rest
+#: `/mnt/UDISK`") is wrong for the Ender — which is why this is the last resort,
+#: after the printer's own file list and the file it last reported.
+_USR_GCODE_DIR = "/usr/data/printer_data/gcodes"
+_UDISK_GCODE_DIR = "/mnt/UDISK/printer_data/gcodes"
+_UDISK_MODELS = frozenset({"F008", "F012", "F021", "F022"})  # K2 Plus, K2 Pro, K2, SPARKX i7
+_GCODES_SUFFIX = "/printer_data/gcodes"
 
-#: Where the K1C stores an uploaded file — `opGcodeFile` addresses it by
-#: this full path, not by the bare name.
-K1_GCODE_DIR = "/usr/data/printer_data/gcodes"
+#: Asks for the file list; the answer names each file's directory.
+REQUEST_FILES = {"method": "get", "params": {"reqGcodeFile": 1}}
+
+#: How long to wait for the file list after an upload. Short: without it the
+#: start falls back to the reported file and the model rule.
+FILE_LIST_WAIT_S = 5.0
 
 
-def upload_route_for(model: Any, hostname: Any) -> str:
-    """The upload/start route known for this model, or "" if none is."""
-    code = str(model or "").strip().upper()
-    name = str(hostname or "").strip().lower()
-    for codes, prefixes, route in _MODEL_UPLOAD_ROUTES:
-        if code in codes or name.startswith(prefixes):
-            return route
-    return ""
+def creality_gcode_dir(state: Mapping[str, Any], known_dir: str = "") -> str:
+    """The directory `opGcodeFile` addresses a stored file in, for this printer.
+
+    The printer's own word first: the directory its file list gave for this
+    file, then the file it last reported. The model rule only stands in when
+    it has said neither.
+    """
+    if known_dir:
+        return known_dir
+    reported = str(state.get("printFileName") or "")
+    if _GCODES_SUFFIX + "/" in reported:
+        return reported.split(_GCODES_SUFFIX + "/", 1)[0] + _GCODES_SUFFIX
+    model = str(state.get("model") or "").strip().upper()
+    hostname = str(state.get("hostname") or "").strip().upper()
+    if model in _UDISK_MODELS or hostname.startswith("K2"):
+        return _UDISK_GCODE_DIR
+    return _USR_GCODE_DIR
+
+
+def file_dirs_from_list(payload: Mapping[str, Any]) -> dict[str, str]:
+    """`{name: directory}` from either file-list answer the firmware sends.
+
+    `retGcodeFileInfo` is `"dir:name:size:...;"` records (what the web UI
+    reads); `retGcodeFileInfo2` is a list of objects whose `path` is the full
+    file path. Firmware differs in which it sends — the Ender-5 Max only the
+    first, the K-series both.
+    """
+    dirs: dict[str, str] = {}
+    first = payload.get("retGcodeFileInfo")
+    if isinstance(first, Mapping):
+        for record in str(first.get("fileInfo") or "").split(";"):
+            parts = record.split(":")
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                dirs[parts[1]] = parts[0]
+    second = payload.get("retGcodeFileInfo2")
+    if isinstance(second, list):
+        for item in second:
+            if isinstance(item, Mapping):
+                path = str(item.get("path") or "")
+                if "/" in path:
+                    directory, _, name = path.rpartition("/")
+                    dirs[name] = directory
+    return dirs
+
+
+#: Read size for streaming a print file into the request body.
+_UPLOAD_CHUNK = 256 * 1024
+
+
+def multipart_upload(
+    fields: Mapping[str, str], name: str, source: Path
+) -> tuple[Any, int, str]:
+    """A `multipart/form-data` body streamed from disk, with its exact length.
+
+    Built here rather than by `aiohttp.FormData`, whose part headers put
+    `Content-Type` before `Content-Disposition`: the libhv server in K-series
+    firmware drops the connection on that order — measured 12.10.2026 on two
+    K1, a K1C and a K2 Plus, about half the uploads cut with WinError 64 /
+    `ServerDisconnectedError`, while the same file in curl's order (disposition
+    first, length known) went through every time. The length is sent up front
+    so the body is never chunked, which the same server is not known to accept.
+    """
+    boundary = f"----rdcontrol{uuid.uuid4().hex}"
+    head = b"".join(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{field}"\r\n\r\n'
+            f"{value}\r\n"
+        ).encode()
+        for field, value in fields.items()
+    )
+    head += (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{name}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode()
+    tail = f"\r\n--{boundary}--\r\n".encode()
+    length = len(head) + source.stat().st_size + len(tail)
+
+    async def stream():
+        yield head
+        with source.open("rb") as handle:
+            while chunk := handle.read(_UPLOAD_CHUNK):
+                yield chunk
+        yield tail
+
+    return stream(), length, f"multipart/form-data; boundary={boundary}"
+
+
+class _RouteAbsent(Exception):
+    """This route is not there on this printer; the next one may be."""
 
 
 #: Answers meaning the endpoint is not there at all, as opposed to a refusal of
@@ -251,8 +340,17 @@ class CrealityAdapter(PrinterAdapter):
         #: the mjpg-streamer port is not the vendor WebSocket this adapter holds.
         self._camera_url = printer.camera_snapshot_url.strip()
         self._camera_probed = bool(self._camera_url)
-        #: A configured endpoint outranks the model default (`_upload_endpoint`).
-        self._configured_upload_url = printer.upload_url.strip()
+        #: Every route refused a file in this process: `upload` goes down so the
+        #: hub stops offering a button whose only answer is "unsupported". Not
+        #: written anywhere — a firmware update may open a route, and a restart
+        #: is when the agent looks again.
+        self._no_upload_route = False
+        #: Name Moonraker stored a file under, by the name it was offered:
+        #: Moonraker may normalise a name, and the start must use the stored one.
+        self._stored_by_name: dict[str, str] = {}
+        #: Directory of each file, as the printer's own file list gave it.
+        self._file_dirs: dict[str, str] = {}
+        self._file_list_event = asyncio.Event()
         self._http_session: aiohttp.ClientSession | None = None
 
     @property
@@ -314,28 +412,12 @@ class CrealityAdapter(PrinterAdapter):
             ts=utc_now_iso(),
         )
 
-    def _upload_route(self) -> str:
-        """The route for this printer: a configured URL speaks `api`, else the model's."""
-        if self._configured_upload_url:
-            return UPLOAD_ROUTE_API
-        return upload_route_for(self._state.get("model"), self._state.get("hostname"))
-
-    def _upload_endpoint(self, name: str = "") -> str:
-        """Configured URL, else the model's path (with the file name where it takes one), else ""."""
-        if self._configured_upload_url:
-            return self._configured_upload_url
-        route = self._upload_route()
-        if not route:
-            return ""
-        path = _UPLOAD_ROUTE_PATHS[route].format(name=quote(name, safe=""))
-        return f"http://{self.printer.host}{path}"
-
     def capabilities(self) -> PrinterCapabilities:
         return PrinterCapabilities(
             pause=True,
             resume=True,
             cancel=True,
-            upload=bool(self._upload_endpoint()),
+            upload=not self._no_upload_route,
             cfs=bool(self._safe_int(self._state.get("cfsConnect"))),
             # Follows the probe, not the brand: the mjpg-streamer port is closed
             # on stock firmware, so a raised flag would be a dead button.
@@ -349,68 +431,130 @@ class CrealityAdapter(PrinterAdapter):
         ams_mapping: Mapping[int, int] | None = None,
         local_path: str | Path | None = None,
     ) -> dict[str, Any]:
-        # The command follows the model's route, like the upload: the K1C
-        # starts a file by its full stored path (`opGcodeFile`, OrcaSlicer's
-        # spool-holder form, `enableSelfTest` off), the rest by the bare name.
-        # The K1C firmware closes the socket right after accepting it; the
-        # connection loop reconnects, and the print has already started.
-        # Adapters are expected to accept the common signature even when the
-        # machine has no AMS mapping to apply.
+        """Start a stored file by the route that delivered it.
+
+        The start is the second half of a route, not a separate choice: a file
+        that went in by `/upload/<name>` is not known to the `print` command.
+        With no route learned yet (a file put there by hand, before any upload
+        through the agent) the `api` command is the one that has worked.
+        Adapters are expected to accept the common signature even when the
+        machine has no AMS mapping to apply.
+        """
         requested = (remote_name or file_ref or "").strip()
         if not requested:
             raise RuntimeError("start_print needs a file name")
         filename = _creality_uploaded_name(requested)
-        if self._upload_route() == UPLOAD_ROUTE_K1:
+        route = self.printer.upload_route or UPLOAD_ROUTE_API
+        if route == UPLOAD_ROUTE_MOONRAKER:
+            stored = self._stored_by_name.get(filename, filename)
+            session = self._ensure_http_session()
+            url = f"http://{self.printer.host}:{MOONRAKER_PORT}/printer/print/start"
+            async with session.post(
+                url, params={"filename": stored}, timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                if response.status >= 400:
+                    body = (await response.text())[:300]
+                    raise RuntimeError(f"{url} answered {response.status} for {stored}: {body}")
+            return {"ok": True, "filename": stored, "requested_name": requested, "route": route}
+        if route == UPLOAD_ROUTE_UPLOAD:
+            # The firmware's own web UI form (`app.*.js`: `printprt:` + dir + name),
+            # confirmed on K1 and K1C 1.0.0. The firmware may close the
+            # socket right after accepting it; the connection loop reconnects,
+            # and the print has already started.
             params: dict[str, Any] = {
-                "opGcodeFile": f"printprt:{K1_GCODE_DIR}/{filename}",
-                "enableSelfTest": 0,
+                "opGcodeFile": (
+                    f"printprt:{creality_gcode_dir(self._state, self._file_dirs.get(filename, ''))}"
+                    f"/{filename}"
+                ),
             }
         else:
             params = {"print": filename}
         await self._send(params)
-        return {"ok": True, "filename": filename, "requested_name": requested, "command": params}
+        return {
+            "ok": True,
+            "filename": filename,
+            "requested_name": requested,
+            "route": route,
+            "command": params,
+        }
 
     async def upload_file(self, local_path: str | Path, remote_name: str) -> dict[str, Any]:
-        """Push a G-code file to the printer's configured upload endpoint.
+        """Deliver a file by the first route this printer accepts, and remember it.
 
-        The print command then selects the file by its printer-side name. A
-        printer that answers the endpoint with "no such thing" is reported as
-        `unsupported`, not `failed`: a retry cannot change it, and the operator
-        needs to read "this printer does not take files", not a transport error.
+        The route that worked last time goes first, so a known printer costs one
+        request; the others follow in `UPLOAD_ROUTES` order. A route whose
+        address is not there (404/405/501, or its port closed) passes to the
+        next. Any other refusal stops here as a failure: the printer took the
+        request and said no to this file, and a different route would not
+        change that. Only when every route is absent is the answer
+        `unsupported` — naming each answer, since that is the whole diagnosis.
         """
-        route = self._upload_route()
-        if not route:
-            raise UnsupportedCommandError(
-                f"no upload endpoint known for {self.printer.key}; set upload_url"
-            )
         source = Path(local_path)
         if not source.is_file():
             raise RuntimeError(f"{source} is not a file")
         name = _creality_uploaded_name((remote_name or source.name).strip() or source.name)
-        upload_url = self._upload_endpoint(name)
+        learned = self.printer.upload_route
+        order = ([learned] if learned in UPLOAD_ROUTES else []) + [
+            route for route in UPLOAD_ROUTES if route != learned
+        ]
+        refusals: list[str] = []
+        for route in order:
+            try:
+                result = await self._upload_by(route, source, name)
+            except _RouteAbsent as absent:
+                refusals.append(f"{route}: {absent}")
+                continue
+            self._no_upload_route = False
+            self._remember_route(route)
+            return {"ok": True, "root": "gcodes", "route": route, **result}
+        self._no_upload_route = True
+        raise UnsupportedCommandError(
+            f"{self.printer.key} accepts files by none of the known routes — "
+            + "; ".join(refusals)
+        )
+
+    async def _upload_by(self, route: str, source: Path, name: str) -> dict[str, Any]:
+        """One route's upload; raises `_RouteAbsent` when the route is not there."""
+        host = self.printer.host
+        if route == UPLOAD_ROUTE_API:
+            url = f"http://{host}/api/files/upload"
+            fields = {"print": "false"}
+        elif route == UPLOAD_ROUTE_UPLOAD:
+            url = f"http://{host}/upload/{quote(name, safe='')}"
+            fields = {}
+        else:
+            url = f"http://{host}:{MOONRAKER_PORT}/server/files/upload"
+            fields = {"root": "gcodes"}
         session = self._ensure_http_session()
-        with source.open("rb") as handle:
-            form = aiohttp.FormData(quote_fields=False)
-            if route == UPLOAD_ROUTE_API:
-                form.add_field("print", "false")
-            form.add_field("file", handle, filename=name, content_type="application/octet-stream")
+        body_stream, length, content_type = multipart_upload(fields, name, source)
+        try:
             async with session.post(
-                upload_url,
-                data=form,
-                timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300),
+                url,
+                data=body_stream,
+                headers={"Content-Type": content_type, "Content-Length": str(length)},
+                timeout=aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=300),
             ) as response:
                 if response.status in _UPLOAD_ABSENT_STATUSES:
-                    raise UnsupportedCommandError(
-                        f"{upload_url} answered {response.status}: "
-                        "the printer does not accept files there"
-                    )
-                response.raise_for_status()
+                    raise _RouteAbsent(f"{url} answered {response.status}")
+                if response.status >= 400:
+                    body = (await response.text())[:300]
+                    raise RuntimeError(f"{url} answered {response.status}: {body}")
                 try:
                     body = await response.json(content_type=None)
                 except ValueError:
                     body = {}
-        result = body if isinstance(body, dict) else {}
-        return {"ok": True, "remote_name": name, "path": name, "root": "gcodes", **result}
+        except aiohttp.ClientConnectorError as exc:
+            # The port is closed: this firmware does not serve the route at all.
+            raise _RouteAbsent(f"{url} refused the connection ({exc.os_error})") from exc
+        body = body if isinstance(body, dict) else {}
+        stored = name
+        if route == UPLOAD_ROUTE_UPLOAD:
+            await self._learn_file_dir(name)
+        if route == UPLOAD_ROUTE_MOONRAKER:
+            item = (body.get("result") or body).get("item") or {}
+            stored = str(item.get("path") or name)
+            self._stored_by_name[name] = stored
+        return {"remote_name": stored, "path": stored}
 
     async def pause(self) -> dict[str, Any]:
         await self._send({"pause": 1})
@@ -525,6 +669,23 @@ class CrealityAdapter(PrinterAdapter):
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2.0, 60.0)
 
+    async def _learn_file_dir(self, name: str) -> None:
+        """Ask the printer where it put `name`; best effort, never fails the upload."""
+        if name in self._file_dirs:
+            return
+        self._file_list_event.clear()
+        try:
+            await self._send(REQUEST_FILES)
+            deadline = asyncio.get_running_loop().time() + FILE_LIST_WAIT_S
+            while name not in self._file_dirs:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return
+                self._file_list_event.clear()
+                await asyncio.wait_for(self._file_list_event.wait(), timeout=remaining)
+        except Exception:
+            return
+
     def _handle_frame(self, raw: str) -> None:
         try:
             payload = json.loads(raw)
@@ -532,6 +693,16 @@ class CrealityAdapter(PrinterAdapter):
             return
         if not isinstance(payload, dict):
             return
+        # The file list is an answer, not state: kept out of the cache it would
+        # ride along in every merge, and it can run to hundreds of files.
+        if "retGcodeFileInfo" in payload or "retGcodeFileInfo2" in payload:
+            self._file_dirs.update(file_dirs_from_list(payload))
+            self._file_list_event.set()
+            payload = {
+                key: value
+                for key, value in payload.items()
+                if key not in ("retGcodeFileInfo", "retGcodeFileInfo2")
+            }
         updates = {key: value for key, value in payload.items() if key not in IGNORED_FIELDS}
         if not updates:
             return

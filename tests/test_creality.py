@@ -7,6 +7,7 @@ K1 just finished, K2 Plus idle), trimmed to the fields the adapter reads.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
@@ -56,9 +57,9 @@ IDLE_FRAME = {
 }
 
 
-def build(frame: dict, *, upload_url: str = "") -> CrealityAdapter:
+def build(frame: dict, *, upload_route: str = "") -> CrealityAdapter:
     adapter = CrealityAdapter(
-        PrinterConfig(key="k1c", brand="creality", host="10.0.0.5", upload_url=upload_url)
+        PrinterConfig(key="k1c", brand="creality", host="10.0.0.5", upload_route=upload_route)
     )
     adapter._state = dict(frame)
     adapter._connected = True
@@ -179,83 +180,30 @@ def test_cfs_capability_follows_the_printer() -> None:
     assert build(PRINTING_FRAME).capabilities().cfs is False
 
 
-def test_pause_resume_cancel_are_advertised_and_upload_is_not_by_default() -> None:
-    capabilities = build(IDLE_FRAME).capabilities()  # K2 Plus: no known route
+def test_pause_resume_cancel_and_upload_are_advertised() -> None:
+    capabilities = build(PRINTING_FRAME).capabilities()
 
     assert (capabilities.pause, capabilities.resume, capabilities.cancel) == (True, True, True)
-    # No endpoint is known to work on every Creality model: one assumed for the
-    # whole brand answered 501 on a K1C, behind a button the hub had shown.
-    assert (capabilities.upload, capabilities.camera) == (False, False)
+    # Upload is offered until every known route has refused a file.
+    assert capabilities.upload is True
+    assert capabilities.camera is False
 
 
-def test_the_ender_5_max_uploads_without_configuration() -> None:
-    """Its endpoint was confirmed by real prints; a43 took the button away from it."""
-    by_code = build({**IDLE_FRAME, "model": "F004", "hostname": "Ender-5 Max-549B"})
-    by_name = build({**IDLE_FRAME, "model": "", "hostname": "Ender-5 Max-549B"})
-
-    assert by_code.capabilities().upload is True
-    assert by_name.capabilities().upload is True
-    assert by_code._upload_endpoint() == "http://10.0.0.5/api/files/upload"
-
-
-def test_other_models_get_no_default_endpoint() -> None:
-    assert build(IDLE_FRAME).capabilities().upload is False  # K2 Plus, F008
-    # Unconfirmed models stay without a button; `k1-` must not catch a K1 Max.
-    assert build({**IDLE_FRAME, "model": "K1 Max", "hostname": "K1 Max-1A2B"}).capabilities().upload is False
-    assert build({**IDLE_FRAME, "model": "K1 SE", "hostname": "K1 SE-0A1B"}).capabilities().upload is False
-
-
-@pytest.mark.parametrize("model, hostname", [("K1", "K1-0A1B"), ("", "K1-0A1B")])
-def test_the_k1_keeps_the_route_it_printed_through(model, hostname) -> None:
-    """The K1 printed via `/api/files/upload` until a43; the K1C route must not take it."""
-    adapter = build({**PRINTING_FRAME, "model": model, "hostname": hostname})
-
-    assert adapter.capabilities().upload is True
-    assert adapter._upload_endpoint("part.gcode") == "http://10.0.0.5/api/files/upload"
-
-
-@pytest.mark.parametrize("model, hostname", [("K1C", "K1C-B24E"), ("", "K1C-B24E")])
-def test_the_k1c_uploads_by_its_own_route(model, hostname) -> None:
-    """`/api/files/upload` answered 501 on a K1C; it takes `/upload/<name>`."""
-    adapter = build({**PRINTING_FRAME, "model": model, "hostname": hostname})
-
-    assert adapter.capabilities().upload is True
-    assert adapter._upload_endpoint("часть 1.gcode") == (
-        "http://10.0.0.5/upload/%D1%87%D0%B0%D1%81%D1%82%D1%8C%201.gcode"
-    )
-
-
-def test_a_configured_url_outranks_the_model_default() -> None:
-    adapter = build(
-        {**IDLE_FRAME, "model": "F004"}, upload_url="http://10.0.0.5/custom"
-    )
-
-    assert adapter._upload_endpoint() == "http://10.0.0.5/custom"
-
-
-def test_a_configured_upload_endpoint_raises_the_flag() -> None:
-    adapter = build(PRINTING_FRAME, upload_url="http://10.0.0.5/upload")
-
-    assert adapter.capabilities().upload is True
-
-
-@pytest.mark.asyncio
-async def test_upload_without_an_endpoint_is_unsupported(tmp_path) -> None:
+def _source(tmp_path) -> Path:
     source = tmp_path / "part.gcode"
     source.write_text("G1 X10 Y20\n", encoding="utf-8")
-
-    with pytest.raises(UnsupportedCommandError, match="upload_url"):
-        await build(IDLE_FRAME).upload_file(source, "part.gcode")
+    return source
 
 
-def _fake_upload_session(monkeypatch, status: int, calls: list[str], forms: list | None = None) -> None:
+def _fake_upload_session(
+    monkeypatch, statuses: dict[str, int], calls: list[str], forms: list | None = None
+) -> None:
+    """Answers each URL with its status; a URL mapped to 0 refuses the connection."""
+
     class FakeResponse:
-        def __init__(self) -> None:
+        def __init__(self, status: int, body: dict) -> None:
             self.status = status
-
-        def raise_for_status(self) -> None:
-            if status >= 400:
-                raise RuntimeError(f"HTTP {status}")
+            self._body = body
 
         async def __aenter__(self):
             return self
@@ -264,133 +212,218 @@ def _fake_upload_session(monkeypatch, status: int, calls: list[str], forms: list
             return None
 
         async def json(self, content_type=None):
-            return {"ok": True}
+            return self._body
+
+        async def text(self):
+            return "refused"
 
     class FakeSession:
-        def post(self, url: str, *, data=None, timeout=None, json=None):
-            calls.append(url)
-            if forms is not None:
-                forms.append([field[0]["name"] for field in data._fields])
-            return FakeResponse()
+        closed = False
+
+        def post(self, url: str, *, data=None, timeout=None, params=None, headers=None):
+            calls.append(url if params is None else f"{url}?{params}")
+            if forms is not None and headers is not None:
+                forms.append(headers["Content-Length"])
+            status = statuses.get(url, 200)
+            if status == 0:
+                raise creality_module.aiohttp.ClientConnectorError(None, OSError(111, "refused"))
+            body = {"result": {"item": {"path": "stored.gcode"}}} if ":7125/" in url else {}
+            return FakeResponse(status, body)
 
     monkeypatch.setattr(creality_module.aiohttp, "ClientSession", lambda *args, **kwargs: FakeSession())
 
 
+API = "http://10.0.0.5/api/files/upload"
+UPLOAD = "http://10.0.0.5/upload/part.gcode"
+MOONRAKER = "http://10.0.0.5:7125/server/files/upload"
+
+
 @pytest.mark.asyncio
-async def test_creality_upload_file_posts_to_the_configured_endpoint(tmp_path, monkeypatch) -> None:
-    source = tmp_path / "part.gcode"
-    source.write_text("G1 X10 Y20\n", encoding="utf-8")
+async def test_the_first_route_that_answers_is_used_and_remembered(tmp_path, monkeypatch) -> None:
+    """Firmware without `/upload/`: the next route takes the file."""
     calls: list[str] = []
-    _fake_upload_session(monkeypatch, 200, calls)
+    forms: list = []
+    _fake_upload_session(monkeypatch, {UPLOAD: 501}, calls, forms)
+    adapter = build(PRINTING_FRAME)
+    recorded: list[tuple[str, str]] = []
+    adapter.route_recorder = lambda printer, route: recorded.append((printer.key, route))
 
-    result = await build(PRINTING_FRAME, upload_url="http://10.0.0.5/upload").upload_file(
-        source, "part.gcode"
-    )
+    result = await adapter.upload_file(_source(tmp_path), "part.gcode")
 
-    assert calls == ["http://10.0.0.5/upload"]
-    assert result["ok"] is True
-    assert result["remote_name"] == "part.gcode"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("status", [404, 405, 501])
-async def test_an_absent_endpoint_is_unsupported_not_failed(tmp_path, monkeypatch, status) -> None:
-    source = tmp_path / "part.gcode"
-    source.write_text("G1 X10 Y20\n", encoding="utf-8")
-    _fake_upload_session(monkeypatch, status, [])
-
-    with pytest.raises(UnsupportedCommandError, match=str(status)):
-        await build(PRINTING_FRAME, upload_url="http://10.0.0.5/upload").upload_file(
-            source, "part.gcode"
-        )
+    assert calls == [UPLOAD, API]
+    assert all(int(length) > 0 for length in forms)  # never chunked
+    assert result["route"] == "api"
+    assert adapter.printer.upload_route == "api"
+    assert recorded == [("k1c", "api")]
 
 
 @pytest.mark.asyncio
-async def test_a_server_fault_on_the_endpoint_stays_a_failure(tmp_path, monkeypatch) -> None:
-    source = tmp_path / "part.gcode"
-    source.write_text("G1 X10 Y20\n", encoding="utf-8")
-    _fake_upload_session(monkeypatch, 500, [])
+async def test_a_learned_route_is_tried_first(tmp_path, monkeypatch) -> None:
+    calls: list[str] = []
+    _fake_upload_session(monkeypatch, {}, calls)
+    adapter = build(PRINTING_FRAME, upload_route="upload")
+    recorded: list[str] = []
+    adapter.route_recorder = lambda printer, route: recorded.append(route)
+
+    await adapter.upload_file(_source(tmp_path), "part.gcode")
+
+    assert calls == [UPLOAD]
+    assert recorded == []  # nothing new to write
+
+
+@pytest.mark.asyncio
+async def test_a_learned_route_that_closed_gives_way_to_the_next(tmp_path, monkeypatch) -> None:
+    calls: list[str] = []
+    _fake_upload_session(monkeypatch, {API: 404}, calls)
+    adapter = build(PRINTING_FRAME, upload_route="api")
+
+    result = await adapter.upload_file(_source(tmp_path), "part.gcode")
+
+    assert calls == [API, UPLOAD]
+    assert result["route"] == "upload"
+    assert adapter.printer.upload_route == "upload"
+
+
+@pytest.mark.asyncio
+async def test_moonraker_is_the_last_route_and_its_stored_name_is_started(
+    tmp_path, monkeypatch
+) -> None:
+    calls: list[str] = []
+    _fake_upload_session(monkeypatch, {API: 501, UPLOAD: 0}, calls)
+    adapter = build(PRINTING_FRAME)
+
+    result = await adapter.upload_file(_source(tmp_path), "part.gcode")
+    started = await adapter.start_print("file-ref", "part.gcode")
+
+    assert calls[:3] == [UPLOAD, API, MOONRAKER]
+    assert result["remote_name"] == "stored.gcode"
+    assert started["filename"] == "stored.gcode"
+    assert calls[3] == "http://10.0.0.5:7125/printer/print/start?{'filename': 'stored.gcode'}"
+
+
+@pytest.mark.asyncio
+async def test_every_route_absent_is_unsupported_and_names_each_answer(
+    tmp_path, monkeypatch
+) -> None:
+    _fake_upload_session(monkeypatch, {API: 501, UPLOAD: 404, MOONRAKER: 0}, [])
+    adapter = build(PRINTING_FRAME)
+
+    with pytest.raises(UnsupportedCommandError) as caught:
+        await adapter.upload_file(_source(tmp_path), "part.gcode")
+
+    assert "api:" in str(caught.value) and "upload:" in str(caught.value)
+    assert "moonraker:" in str(caught.value)
+    # The hub stops showing a button whose only answer is "unsupported".
+    assert adapter.capabilities().upload is False
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_of_the_file_is_a_failure_not_the_next_route(tmp_path, monkeypatch) -> None:
+    calls: list[str] = []
+    _fake_upload_session(monkeypatch, {UPLOAD: 500}, calls)
 
     with pytest.raises(RuntimeError) as caught:
-        await build(PRINTING_FRAME, upload_url="http://10.0.0.5/upload").upload_file(
-            source, "part.gcode"
-        )
+        await build(PRINTING_FRAME).upload_file(_source(tmp_path), "part.gcode")
+
     assert not isinstance(caught.value, UnsupportedCommandError)
+    assert calls == [UPLOAD]
+
+
+def test_a_cyrillic_name_is_quoted_in_the_upload_path(tmp_path) -> None:
+    from urllib.parse import quote
+
+    assert quote("часть 1.gcode", safe="") == "%D1%87%D0%B0%D1%81%D1%82%D1%8C%201.gcode"
+
+
+class _FakeSocket:
+    closed = False
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send_str(self, data: str) -> None:
+        self.sent.append(data)
 
 
 @pytest.mark.asyncio
-async def test_the_k1_upload_posts_the_file_under_its_name(tmp_path, monkeypatch) -> None:
-    source = tmp_path / "part.gcode"
-    source.write_text("G1 X10 Y20\n", encoding="utf-8")
-    calls: list[str] = []
-    forms: list = []
-    _fake_upload_session(monkeypatch, 200, calls, forms)
-
-    result = await build(PRINTING_FRAME).upload_file(source, "part.gcode")
-
-    assert calls == ["http://10.0.0.5/upload/part.gcode"]
-    assert forms == [["file"]]  # no `print` field: that is the api route's
-    assert result["remote_name"] == "part.gcode"
-
-
-@pytest.mark.asyncio
-async def test_the_api_route_keeps_its_form(tmp_path, monkeypatch) -> None:
-    source = tmp_path / "part.gcode"
-    source.write_text("G1 X10 Y20\n", encoding="utf-8")
-    calls: list[str] = []
-    forms: list = []
-    _fake_upload_session(monkeypatch, 200, calls, forms)
-
-    await build({**IDLE_FRAME, "model": "F004"}).upload_file(source, "part.gcode")
-
-    assert calls == ["http://10.0.0.5/api/files/upload"]
-    assert forms == [["print", "file"]]
-
-
-@pytest.mark.asyncio
-async def test_the_k1_starts_a_file_by_its_stored_path() -> None:
-    adapter = build(PRINTING_FRAME)
-    sent: list[str] = []
-
-    class FakeSocket:
-        closed = False
-
-        async def send_str(self, data: str) -> None:
-            sent.append(data)
-
-    adapter._websocket = FakeSocket()
+async def test_the_upload_route_starts_a_file_by_its_stored_path() -> None:
+    adapter = build(PRINTING_FRAME, upload_route="upload")
+    adapter._websocket = socket = _FakeSocket()
 
     await adapter.start_print("file-ref", "part.gcode")
 
-    assert [json.loads(item) for item in sent] == [
+    # The directory is read off the file the printer itself reported.
+    assert [json.loads(item) for item in socket.sent] == [
         {
             "method": "set",
             "params": {
                 "opGcodeFile": "printprt:/usr/data/printer_data/gcodes/part.gcode",
-                "enableSelfTest": 0,
             },
         }
     ]
 
 
+@pytest.mark.parametrize(
+    "frame, expected",
+    [
+        ({"printFileName": "/mnt/UDISK/printer_data/gcodes/x.gcode"}, "/mnt/UDISK/printer_data/gcodes"),
+        ({"model": "K1C"}, "/usr/data/printer_data/gcodes"),
+        ({"hostname": "K1-022D"}, "/usr/data/printer_data/gcodes"),
+        # Measured 12.10.2026: OrcaSlicer's "non-K1 is /mnt/UDISK" is wrong here.
+        ({"model": "F004"}, "/usr/data/printer_data/gcodes"),
+        ({"model": "F008"}, "/mnt/UDISK/printer_data/gcodes"),
+    ],
+)
+def test_the_gcode_directory_follows_the_printer(frame, expected) -> None:
+    assert creality_module.creality_gcode_dir(frame) == expected
+
+
+def test_the_printer_file_list_outranks_every_guess() -> None:
+    state = {"printFileName": "/usr/data/printer_data/gcodes/old.gcode"}
+    assert creality_module.creality_gcode_dir(state, "/mnt/UDISK/printer_data/gcodes") == (
+        "/mnt/UDISK/printer_data/gcodes"
+    )
+
+
+def test_both_file_list_shapes_are_read() -> None:
+    """The Ender-5 Max answers only the first shape, the K-series both."""
+    first = {"retGcodeFileInfo": {"totalNum": 2, "fileInfo": "/usr/data/printer_data/gcodes:a.gcode:86:0:1:0:;"}}
+    second = {"retGcodeFileInfo2": [{"name": "b.gcode", "path": "/mnt/UDISK/printer_data/gcodes/b.gcode"}]}
+
+    assert creality_module.file_dirs_from_list(first) == {"a.gcode": "/usr/data/printer_data/gcodes"}
+    assert creality_module.file_dirs_from_list(second) == {"b.gcode": "/mnt/UDISK/printer_data/gcodes"}
+
+
+def test_a_file_list_answer_is_not_merged_into_state() -> None:
+    adapter = build(PRINTING_FRAME)
+
+    adapter._handle_frame(
+        json.dumps({"retGcodeFileInfo2": [{"path": "/mnt/UDISK/printer_data/gcodes/x.gcode"}]})
+    )
+
+    assert "retGcodeFileInfo2" not in adapter._state
+    assert adapter._file_dirs == {"x.gcode": "/mnt/UDISK/printer_data/gcodes"}
+
+
 @pytest.mark.asyncio
-async def test_creality_start_print_sends_a_print_command() -> None:
-    adapter = build({**IDLE_FRAME, "model": "F004", "hostname": "Ender-5 Max-549B"})
-    sent: list[str] = []
-
-    class FakeSocket:
-        closed = False
-
-        async def send_str(self, data: str) -> None:
-            sent.append(data)
-
-    adapter._websocket = FakeSocket()
+async def test_the_api_route_starts_by_the_bare_name() -> None:
+    adapter = build(IDLE_FRAME, upload_route="api")
+    adapter._websocket = socket = _FakeSocket()
 
     result = await adapter.start_print("file-ref", "part.gcode")
 
-    assert result["ok"] is True
     assert result["filename"] == "part.gcode"
-    assert sent == ['{"method": "set", "params": {"print": "part.gcode"}}']
+    assert socket.sent == ['{"method": "set", "params": {"print": "part.gcode"}}']
+
+
+@pytest.mark.asyncio
+async def test_without_a_learned_route_the_start_is_the_api_command() -> None:
+    adapter = build(IDLE_FRAME)
+    adapter._websocket = socket = _FakeSocket()
+
+    await adapter.start_print("file-ref", "part.gcode")
+
+    assert socket.sent == ['{"method": "set", "params": {"print": "part.gcode"}}']
 
 
 @pytest.mark.asyncio
@@ -585,3 +618,26 @@ def test_firmware_without_the_counter_omits_the_key() -> None:
 
     assert snapshot.job.filament_used_mm is None
     assert "filament_used_mm" not in snapshot.to_dict()["job"]
+
+
+@pytest.mark.asyncio
+async def test_the_multipart_body_puts_the_disposition_first_and_states_its_length(
+    tmp_path,
+) -> None:
+    """libhv in K-series firmware dropped about half of aiohttp's FormData uploads."""
+    source = _source(tmp_path)
+
+    stream, length, content_type = creality_module.multipart_upload(
+        {"print": "false"}, "part.gcode", source
+    )
+    body = b"".join([chunk async for chunk in stream])
+
+    boundary = content_type.split("boundary=", 1)[1]
+    assert len(body) == length
+    assert body.endswith(f"\r\n--{boundary}--\r\n".encode())
+    file_part = body.split(f"--{boundary}\r\n".encode())[2]
+    assert file_part.startswith(
+        b'Content-Disposition: form-data; name="file"; filename="part.gcode"\r\n'
+        b"Content-Type: application/octet-stream\r\n\r\nG1 X10 Y20"
+    )
+    assert b'name="print"\r\n\r\nfalse\r\n' in body

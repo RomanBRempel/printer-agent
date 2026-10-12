@@ -268,6 +268,20 @@ async def test_control_connection_is_always_released(ftps, tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_a_storage_refusal_names_the_printer_storage(ftps, tmp_path, monkeypatch) -> None:
+    """H2D, 12.10.2026: `553 Could not create file` — карта, а не агент и не сеть."""
+    source = tmp_path / "part.gcode"
+    source.write_bytes(b"x")
+
+    def refuse(self: FakeFTPS, command: str, handle: Any) -> None:
+        raise ftplib.error_perm("553 Could not create file.")
+
+    monkeypatch.setattr(FakeFTPS, "storbinary", refuse)
+    with pytest.raises(RuntimeError, match="553 Could not create file.*SD card"):
+        await make_adapter().upload_file(source, "part.gcode")
+
+
+@pytest.mark.asyncio
 async def test_upload_without_an_access_code_is_refused_before_connecting(ftps, tmp_path) -> None:
     """Кода доступа нет — FTPS невозможен, и говорим об этом, а не пробуем."""
     source = tmp_path / "part.gcode"

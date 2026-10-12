@@ -68,12 +68,14 @@ class PrinterConfig:
     #: Still-image URL for the camera, when the printer's is not where the
     #: adapter would look by itself. Not a credential: it is an address.
     camera_snapshot_url: str = ""
-    #: Where the printer accepts a print file over HTTP, for an adapter that
-    #: has no endpoint it knows to work on this model. Creality's LAN firmware
-    #: differs by model and documents none: an endpoint written into the
-    #: adapter on trust answered `501 Not Implemented` on a K1C. Empty means
-    #: the adapter does not offer `upload` at all, so the hub shows no button.
-    upload_url: str = ""
+    #: How this printer took a file the last time one was delivered — the name
+    #: of one of the adapter's known routes (Creality: `api`, `upload`,
+    #: `moonraker`). Learned and written by the agent itself, never typed: the
+    #: firmware documents no route and they differ by model and even by unit
+    #: (a K1 and a K1C both answered `501` on the one the Ender-5 Max takes), so
+    #: the adapter tries its routes in turn and records the one that worked.
+    #: Empty means not learned yet. Bambu records its storage directory here.
+    upload_route: str = ""
     #: What the machine at `host` says it is — a MAC for Moonraker, the firmware
     #: hostname for Creality. DHCP hands addresses out again, so `host` is only
     #: where the printer was last seen; this is how the agent tells the same
@@ -265,7 +267,7 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
                     if printer.camera_snapshot_url
                     else {}
                 ),
-                **({"upload_url": printer.upload_url} if printer.upload_url else {}),
+                **({"upload_route": printer.upload_route} if printer.upload_route else {}),
                 **({"credentials": printer.credentials} if printer.credentials else {}),
                 **({"device_id": printer.device_id} if printer.device_id else {}),
             }
@@ -345,7 +347,8 @@ def _parse_bool(value: Any, default: bool = False) -> bool:
 #: Everything a `printers[]` entry may say about itself. Anything else is a
 #: mistake worth naming rather than dropping.
 _PRINTER_KEYS = frozenset(
-    {"key", "brand", "host", "port", "credentials", "camera_snapshot_url", "upload_url", "device_id"}
+    {"key", "brand", "host", "port", "credentials", "camera_snapshot_url",
+     "upload_url", "upload_route", "device_id"}
 )
 
 #: Settings that belong one level down, under `credentials`. Written beside
@@ -399,7 +402,9 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
                 port=_int(item.get("port"), 0, f"printer {key}: port") if item.get("port") is not None else None,
                 credentials=item.get("credentials") or {},
                 camera_snapshot_url=_text(item.get("camera_snapshot_url")),
-                upload_url=_text(item.get("upload_url")),
+                # `upload_url` (a44 and earlier) is still accepted and ignored:
+                # the route is learned now, and an old file must keep loading.
+                upload_route=_text(item.get("upload_route")),
                 device_id=normalize_device_id(_text(item.get("device_id"))),
             )
         )
@@ -504,8 +509,6 @@ def validate_config(config: AgentConfig) -> list[str]:
             ("http://", "https://")
         ):
             errors.append(f"printer {printer.key}: camera_snapshot_url must be an http(s) URL")
-        if printer.upload_url and not printer.upload_url.lower().startswith(("http://", "https://")):
-            errors.append(f"printer {printer.key}: upload_url must be an http(s) URL")
         if printer.brand == "bambu":
             access_code = str((printer.credentials or {}).get("access_code", "")).strip()
             serial = str((printer.credentials or {}).get("serial", "")).strip()

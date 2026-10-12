@@ -269,7 +269,7 @@ class HubConnection:
         )
         self._camera = CameraService(config.agent_token)
         self._command_processor = CommandProcessor(outbox, self._files, self._camera)
-        self._adapters = {printer.key: build_adapter(printer) for printer in config.printers}
+        self._adapters = {printer.key: self._build_adapter(printer) for printer in config.printers}
         self._state_store = PrinterStateStore()
         self._connected_adapters: set[str] = set()
         self._ws: aiohttp.ClientWebSocketResponse | None = None
@@ -924,12 +924,15 @@ class HubConnection:
         incoming = {printer.key: printer for printer in config.printers}
         removed = [key for key in previous if key not in incoming]
         added = [key for key in incoming if key not in previous]
-        # A learned `device_id` is written into the file by the agent itself;
-        # that must not tear down a working connection to adopt it.
+        # A learned `device_id` or `upload_route` is written into the file by
+        # the agent itself; that must not tear down a working connection to
+        # adopt it.
         rebuilt = [
             key
             for key, printer in incoming.items()
-            if key in previous and replace(previous[key], device_id="") != replace(printer, device_id="")
+            if key in previous
+            and replace(previous[key], device_id="", upload_route="")
+            != replace(printer, device_id="", upload_route="")
         ]
 
         for name in _restart_required_changes(self.config, config):
@@ -953,7 +956,7 @@ class HubConnection:
                 with suppress(Exception):
                     await adapter.disconnect()
         for key in added + rebuilt:
-            self._adapters[key] = build_adapter(incoming[key])
+            self._adapters[key] = self._build_adapter(incoming[key])
         for key, printer in incoming.items():
             if key in previous and previous[key].device_id != printer.device_id:
                 # Someone changed or cleared it by hand: check the device, or
@@ -1070,6 +1073,33 @@ class HubConnection:
 
     def _printer_config(self, key: str) -> PrinterConfig | None:
         return next((printer for printer in self.config.printers if printer.key == key), None)
+
+    def _build_adapter(self, printer: PrinterConfig) -> PrinterAdapter:
+        adapter = build_adapter(printer)
+        adapter.route_recorder = self._learn_upload_route
+        return adapter
+
+    def _learn_upload_route(self, printer: PrinterConfig, route: str) -> None:
+        """Record the route a printer took a file by, so the next upload starts there.
+
+        Written to the file, like the identity, so it outlives a restart; a
+        failure to write costs only a retried route next time, never the print.
+        """
+        path = self.config.source_path
+        if path is None or not path.exists():
+            return
+        try:
+            write_printer_fields(path, {printer.key: {"upload_route": route}})
+        except Exception as exc:
+            logger.warning(
+                "could not record upload route",
+                extra={"action": "upload_route", "printer_key": printer.key, "error": str(exc)},
+            )
+            return
+        logger.info(
+            "recorded upload route",
+            extra={"action": "upload_route", "printer_key": printer.key, "route": route},
+        )
 
     def _learn_identity(self, printer: PrinterConfig, device_id: str) -> None:
         """Record the identity a printer answered with, so it can be found again.

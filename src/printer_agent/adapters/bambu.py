@@ -1530,6 +1530,21 @@ class BambuAdapter(PrinterAdapter):
                 f"FTPS upload to {self.printer.host}:{BAMBU_FTPS_PORT} timed out"
                 f" trying to {stage} ({exc})"
             ) from exc
+        except ftplib.error_perm as exc:
+            # 553 on STOR is the printer's storage refusing to create the file:
+            # the FTP root *is* its storage, so a missing, full or write-protected
+            # card answers exactly this. Said in words — "553 Could not create
+            # file" sent the operator after the agent, not after the printer.
+            storage = (
+                " — the printer's storage refused it: check that its SD card is"
+                " in, not full and not write-protected"
+                if str(exc).startswith("553") and stage.startswith("send")
+                else ""
+            )
+            raise RuntimeError(
+                f"FTPS upload to {self.printer.host}:{BAMBU_FTPS_PORT} failed"
+                f" trying to {stage}: {exc}{storage}"
+            ) from exc
         except Exception as exc:
             raise RuntimeError(
                 f"FTPS upload to {self.printer.host}:{BAMBU_FTPS_PORT} failed"

@@ -71,7 +71,7 @@ def test_config_roundtrip_through_yaml(tmp_path: Path) -> None:
                 key="k1c-b24e",
                 brand="creality",
                 host="10.13.0.46",
-                upload_url="http://10.13.0.46/upload",
+                upload_route="upload",
             ),
         ],
     )

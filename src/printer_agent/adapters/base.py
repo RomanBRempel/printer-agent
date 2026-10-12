@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from ..config import PrinterConfig
@@ -13,9 +13,23 @@ class UnsupportedCommandError(RuntimeError):
     pass
 
 
+#: Receives a printer and the upload route it just took a file by.
+RouteRecorder = Callable[[PrinterConfig, str], None]
+
+
 class PrinterAdapter(ABC):
     def __init__(self, printer: PrinterConfig):
         self.printer = printer
+        #: Set by the hub connection, which writes the route into `agent.yaml`.
+        self.route_recorder: RouteRecorder | None = None
+
+    def _remember_route(self, route: str) -> None:
+        """Keep the route that delivered a file, in memory and in the config file."""
+        if route == self.printer.upload_route:
+            return
+        self.printer.upload_route = route
+        if self.route_recorder is not None:
+            self.route_recorder(self.printer, route)
 
     @property
     def printer_key(self) -> str:
