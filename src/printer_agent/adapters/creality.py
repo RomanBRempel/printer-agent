@@ -25,6 +25,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 
@@ -103,6 +104,52 @@ def normalize_creality_status(raw_state: Any) -> PrinterStatus:
     except (TypeError, ValueError):
         return PrinterStatus.maintenance
     return _CREALITY_STATE_MAP.get(value, PrinterStatus.maintenance)
+
+
+#: How a model takes a file and starts it. The firmware documents neither and
+#: they differ by model, so the pair is chosen per model, never for the brand:
+#: `/api/files/upload` assumed for the whole brand delivered files to the
+#: Ender-5 Max and answered `501 Not Implemented` on a K1C.
+#:
+#: `api` — multipart `POST /api/files/upload`, then `{"print": <name>}`;
+#:   confirmed by printing on the Ender-5 Max and the K1 (both printed through
+#:   it until a43 took the brand default away).
+#: `k1` — multipart `POST /upload/<name>`, then `opGcodeFile` with the full path
+#:   under `/usr/data`; the K1C's route — the one that answered 501 on `api` —
+#:   taken from OrcaSlicer's CrealityPrint host (`src/slic3r/Utils/
+#:   CrealityPrint.cpp`: `upload()`, `start_print()`), which prints on it.
+UPLOAD_ROUTE_API = "api"
+UPLOAD_ROUTE_K1 = "k1"
+
+#: (model codes, hostname prefixes, route). Matched by the code the firmware
+#: reports and, in case another firmware reports another code, by the hostname
+#: it builds from the model name (`K1C-B24E`). The trailing dash keeps `k1-`
+#: from matching a K1C or a K1 Max. A model that is not here gets no button:
+#: an unconfirmed guess is exactly the dead button a43 removed.
+_MODEL_UPLOAD_ROUTES: tuple[tuple[frozenset[str], tuple[str, ...], str], ...] = (
+    (frozenset({"F004"}), ("ender-5 max",), UPLOAD_ROUTE_API),
+    (frozenset({"K1"}), ("k1-",), UPLOAD_ROUTE_API),
+    (frozenset({"K1C"}), ("k1c-",), UPLOAD_ROUTE_K1),
+)
+
+_UPLOAD_ROUTE_PATHS = {
+    UPLOAD_ROUTE_API: "/api/files/upload",
+    UPLOAD_ROUTE_K1: "/upload/{name}",
+}
+
+#: Where the K1C stores an uploaded file — `opGcodeFile` addresses it by
+#: this full path, not by the bare name.
+K1_GCODE_DIR = "/usr/data/printer_data/gcodes"
+
+
+def upload_route_for(model: Any, hostname: Any) -> str:
+    """The upload/start route known for this model, or "" if none is."""
+    code = str(model or "").strip().upper()
+    name = str(hostname or "").strip().lower()
+    for codes, prefixes, route in _MODEL_UPLOAD_ROUTES:
+        if code in codes or name.startswith(prefixes):
+            return route
+    return ""
 
 
 #: Answers meaning the endpoint is not there at all, as opposed to a refusal of
@@ -204,9 +251,8 @@ class CrealityAdapter(PrinterAdapter):
         #: the mjpg-streamer port is not the vendor WebSocket this adapter holds.
         self._camera_url = printer.camera_snapshot_url.strip()
         self._camera_probed = bool(self._camera_url)
-        #: Only a configured endpoint: the firmware documents none, and one
-        #: assumed for the whole brand was a dead button on the K1C.
-        self._upload_url = printer.upload_url.strip()
+        #: A configured endpoint outranks the model default (`_upload_endpoint`).
+        self._configured_upload_url = printer.upload_url.strip()
         self._http_session: aiohttp.ClientSession | None = None
 
     @property
@@ -268,12 +314,28 @@ class CrealityAdapter(PrinterAdapter):
             ts=utc_now_iso(),
         )
 
+    def _upload_route(self) -> str:
+        """The route for this printer: a configured URL speaks `api`, else the model's."""
+        if self._configured_upload_url:
+            return UPLOAD_ROUTE_API
+        return upload_route_for(self._state.get("model"), self._state.get("hostname"))
+
+    def _upload_endpoint(self, name: str = "") -> str:
+        """Configured URL, else the model's path (with the file name where it takes one), else ""."""
+        if self._configured_upload_url:
+            return self._configured_upload_url
+        route = self._upload_route()
+        if not route:
+            return ""
+        path = _UPLOAD_ROUTE_PATHS[route].format(name=quote(name, safe=""))
+        return f"http://{self.printer.host}{path}"
+
     def capabilities(self) -> PrinterCapabilities:
         return PrinterCapabilities(
             pause=True,
             resume=True,
             cancel=True,
-            upload=bool(self._upload_url),
+            upload=bool(self._upload_endpoint()),
             cfs=bool(self._safe_int(self._state.get("cfsConnect"))),
             # Follows the probe, not the brand: the mjpg-streamer port is closed
             # on stock firmware, so a raised flag would be a dead button.
@@ -287,15 +349,26 @@ class CrealityAdapter(PrinterAdapter):
         ams_mapping: Mapping[int, int] | None = None,
         local_path: str | Path | None = None,
     ) -> dict[str, Any]:
-        # The newer Creality LAN protocol accepts a print command by the printer
-        # side filename. Adapters are expected to accept the common signature even
-        # when the machine has no AMS mapping to apply.
+        # The command follows the model's route, like the upload: the K1C
+        # starts a file by its full stored path (`opGcodeFile`, OrcaSlicer's
+        # spool-holder form, `enableSelfTest` off), the rest by the bare name.
+        # The K1C firmware closes the socket right after accepting it; the
+        # connection loop reconnects, and the print has already started.
+        # Adapters are expected to accept the common signature even when the
+        # machine has no AMS mapping to apply.
         requested = (remote_name or file_ref or "").strip()
         if not requested:
             raise RuntimeError("start_print needs a file name")
         filename = _creality_uploaded_name(requested)
-        await self._send({"print": filename})
-        return {"ok": True, "filename": filename, "requested_name": requested}
+        if self._upload_route() == UPLOAD_ROUTE_K1:
+            params: dict[str, Any] = {
+                "opGcodeFile": f"printprt:{K1_GCODE_DIR}/{filename}",
+                "enableSelfTest": 0,
+            }
+        else:
+            params = {"print": filename}
+        await self._send(params)
+        return {"ok": True, "filename": filename, "requested_name": requested, "command": params}
 
     async def upload_file(self, local_path: str | Path, remote_name: str) -> dict[str, Any]:
         """Push a G-code file to the printer's configured upload endpoint.
@@ -305,27 +378,30 @@ class CrealityAdapter(PrinterAdapter):
         `unsupported`, not `failed`: a retry cannot change it, and the operator
         needs to read "this printer does not take files", not a transport error.
         """
-        if not self._upload_url:
+        route = self._upload_route()
+        if not route:
             raise UnsupportedCommandError(
-                f"no upload endpoint for {self.printer.key}; set upload_url"
+                f"no upload endpoint known for {self.printer.key}; set upload_url"
             )
         source = Path(local_path)
         if not source.is_file():
             raise RuntimeError(f"{source} is not a file")
         name = _creality_uploaded_name((remote_name or source.name).strip() or source.name)
+        upload_url = self._upload_endpoint(name)
         session = self._ensure_http_session()
         with source.open("rb") as handle:
             form = aiohttp.FormData(quote_fields=False)
-            form.add_field("print", "false")
+            if route == UPLOAD_ROUTE_API:
+                form.add_field("print", "false")
             form.add_field("file", handle, filename=name, content_type="application/octet-stream")
             async with session.post(
-                self._upload_url,
+                upload_url,
                 data=form,
                 timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300),
             ) as response:
                 if response.status in _UPLOAD_ABSENT_STATUSES:
                     raise UnsupportedCommandError(
-                        f"{self._upload_url} answered {response.status}: "
+                        f"{upload_url} answered {response.status}: "
                         "the printer does not accept files there"
                     )
                 response.raise_for_status()

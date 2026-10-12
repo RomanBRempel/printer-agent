@@ -6,6 +6,7 @@ K1 just finished, K2 Plus idle), trimmed to the fields the adapter reads.
 
 from __future__ import annotations
 
+import json
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
@@ -179,12 +180,57 @@ def test_cfs_capability_follows_the_printer() -> None:
 
 
 def test_pause_resume_cancel_are_advertised_and_upload_is_not_by_default() -> None:
-    capabilities = build(PRINTING_FRAME).capabilities()
+    capabilities = build(IDLE_FRAME).capabilities()  # K2 Plus: no known route
 
     assert (capabilities.pause, capabilities.resume, capabilities.cancel) == (True, True, True)
     # No endpoint is known to work on every Creality model: one assumed for the
     # whole brand answered 501 on a K1C, behind a button the hub had shown.
     assert (capabilities.upload, capabilities.camera) == (False, False)
+
+
+def test_the_ender_5_max_uploads_without_configuration() -> None:
+    """Its endpoint was confirmed by real prints; a43 took the button away from it."""
+    by_code = build({**IDLE_FRAME, "model": "F004", "hostname": "Ender-5 Max-549B"})
+    by_name = build({**IDLE_FRAME, "model": "", "hostname": "Ender-5 Max-549B"})
+
+    assert by_code.capabilities().upload is True
+    assert by_name.capabilities().upload is True
+    assert by_code._upload_endpoint() == "http://10.0.0.5/api/files/upload"
+
+
+def test_other_models_get_no_default_endpoint() -> None:
+    assert build(IDLE_FRAME).capabilities().upload is False  # K2 Plus, F008
+    # Unconfirmed models stay without a button; `k1-` must not catch a K1 Max.
+    assert build({**IDLE_FRAME, "model": "K1 Max", "hostname": "K1 Max-1A2B"}).capabilities().upload is False
+    assert build({**IDLE_FRAME, "model": "K1 SE", "hostname": "K1 SE-0A1B"}).capabilities().upload is False
+
+
+@pytest.mark.parametrize("model, hostname", [("K1", "K1-0A1B"), ("", "K1-0A1B")])
+def test_the_k1_keeps_the_route_it_printed_through(model, hostname) -> None:
+    """The K1 printed via `/api/files/upload` until a43; the K1C route must not take it."""
+    adapter = build({**PRINTING_FRAME, "model": model, "hostname": hostname})
+
+    assert adapter.capabilities().upload is True
+    assert adapter._upload_endpoint("part.gcode") == "http://10.0.0.5/api/files/upload"
+
+
+@pytest.mark.parametrize("model, hostname", [("K1C", "K1C-B24E"), ("", "K1C-B24E")])
+def test_the_k1c_uploads_by_its_own_route(model, hostname) -> None:
+    """`/api/files/upload` answered 501 on a K1C; it takes `/upload/<name>`."""
+    adapter = build({**PRINTING_FRAME, "model": model, "hostname": hostname})
+
+    assert adapter.capabilities().upload is True
+    assert adapter._upload_endpoint("часть 1.gcode") == (
+        "http://10.0.0.5/upload/%D1%87%D0%B0%D1%81%D1%82%D1%8C%201.gcode"
+    )
+
+
+def test_a_configured_url_outranks_the_model_default() -> None:
+    adapter = build(
+        {**IDLE_FRAME, "model": "F004"}, upload_url="http://10.0.0.5/custom"
+    )
+
+    assert adapter._upload_endpoint() == "http://10.0.0.5/custom"
 
 
 def test_a_configured_upload_endpoint_raises_the_flag() -> None:
@@ -199,10 +245,10 @@ async def test_upload_without_an_endpoint_is_unsupported(tmp_path) -> None:
     source.write_text("G1 X10 Y20\n", encoding="utf-8")
 
     with pytest.raises(UnsupportedCommandError, match="upload_url"):
-        await build(PRINTING_FRAME).upload_file(source, "part.gcode")
+        await build(IDLE_FRAME).upload_file(source, "part.gcode")
 
 
-def _fake_upload_session(monkeypatch, status: int, calls: list[str]) -> None:
+def _fake_upload_session(monkeypatch, status: int, calls: list[str], forms: list | None = None) -> None:
     class FakeResponse:
         def __init__(self) -> None:
             self.status = status
@@ -223,6 +269,8 @@ def _fake_upload_session(monkeypatch, status: int, calls: list[str]) -> None:
     class FakeSession:
         def post(self, url: str, *, data=None, timeout=None, json=None):
             calls.append(url)
+            if forms is not None:
+                forms.append([field[0]["name"] for field in data._fields])
             return FakeResponse()
 
     monkeypatch.setattr(creality_module.aiohttp, "ClientSession", lambda *args, **kwargs: FakeSession())
@@ -271,8 +319,63 @@ async def test_a_server_fault_on_the_endpoint_stays_a_failure(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_creality_start_print_sends_a_print_command() -> None:
+async def test_the_k1_upload_posts_the_file_under_its_name(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "part.gcode"
+    source.write_text("G1 X10 Y20\n", encoding="utf-8")
+    calls: list[str] = []
+    forms: list = []
+    _fake_upload_session(monkeypatch, 200, calls, forms)
+
+    result = await build(PRINTING_FRAME).upload_file(source, "part.gcode")
+
+    assert calls == ["http://10.0.0.5/upload/part.gcode"]
+    assert forms == [["file"]]  # no `print` field: that is the api route's
+    assert result["remote_name"] == "part.gcode"
+
+
+@pytest.mark.asyncio
+async def test_the_api_route_keeps_its_form(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "part.gcode"
+    source.write_text("G1 X10 Y20\n", encoding="utf-8")
+    calls: list[str] = []
+    forms: list = []
+    _fake_upload_session(monkeypatch, 200, calls, forms)
+
+    await build({**IDLE_FRAME, "model": "F004"}).upload_file(source, "part.gcode")
+
+    assert calls == ["http://10.0.0.5/api/files/upload"]
+    assert forms == [["print", "file"]]
+
+
+@pytest.mark.asyncio
+async def test_the_k1_starts_a_file_by_its_stored_path() -> None:
     adapter = build(PRINTING_FRAME)
+    sent: list[str] = []
+
+    class FakeSocket:
+        closed = False
+
+        async def send_str(self, data: str) -> None:
+            sent.append(data)
+
+    adapter._websocket = FakeSocket()
+
+    await adapter.start_print("file-ref", "part.gcode")
+
+    assert [json.loads(item) for item in sent] == [
+        {
+            "method": "set",
+            "params": {
+                "opGcodeFile": "printprt:/usr/data/printer_data/gcodes/part.gcode",
+                "enableSelfTest": 0,
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_creality_start_print_sends_a_print_command() -> None:
+    adapter = build({**IDLE_FRAME, "model": "F004", "hostname": "Ender-5 Max-549B"})
     sent: list[str] = []
 
     class FakeSocket:
